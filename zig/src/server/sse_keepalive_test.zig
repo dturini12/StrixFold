@@ -105,7 +105,7 @@ const Seen = struct {
         c.n += 1;
     }
 
-    fn open(_: *anyopaque) error{Closed}!void {}
+    fn open(_: *anyopaque, _: usize) error{Closed}!void {}
 
     fn event(ctx: *anyopaque, _: ?json.Value) error{Closed}!void {
         const c: *Seen = @ptrCast(@alignCast(ctx));
