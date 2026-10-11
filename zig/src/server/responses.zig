@@ -211,7 +211,7 @@ const Wire = struct {
         if (w.opened) try sse.comment(w.reply.conn);
     }
 
-    fn open(ctx: *anyopaque) error{Closed}!void {
+    fn open(ctx: *anyopaque, _: usize) error{Closed}!void {
         const w: *Wire = @ptrCast(@alignCast(ctx));
         w.opened = true;
         try sse.open(w.reply.conn);
