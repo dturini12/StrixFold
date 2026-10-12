@@ -31,6 +31,9 @@ pub const HfText = struct {
             problem.* = try std.fmt.allocPrint(pa, "cannot read {s}/tokenizer.json ({s})", .{ dir, @errorName(e) });
             return error.Load;
         };
+        errdefer t.tok.deinit();
+        // each request renders its chat up to three times, and a chat's earlier messages come back every turn
+        t.tok.memo = try tokenizer.Memo.create(gpa, 64 << 20);
         const config = readJson(io, a, dir, "tokenizer_config.json");
         const model_config = readJson(io, a, dir, "config.json");
         try t.readTemplates(io, a, dir, config);
