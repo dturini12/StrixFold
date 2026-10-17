@@ -43,6 +43,9 @@ pub const Config = struct {
     loop_guard: bool = false,
     /// Seconds the idle keepalive runs after the last request ends (0: off).
     keep_warm_s: i64 = 900,
+    /// TENSORFOLD_SSE_KEEPALIVE (seconds): a stream that sent nothing for this long (a long prompt's prefill) sends an
+    /// SSE comment, so a client's idle timer does not drop it; 0: never (the stream's bytes as before).
+    sse_keepalive_ms: u32 = 0,
     dashboard: bool = false,
     /// Sampling when a request names none (generation_config.json and the serve flags), or null for greedy.
     default_sampling: ?Value = null,

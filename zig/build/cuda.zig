@@ -249,6 +249,16 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     cli.addImport("lanes", mods.lanes);
     cli.addImport("nemotron", mods.nemotron);
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli })).step);
+    // the server's own unit tests (zig/src/server/root.zig), which the Metal build's test step runs: on this host too
+    const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = host, .optimize = .debug, .link_libc = true });
+    const server = b.createModule(.{
+        .root_source_file = b.path("zig/src/server/root.zig"),
+        .target = host,
+        .optimize = .debug,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "engine_api", .module = eng.api }, .{ .name = "tokenizer", .module = mods.tokenizer }, .{ .name = "template", .module = template } },
+    });
+    b.step("test-server", "The server's unit tests on this host").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server })).step);
 }
 
 /// nvcc -fatbin with torch's flags, the kernel's own and one -gencode per SASS target, as the Python build passes them.
