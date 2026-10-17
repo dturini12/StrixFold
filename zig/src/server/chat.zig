@@ -41,6 +41,8 @@ pub const Input = struct {
 pub const Sink = struct {
     ctx: *anyopaque,
     call: *const fn (ctx: *anyopaque, delta: Value) error{Closed}!void,
+    /// Keeps an idle stream alive (an SSE comment), when Config.sse_keepalive_ms says so; null: never.
+    keep: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
 };
 
 pub const Reply = struct {
@@ -241,7 +243,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     };
     release(srv, preparing); // a background request waits only while a foreground one prepares
     preparing = false;
-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = input.token_ids };
+    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = input.token_ids, .sent_ns = submitted };
     defer srv.noteRequest(prepared.prompt_len, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
     const result: Failure!Reply = blk: {
@@ -331,6 +333,7 @@ const Generation = struct {
     engine_done: bool = false,
     consumed: usize = 0,
     chunk_index: usize = 0,
+    sent_ns: i96 = 0, // when the stream last sent the client something (its keepalive's clock)
 
     fn eos(g: *const Generation, t: u32) bool {
         return !g.ignore_eos and std.mem.indexOfScalar(u32, g.srv.eos, t) != null;
@@ -428,6 +431,23 @@ const Generation = struct {
             g.cancel();
             return error.Cancelled;
         };
+        if (g.srv.config.sse_keepalive_ms > 0) g.sent_ns = nowNs(g.srv.io);
+    }
+
+    /// The sink's keepalive once the stream has sent nothing for Config.sse_keepalive_ms (a long prompt's prefill),
+    /// so a client's idle timer keeps it; a client that left cancels the reply.
+    fn keepAlive(g: *Generation) Failure!void {
+        const every = g.srv.config.sse_keepalive_ms;
+        if (every == 0) return;
+        const sink = g.sink orelse return;
+        const keep = sink.keep orelse return;
+        const now = nowNs(g.srv.io);
+        if (now - g.sent_ns < @as(i96, every) * std.time.ns_per_ms) return;
+        keep(sink.ctx) catch {
+            g.cancel();
+            return error.Cancelled;
+        };
+        g.sent_ns = now;
     }
 
     /// Ends the request and waits for the engine; one it ended unfinished counts as a disconnect, as the Mac scheduler counts it.
@@ -472,7 +492,10 @@ const Generation = struct {
                 g.cancel();
                 return error.Cancelled;
             }
-            const tokens = chunk orelse continue;
+            const tokens = chunk orelse {
+                try g.keepAlive();
+                continue;
+            };
             if (g.reason == null) try g.commit(tokens);
         }
     }

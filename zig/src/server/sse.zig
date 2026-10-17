@@ -23,6 +23,11 @@ pub fn done(conn: *Conn) error{Closed}!void {
     return conn.writeAll("data: [DONE]\n\n");
 }
 
+/// ``: keepalive`` and a blank line: an SSE comment, which clients skip; an idle stream's timers see it alive.
+pub fn comment(conn: *Conn) error{Closed}!void {
+    return conn.writeAll(": keepalive\n\n");
+}
+
 /// ``event: KIND`` then its data line (Responses and Messages events).
 pub fn event(conn: *Conn, a: Allocator, kind: []const u8, payload: json.Value) error{Closed}!void {
     const text = json.stringify(a, payload, .{}) catch return error.Closed;
