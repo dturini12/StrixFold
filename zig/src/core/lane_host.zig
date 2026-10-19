@@ -54,6 +54,7 @@ pub const LaneHost = struct {
     // and frees its extent (its kept state then resumes in place) instead of waiting out every queued pass, as the
     // Python lane's fills leave decoding its share
     finish_until: ?i96 = null,
+    filling: ?*Job = null, // the job whose prompt pass runs in pieces between rounds (core.filling's)
 
     const Mark = struct { at: i96, tokens: u64 };
     const full_retry_ns: i96 = std.time.ns_per_s;
@@ -304,6 +305,7 @@ pub const LaneHost = struct {
             };
             h.unlock();
             const job = found orelse continue;
+            if (admitted and h.filling == job) h.filling = null;
             if (admitted and job.started and !job.stream.finished) h.core.discard(&job.stream);
             h.finish(job, .cancelled, "");
         }
@@ -320,7 +322,7 @@ pub const LaneHost = struct {
     /// Prefills the next queued request into a free lane; false when none waits or no lane is free.
     fn admitOne(h: *LaneHost) bool {
         h.lock();
-        if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes) {
+        if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes or h.filling != null) {
             h.unlock();
             return false;
         }
@@ -388,6 +390,10 @@ pub const LaneHost = struct {
             if (e == error.ContextFull and h.core.activeCount() > 0) return h.requeue(job);
             return h.drop(job, h.words(e));
         };
+        if (h.core.filling == &job.stream) {
+            h.filling = job; // its next pieces run between rounds (fillOne)
+            return true;
+        }
         h.prefilled(job, began);
         const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
         if (now - began >= long_pass_ns) {
@@ -537,10 +543,25 @@ pub const LaneHost = struct {
         };
     }
 
+    /// The filling job's next piece, when its turn has come; its first tokens once its prompt pass ends.
+    fn fillOne(h: *LaneHost) void {
+        const job = h.filling orelse return;
+        const done = h.core.fillStep() catch |e| {
+            h.filling = null;
+            _ = if (e == error.Cancelled) h.cancel(job) else h.drop(job, h.words(e));
+            return;
+        };
+        if (!done) return;
+        h.filling = null;
+        h.prefilled(job, job.began);
+        if (h.deliver(job)) h.remove(job);
+    }
+
     fn run(h: *LaneHost) void {
         while (true) {
             h.takeCancels();
             while (h.admitOne()) {}
+            h.fillOne();
             h.noteLive();
             h.lock();
             if (h.closing) {
@@ -551,6 +572,10 @@ pub const LaneHost = struct {
                 continue;
             }
             if (h.core.activeCount() == 0) {
+                if (h.filling != null) {
+                    h.unlock();
+                    continue;
+                }
                 if (h.cancels.items.len == 0 and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes))
                     h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
                 h.unlock();
@@ -575,6 +600,7 @@ pub const LaneHost = struct {
 
     /// A failed round ends every job it admitted, with the backend's error; the list is taken whole, not copied.
     pub fn failAll(h: *LaneHost, message: []const u8) void {
+        h.filling = null;
         h.lock();
         var jobs = h.admitted;
         h.admitted = .empty;
@@ -594,6 +620,7 @@ pub const LaneHost = struct {
         h.queued = .empty;
         var admitted = h.admitted;
         h.admitted = .empty;
+        h.filling = null;
         h.unlock();
         defer queued.deinit(h.gpa);
         defer admitted.deinit(h.gpa);

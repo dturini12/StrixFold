@@ -513,6 +513,20 @@ fn noteRefusal(sn: *const Snap, len: usize, why: Refusal, then: []const u8) void
     std.log.info("dsv41: a prompt of {d} tokens does not resume the kept state of {d} tokens at {d}: {s}; {s}", .{ len, sn.at, sn.base, why.says(), then });
 }
 
+/// A prompt pass between its pieces (TF_FILL_CHUNKS): the chunk it runs next and what its chunk loop reads.
+const Fill = struct {
+    s: *lanes.Stream,
+    slot: usize,
+    base: usize,
+    len: usize,
+    replay: usize,
+    last_end: usize,
+    start: usize,
+    keyed: bool, // its kept states are keyed by `key` (the prompt's ids, or the host's key with images)
+    key: []const u32,
+    head: bool = false,
+};
+
 /// How long a request waits for the live stream that holds the kept state it resumes from to end (then it resumes
 /// in place and every kept state stays) before other kept states give their room for a copy of it.
 const held_wait_ns: u64 = 10 * std.time.ns_per_s;
@@ -538,6 +552,7 @@ pub const Lanes = struct {
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, least recently used first (made, or last resumed)
+    fill: ?Fill = null, // the prompt pass that runs in pieces between rounds, from its next chunk (none: no pass runs)
     next_snap: u64 = 1,
     /// The tokenizer's bytes for structured output (native.zig loads it); null: requests with a structure refused.
     vocab: ?*const grammar.Vocab = null,
@@ -571,6 +586,7 @@ pub const Lanes = struct {
     pub fn backend(self: *Lanes) be.Backend {
         return .{ .ptr = self, .vtable = &.{
             .prefill = prefillFn,
+            .prefill_part = prefillPartFn,
             .first = firstFn,
             .queue = queueFn,
             .read = readFn,
@@ -647,21 +663,117 @@ pub const Lanes = struct {
     /// The lowest free slot, the first extent that fits, the prompt in chunks of the served size (at multiples of it:
     /// the chunks the gates checked; the host's chunk plan is not followed), the head's draw of the first token.
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
-        return prefill(ptr, s) catch |err| {
+        const done = of(ptr).prefillPart(s, std.math.maxInt(usize), true) catch |err| {
+            ended(err);
+            return err;
+        };
+        if (!done) return error.FillUnfinished;
+    }
+
+    /// The prompt pass in pieces of `chunks` chunks (opened at its first), the other streams' rounds between them
+    /// (TF_FILL_CHUNKS): true once it reached the head and drew the first token.
+    fn prefillPartFn(ptr: *anyopaque, s: *lanes.Stream, chunks: usize) anyerror!bool {
+        return of(ptr).prefillPart(s, chunks, false) catch |err| {
             ended(err);
             return err;
         };
     }
 
-    fn prefill(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
-        const self = of(ptr);
+    /// `whole`: prefill's pass, which runs to its end in this call (the only kind with every TF_FILL_* unset).
+    fn prefillPart(self: *Lanes, s: *lanes.Stream, chunks: usize, whole: bool) !bool {
         const m = self.m;
         const gpa = self.gpa;
         const t0 = m.now();
         defer if (self.prof) |*p| {
             p.prefill += m.now() - t0;
-            p.prefills += 1;
         };
+        if (self.fill) |f| if (f.s != s) return error.FillBusy;
+        if (self.fill == null) {
+            errdefer if (self.prof) |*p| {
+                p.prefills += 1;
+            };
+            try self.fillOpen(s, whole);
+        }
+        errdefer {
+            if (self.prof) |*p| p.prefills += 1;
+            self.fillFailed(s);
+        }
+        const f = &self.fill.?;
+        const seq = &self.seqs[f.slot];
+        const len = f.len;
+        const replay = f.replay;
+        const last_end = f.last_end;
+        // a pass that reached its end ends here, after the read-ahead's join below (a whole pass's order)
+        defer if (self.fill) |x| if (x.start >= x.len) self.fillEnd();
+        m.fill_seq = seq.items;
+        // a round may run before the next piece: the read-ahead joined and the prompt's ids gone, as rank 1 does at its
+        // frame (the rows it read stay for the next chunk: Model.fillChunk takes them when they cover it)
+        defer {
+            m.joinAhead();
+            m.fill_seq = &.{};
+        }
+        var ran: usize = 0;
+        while (f.start < len and ran < chunks) : (ran += 1) {
+            const start = f.start;
+            if (start > 0 and s.isCancelled()) return error.Cancelled;
+            const n = @min(model.chunk_rows, len - start);
+            const cf: ChunkFrame = .{ .start = start, .n = n, .replay = replay, .pre_read = m.preRead(start, n) };
+            if (try self.begin(.fill_chunk)) {
+                try cf.write(&self.wire, gpa);
+                try self.flush();
+            }
+            f.head = try m.fillChunk(seq.items[0 .. start + n], start, n, replay, cf.pre_read);
+            f.start += n;
+            const at = f.start;
+            if (self.disk) |d| if (d.streaming and at <= last_end and at % model.chunk_rows == 0) try self.diskStream(d, f.slot, f.base, at, last_end);
+            if (f.keyed) if (s.reuse.hook) |k| if (at < len and at <= replay and (at == last_end or markEnds(s.reuse.marks, at))) k.at(k.ptr, s, @intCast(at));
+        }
+        if (f.start < len) return false;
+        const head = f.head;
+        if (self.prof) |*p| p.prefills += 1;
+        if (!head) return error.NoPromptLogits;
+        const logits = try m.promptLogitsHost();
+        if (logits_sha or logits_dump != null) {
+            var dg: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(logits), &dg, .{});
+            const hex = std.fmt.bytesToHex(dg, .lower);
+            if (logits_sha) std.debug.print("{{\"prompt_logits\": \"{s}\", \"sha256\": \"{s}\", \"rows\": {d}}}\n", .{ s.id, hex, len });
+            if (logits_dump) |dir| try dumpLogits(m.io, dir, s.id, len, m.cfg.vocab, logits, &hex);
+        }
+        const l = self.streams.getPtr(s).?;
+        const token = if (l.grammar) |c| blk: {
+            const g0 = m.now();
+            defer {
+                l.grammar_rows += 1;
+                l.grammar_ns += m.now() - g0;
+            }
+            c.reset(s.emitted());
+            break :blk try drawAllowed(c, logits, len, s.sampling);
+        } else try draw(logits, len, s.sampling);
+        l.first = self.take(token);
+        return true;
+    }
+
+    /// The pass in pieces ended (its first token drawn, or it failed): sf-disk's pass on this rank ends with it.
+    fn fillEnd(self: *Lanes) void {
+        if (self.fill == null) return;
+        self.fill = null;
+        if (self.disk) |d| d.endPass();
+    }
+
+    /// A pass that failed after its opening: it ends, and its stream holds no slot (as its opening's errdefers do).
+    fn fillFailed(self: *Lanes, s: *lanes.Stream) void {
+        self.fillEnd();
+        const kv = self.streams.fetchRemove(s) orelse return;
+        self.used[kv.value.slot] = false;
+        if (kv.value.grammar) |c| c.deinit();
+    }
+
+    /// A prompt pass's start: its slot and extent, its images, rank 1's fill, the kept state or disk state it resumes
+    /// from; its chunks then run in prefillPart (self.fill).
+    fn fillOpen(self: *Lanes, s: *lanes.Stream, whole: bool) !void {
+        const m = self.m;
+        const gpa = self.gpa;
         const ids = s.prompt();
         const len = ids.len;
         if (len == 0) return error.EmptyPrompt;
@@ -730,7 +842,8 @@ pub const Lanes = struct {
                 moved = false;
             }
         };
-        defer if (self.disk) |d| d.endPass();
+        // (the disk pass ends with the pass, fillEnd; here only when the opening fails)
+        errdefer if (self.disk) |d| d.endPass();
         const base = if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size, kept);
         if (kept) |sn| {
             sn.wanted = 0;
@@ -865,47 +978,11 @@ pub const Lanes = struct {
         // where this pass keeps states: the cache's marks and its last chunk end before the replay (the served lane's
         // kept prompt), each at the chunk end at or before it
         const last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows;
-        // sf-disk: a pass that keeps states writes its finished blocks as it goes (diskStream)
-        if (self.disk) |d| d.streaming = d.passing and !d.off and s.reuse.hook != null and last_end >= d.settings.min_tokens;
-        var head = false;
-        m.fill_seq = seq.items;
-        defer {
-            m.joinAhead();
-            m.fill_seq = &.{};
-        }
-        while (start < len) {
-            if (start > 0 and s.isCancelled()) return error.Cancelled;
-            const n = @min(model.chunk_rows, len - start);
-            const f: ChunkFrame = .{ .start = start, .n = n, .replay = replay, .pre_read = m.preRead(start, n) };
-            if (try self.begin(.fill_chunk)) {
-                try f.write(&self.wire, gpa);
-                try self.flush();
-            }
-            head = try m.fillChunk(seq.items[0 .. start + n], start, n, replay, f.pre_read);
-            start += n;
-            if (self.disk) |d| if (d.streaming and start <= last_end and start % model.chunk_rows == 0) try self.diskStream(d, slot, base, start, last_end);
-            if (keyed) if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
-        }
-        if (!head) return error.NoPromptLogits;
-        const logits = try m.promptLogitsHost();
-        if (logits_sha or logits_dump != null) {
-            var dg: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(logits), &dg, .{});
-            const hex = std.fmt.bytesToHex(dg, .lower);
-            if (logits_sha) std.debug.print("{{\"prompt_logits\": \"{s}\", \"sha256\": \"{s}\", \"rows\": {d}}}\n", .{ s.id, hex, len });
-            if (logits_dump) |dir| try dumpLogits(m.io, dir, s.id, len, m.cfg.vocab, logits, &hex);
-        }
-        const l = self.streams.getPtr(s).?;
-        const token = if (l.grammar) |c| blk: {
-            const g0 = m.now();
-            defer {
-                l.grammar_rows += 1;
-                l.grammar_ns += m.now() - g0;
-            }
-            c.reset(s.emitted());
-            break :blk try drawAllowed(c, logits, len, s.sampling);
-        } else try draw(logits, len, s.sampling);
-        l.first = self.take(token);
+        // sf-disk: a pass that keeps states writes its finished blocks as it goes (diskStream); a pass in pieces does
+        // not (rounds between its pieces end rank 1's disk pass, which forgets streamed blocks no state took): its keeps
+        // write their blocks at the keep (diskSave)
+        if (self.disk) |d| d.streaming = whole and d.passing and !d.off and s.reuse.hook != null and last_end >= d.settings.min_tokens;
+        self.fill = .{ .s = s, .slot = slot, .base = base, .len = len, .replay = replay, .last_end = last_end, .start = start, .keyed = keyed, .key = key };
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -1482,6 +1559,11 @@ pub const Lanes = struct {
 
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = of(ptr);
+        if (self.fill) |f| if (f.s == s) { // a pass in pieces cancelled between them
+            self.m.joinAhead();
+            self.m.fill_seq = &.{};
+            self.fillEnd();
+        };
         const kv = self.streams.fetchRemove(s) orelse return;
         self.used[kv.value.slot] = false;
         s.telemetry_len = kv.value.tel.write(if (self.m.graphs) |*g| g else null, &s.telemetry_buf);
@@ -1492,6 +1574,24 @@ pub const Lanes = struct {
         }
     }
 };
+
+/// Rank 1, at a frame that is not the prompt pass's own (inPass): the next chunk's read-ahead joined, the prompt's ids
+/// gone, sf-disk's pass ended (rank 0's next frames may belong to another prompt).
+fn leavePass(m: anytype, disk: anytype) void {
+    m.joinAhead();
+    m.fill_seq = &.{};
+    if (disk) |d| d.endPass();
+}
+
+/// Rank 1, at a pass's chunk: after a round ended its pass between two pieces (rank 0's TF_FILL_CHUNKS), its ids for
+/// the read-ahead and sf-disk's pass on its key again, so a keep's disk_save finds the chain rank 0 has (rank 0 keeps
+/// its pass across pieces and streams no blocks from one, so the ended pass dropped nothing). A pass that runs whole
+/// has its ids here already: nothing happens.
+fn rearmPass(m: anytype, disk: anytype, seq: []const i32, span_key: ?[]const u32) void {
+    if (m.fill_seq.len != 0) return;
+    m.fill_seq = seq;
+    if (disk) |d| if (!d.passing) d.beginPass(if (span_key) |k| std.mem.sliceAsBytes(k) else std.mem.sliceAsBytes(seq));
+}
 
 /// A fill_chunk frame's fields: the chunk's rows and replay, and rank 0's preRead, which orders a split chunk's Engram
 /// gathers (Model.fillChunk) the same on every rank.
@@ -1672,6 +1772,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     defer img_rows.deinit(gpa);
     var key_ids: std.ArrayList(u32) = .empty; // a prompt with images: its cache key (rank 0's span key ids)
     defer key_ids.deinit(gpa);
+    var key_slot: ?usize = null; // the slot whose pass key_ids are (its fill_begin carried span key ids)
     var kept: std.AutoHashMapUnmanaged(u64, gpu.DeviceBuffer) = .empty; // rank 0's kept states, this rank's part
     defer {
         var ki = kept.valueIterator();
@@ -1711,11 +1812,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
         if (try r.int(u64) != step) return error.OutOfStep;
         step += 1;
         // a chunk's read-ahead of the next is done before anything that ends the prompt pass (its ids may change)
-        if (!inPass(kind)) {
-            m.joinAhead();
-            m.fill_seq = &.{};
-            if (disk) |d| d.endPass();
-        }
+        if (!inPass(kind)) leavePass(m, disk);
         switch (kind) {
             .fill_begin => {
                 slot = try r.int(u32);
@@ -1727,7 +1824,9 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 // holds -1 there); none: the prompt's own ids
                 const seq = seqs[slot].items;
                 const n_spans = try r.int(u32);
+                if (n_spans == 0 and key_slot == slot) key_slot = null;
                 if (n_spans > 0) {
+                    key_slot = slot;
                     try key_ids.resize(gpa, seq.len);
                     for (key_ids.items, seq) |*k, x| k.* = @bitCast(x);
                     for (0..n_spans) |_| {
@@ -1747,6 +1846,8 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 const f = try ChunkFrame.read(&r);
                 try r.end();
                 if (f.start + f.n > seqs[slot].items.len) return error.BadChunk;
+                // a pass's next piece after a round (TF_FILL_CHUNKS): its read-ahead and sf-disk's pass again
+                rearmPass(m, disk, seqs[slot].items, if (key_slot == slot) key_ids.items else null);
                 if (f.pre_read != m.preRead(f.start, f.n)) {
                     plan_diffs += 1;
                     if (oftenEnough(plan_diffs)) std.log.warn("lanes: step {d} rank 1: its Engram read-ahead plan for the chunk at {d} differs from rank 0's ({}); rank 0's orders the gathers ({d} such chunks so far)", .{ step - 1, f.start, f.pre_read, plan_diffs });

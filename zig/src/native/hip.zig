@@ -61,6 +61,14 @@ fn envNumber(text: ?[]const u8) error{Invalid}!?u32 {
 }
 
 /// The flag's value, else the variable's, else `default`; `problem` names a variable that is not a whole number.
+/// A TF_FILL_* switch: its whole number, or null when unset (or not a whole number, which says so and leaves it off).
+fn fillSetting(name: [:0]const u8) ?u32 {
+    return envNumber(getenv(name)) catch {
+        std.log.warn("{s}={s}: not a whole number; ignored", .{ name, getenv(name).? });
+        return null;
+    };
+}
+
 fn setting(a: Allocator, flag: ?u32, name: [:0]const u8, default: u32, problem: *[]const u8) !?u32 {
     if (flag) |v| return v;
     const v = envNumber(getenv(name)) catch {
@@ -193,6 +201,10 @@ const Host = struct {
         h.clock = .{ .io = io };
         h.core = lanes.Engine.init(h.gpa, &h.cfg, h.backend(), h.clock.clock());
         errdefer h.core.deinit();
+        // TF_FILL_CHUNKS=N: a prompt pass runs N chunks at a time while other streams decode, TF_FILL_ROUNDS of their
+        // rounds between (a backend with prefill_part; unset or 0: each pass whole, the others waiting)
+        h.core.fill_chunks = fillSetting("TF_FILL_CHUNKS") orelse 0;
+        h.core.fill_rounds = fillSetting("TF_FILL_ROUNDS") orelse h.core.fill_rounds;
         h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
         h.host.explain = explain;
@@ -218,6 +230,12 @@ const Host = struct {
                     return x.inner.vtable.prefill(x.inner.ptr, s);
                 }
             }.f,
+            .prefill_part = if (v.prefill_part != null) struct {
+                fn f(p: *anyopaque, s: *lanes.Stream, chunks: usize) anyerror!bool {
+                    const x = bind(p);
+                    return x.inner.vtable.prefill_part.?(x.inner.ptr, s, chunks);
+                }
+            }.f else null,
             .first = struct {
                 fn f(p: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
                     const x = bind(p);
