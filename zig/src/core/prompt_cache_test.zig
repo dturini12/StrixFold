@@ -199,6 +199,25 @@ test "an entry keys its lookahead tokens: a prompt that differs right after the 
     try std.testing.expect(s.find(&.{ 1, 2, 3, 4 }, &.{}) == null); // the lookahead token must be in the prompt
 }
 
+test "a state within the tail of a prompt's end is passed over for an earlier one, and stays for the conversation that kept it" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.snapshots(), .{ .tail = 3, .min_prompt = 0 }, 1 << 20);
+    defer s.deinit();
+    const long = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    _ = f.pass(&s, &long, .{ .marks = &.{ 4, 8 } });
+    const short = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 20, 21 }; // shares 8 tokens and ends 2 past them, inside the tail
+    var p = try s.begin(a, &short, 9, &.{}, &.{}, null);
+    try std.testing.expectEqual(@as(u32, 4), p.from);
+    try std.testing.expectEqual(fresh(&short), f.pass(&s, &short, p));
+    const next = long ++ [_]u32{ 13, 14 }; // the long conversation's next turn resumes its own state at 8
+    p = try s.begin(a, &next, 12, &.{}, &.{}, null);
+    try std.testing.expectEqual(@as(u32, 8), p.from);
+}
+
 test "planned families resume and keep only at the request's chunk starts" {
     const gpa = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(gpa);
