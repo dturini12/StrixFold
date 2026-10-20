@@ -46,6 +46,8 @@ pub const Rules = struct {
     min_gap: u32 = 256,
     /// Shorter prompts keep nothing: below it a mark's extra prompt call costs more than a later turn's reuse saves.
     min_prompt: u32 = 4096,
+    /// Rows a resumed pass must still run past its state (DeepSeek's sliding window): a state nearer the end is passed over.
+    tail: u32 = 0,
 };
 
 pub const Entry = struct {
@@ -120,11 +122,11 @@ pub const Store = struct {
         return at > 0 and (!s.rules.planned or std.mem.indexOfScalar(u32, starts, at) != null);
     }
 
-    /// The longest kept state `prompt` resumes exactly: its tokens a prefix of the prompt, at least one row left.
+    /// The longest kept state `prompt` resumes exactly: its tokens a prefix of the prompt, at least one row and `tail` left.
     pub fn find(s: *Store, prompt: []const u32, starts: []const u32) ?*Entry {
         var best: ?*Entry = null;
         for (s.entries.items) |e| {
-            if (e.tokens.len > prompt.len or e.at >= prompt.len or !s.usable(e.at, starts)) continue;
+            if (e.tokens.len > prompt.len or e.at >= prompt.len or @as(usize, e.at) + s.rules.tail > prompt.len or !s.usable(e.at, starts)) continue;
             if (best != null and e.at <= best.?.at) continue;
             const n = e.tokens.len;
             if (prompt[n - 1] != e.tokens[n - 1] or !std.mem.eql(u32, prompt[0..n], e.tokens)) continue;
