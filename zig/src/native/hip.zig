@@ -384,7 +384,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     if (@hasField(@TypeOf(loaded), "snaps")) if (loaded.snaps) |sn| {
         const want: u64 = @intFromFloat((o.prompt_cache_gib orelse 0.5) * gib);
         if (want > 0) {
-            h.snap_vt = .{ .bytes = sn.bytes, .save = sn.save, .restore = sn.restore, .drop = sn.drop };
+            h.snap_vt = .{ .bytes = sn.bytes, .save = sn.save, .restore = sn.restore, .drop = sn.drop, .resumes = if (@hasField(@TypeOf(sn), "resumes")) sn.resumes else null, .live = if (@hasField(@TypeOf(sn), "live")) sn.live else null };
             h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{ .tail = if (@hasField(@TypeOf(sn), "tail")) sn.tail else 0 }, want);
         }
     };

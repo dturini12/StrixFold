@@ -32,11 +32,26 @@ const Fake = struct {
     live: usize = 0,
     spare_bytes: u64 = 0,
     peer: ?*Peer = null, // speed-up mode's rank 1: it keeps the same states and drops them only when a request names them
+    window: u32 = 0, // checked(): a state resumes a prompt only this many tokens or more before its end
+    dead_at: u32 = 0, // checked(): the state at this position lost its rows (0: none)
 
     const State = struct { at: u32, sum: u64 };
 
     fn snapshots(f: *Fake) Snapshots {
         return .{ .ptr = f, .vtable = &.{ .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn } };
+    }
+    /// With the family's own resume check: a state resumes a prompt only `window` tokens or more before its end, and
+    /// the state at `dead_at` lost its rows.
+    fn checked(f: *Fake) Snapshots {
+        return .{ .ptr = f, .vtable = &.{ .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn, .resumes = resumesFn, .live = liveFn } };
+    }
+    fn resumesFn(ptr: *anyopaque, saved: Saved, len: u32) bool {
+        const st: *State = @ptrCast(@alignCast(saved));
+        return liveFn(ptr, saved) and st.at + of(ptr).window <= len;
+    }
+    fn liveFn(ptr: *anyopaque, saved: Saved) bool {
+        const st: *State = @ptrCast(@alignCast(saved));
+        return st.at != of(ptr).dead_at;
     }
     /// With learned states on disk: a state's position and sum in one file.
     fn learned(f: *Fake) Snapshots {
@@ -134,7 +149,7 @@ const Fake = struct {
 
     /// A prompt pass from `plan.from`, keeping at each mark; returns the sum a fresh pass would give.
     fn pass(f: *Fake, s: *Store, prompt: []const u32, plan: Plan) u64 {
-        if (plan.from == 0) f.* = .{ .gpa = f.gpa, .fail_save = f.fail_save, .fail_restore = f.fail_restore, .live = f.live, .spare_bytes = f.spare_bytes, .peer = f.peer };
+        if (plan.from == 0) f.* = .{ .gpa = f.gpa, .fail_save = f.fail_save, .fail_restore = f.fail_restore, .live = f.live, .spare_bytes = f.spare_bytes, .peer = f.peer, .window = f.window, .dead_at = f.dead_at };
         if (f.peer) |p| p.in_pass = true;
         defer if (f.peer) |p| {
             p.in_pass = false;
@@ -493,4 +508,56 @@ test "past the learned-state cap the least recently used state is forgotten, and
     try std.testing.expect(!im.has(imprint.Imprint.keyOf(&two)));
     try std.testing.expectEqual(fresh(&p3), g.pass(&t, &p3, plan));
     try std.testing.expect(im.has(imprint.Imprint.keyOf(&two))); // learned again by that pass
+}
+
+test "a state the family does not resume for a prompt that ends too near it: an earlier one resumes, and it stays for its own conversation" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f: Fake = .{ .gpa = gpa, .window = 3 }; // as DeepSeek's window: a state resumes a prompt 3 or more tokens before its end
+    var s = Store.init(gpa, f.checked(), .{ .min_prompt = 0 }, 1 << 20);
+    defer s.deinit();
+    const t1 = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    _ = f.pass(&s, &t1, try s.begin(a, &t1, 2, &.{}, &.{}, null)); // keeps 2
+    const t2 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    var p = try s.begin(a, &t2, 5, &.{}, &.{}, null);
+    try std.testing.expectEqual(@as(u32, 2), p.from);
+    try std.testing.expectEqual(fresh(&t2), f.pass(&s, &t2, p)); // keeps 5
+    const five = s.find(&t2, &.{}).?;
+    try std.testing.expectEqual(@as(u32, 5), five.at);
+    const near = [_]u32{ 1, 2, 3, 4, 5, 6, 7 }; // ends 2 past the state at 5: the family refuses it, the one at 2 resumes
+    p = try s.begin(a, &near, 2, &.{}, &.{}, null);
+    try std.testing.expectEqual(@as(u32, 2), p.from);
+    try std.testing.expectEqual(fresh(&near), f.pass(&s, &near, p));
+    try std.testing.expectEqual(five, s.find(&t2, &.{}).?); // the state at 5 stays for t2's conversation
+    try std.testing.expectEqual(@as(u64, 2), s.counts.hits);
+    try std.testing.expectEqual(@as(u64, 0), s.counts.failed);
+    try std.testing.expectEqual(@as(u64, 0), s.counts.evicted);
+    try std.testing.expectEqual(@as(usize, 2), f.live);
+}
+
+test "a state that lost its rows: an earlier one resumes, and the lost one leaves the store" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.checked(), .{ .min_prompt = 0 }, 1 << 20);
+    defer s.deinit();
+    const t1 = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    _ = f.pass(&s, &t1, try s.begin(a, &t1, 2, &.{}, &.{}, null)); // keeps 2
+    const t2 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    _ = f.pass(&s, &t2, try s.begin(a, &t2, 5, &.{}, &.{}, null)); // keeps 5
+    try std.testing.expectEqual(@as(usize, 2), f.live);
+    f.dead_at = 5; // another stream wrote over its rows
+    const t3 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    const p = try s.begin(a, &t3, 2, &.{}, &.{}, null);
+    try std.testing.expectEqual(@as(u32, 2), p.from);
+    try std.testing.expectEqual(fresh(&t3), f.pass(&s, &t3, p));
+    try std.testing.expectEqual(@as(u64, 1), s.counts.evicted);
+    try std.testing.expectEqual(@as(u64, 0), s.counts.failed);
+    try std.testing.expectEqual(@as(usize, 1), s.entries.items.len); // the lost one left the store when find met it
+    try std.testing.expectEqual(@as(usize, 1), f.live);
+    try std.testing.expectEqual(@as(u32, 2), s.find(&t2, &.{}).?.at);
 }

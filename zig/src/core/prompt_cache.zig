@@ -19,6 +19,11 @@ pub const Snapshots = struct {
         /// Make the live state `saved`'s: the next prompt chunk starts at its position.
         restore: *const fn (ptr: *anyopaque, owner: ?*anyopaque, saved: Saved) anyerror!void,
         drop: *const fn (ptr: *anyopaque, saved: Saved) void,
+        /// Whether the family resumes `saved` for a prompt of `len` tokens: find passes a state it refuses over for
+        /// an earlier one (null: every state find matches).
+        resumes: ?*const fn (ptr: *anyopaque, saved: Saved, len: u32) bool = null,
+        /// Whether `saved` still holds its state: one that lost it leaves the store when find meets it (null: always).
+        live: ?*const fn (ptr: *anyopaque, saved: Saved) bool = null,
         /// The storage a kept state holds: new storage up to `bytes`, or the spare storage it took (null: `bytes`).
         charged: ?*const fn (ptr: *anyopaque, saved: Saved) u64 = null,
         /// Free storage the family keeps for later saves, inside the budget (null: none).
@@ -125,15 +130,38 @@ pub const Store = struct {
     /// The longest kept state `prompt` resumes exactly: its tokens a prefix of the prompt, at least one row and `tail` left.
     pub fn find(s: *Store, prompt: []const u32, starts: []const u32) ?*Entry {
         var best: ?*Entry = null;
-        for (s.entries.items) |e| {
+        var i: usize = 0;
+        while (i < s.entries.items.len) {
+            const e = s.entries.items[i];
+            i += 1;
             if (e.tokens.len > prompt.len or e.at >= prompt.len or @as(usize, e.at) + s.rules.tail > prompt.len or !s.usable(e.at, starts)) continue;
             if (best != null and e.at <= best.?.at) continue;
             const n = e.tokens.len;
             if (prompt[n - 1] != e.tokens[n - 1] or !std.mem.eql(u32, prompt[0..n], e.tokens)) continue;
-            best = e;
+            switch (s.familyResumes(e, prompt.len)) {
+                .resumes => best = e,
+                .refused => {},
+                .lost => { // (`best` is another entry: its pointer outlives the removal)
+                    i -= 1;
+                    s.remove(i);
+                    s.counts.evicted += 1;
+                },
+            }
         }
         return best;
     }
+
+    /// Whether the family resumes `e` for a prompt of `len` tokens: a state it refuses is passed over for an earlier
+    /// one. One that lost its rows also leaves the store now (counted as evicted); one this prompt only ends too near
+    /// stays for the longer prompts of the conversation that kept it.
+    fn familyResumes(s: *Store, e: *Entry, len: usize) Resumes {
+        const f = s.family.vtable.resumes orelse return .resumes;
+        if (f(s.family.ptr, e.saved, @intCast(len))) return .resumes;
+        if (s.family.vtable.live) |g| if (!g(s.family.ptr, e.saved)) return .lost;
+        return .refused;
+    }
+
+    const Resumes = enum { resumes, refused, lost };
 
     /// Before a prompt pass: restore the longest state `prompt` resumes (from 0: none or a failed copy) and plan its marks.
     pub fn begin(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, shared: []const u32, starts: []const u32, owner: ?*anyopaque) !Plan {

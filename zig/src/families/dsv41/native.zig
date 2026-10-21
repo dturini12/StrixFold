@@ -101,6 +101,9 @@ pub const Snaps = struct {
     drop: *const fn (*anyopaque, *anyopaque) void,
     /// Rows a resumed prompt pass must still run past a kept state (core/prompt_cache Rules.tail).
     tail: u32 = 0,
+    /// Whether a kept state restores for a prompt of this many tokens, and whether it still holds its rows.
+    resumes: *const fn (*anyopaque, *anyopaque, u32) bool,
+    live: *const fn (*anyopaque, *anyopaque) bool,
 };
 
 /// The rank's model and the backend over it (what `open` hands the server, freed by `deinit`).
@@ -252,7 +255,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []
     };
     // the pool is the model's (preallocated): a stream takes no device memory of its own
     const L = lanes_mod.Lanes;
-    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .tail = @intCast(st.m.cfg.window) };
+    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .resumes = L.snapResumesFn, .live = L.snapLiveFn, .tail = @intCast(st.m.cfg.window) };
     return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = hook, .structures = st.vocab != null, .context_window = lanes_mod.usableContext(st.m.context_cap, st.m.eng.round_rows) };
 }
 
