@@ -486,6 +486,33 @@ fn noteStale(sn: *const Snap, why: []const u8) void {
     if (sn.at >= note_rows) std.log.info("dsv41: the kept state of {d} tokens at {d} goes stale: {s}", .{ sn.at, sn.base, why });
 }
 
+/// Why a kept state does not restore for a prompt (Lanes.refusal).
+const Refusal = enum {
+    dropped, // the prompt cache freed it
+    stale, // a stream wrote over its rows
+    short, // the prompt ends at or before it
+    off_chunk, // it is not at a chunk end
+    near_end, // the prompt ends within the window past it: its replay starts before the state
+    unkeyed, // the prompt has images and no key: its spans' ids are all the image token
+
+    fn says(r: Refusal) []const u8 {
+        return switch (r) {
+            .dropped => "it was dropped",
+            .stale => "a stream wrote over its rows",
+            .short => "the prompt ends at or before it",
+            .off_chunk => "it is not at a chunk end",
+            .near_end => "the prompt ends within the window past it",
+            .unkeyed => "the prompt has images and no key",
+        };
+    }
+};
+
+/// Every kept state a prompt does not resume says why in the log (a dropped one is not read).
+fn noteRefusal(sn: *const Snap, len: usize, why: Refusal, then: []const u8) void {
+    if (why == .dropped) return std.log.info("dsv41: a prompt of {d} tokens resumes no kept state: {s}; {s}", .{ len, why.says(), then });
+    std.log.info("dsv41: a prompt of {d} tokens does not resume the kept state of {d} tokens at {d}: {s}; {s}", .{ len, sn.at, sn.base, why.says(), then });
+}
+
 /// How long a request waits for the live stream that holds the kept state it resumes from to end (then it resumes
 /// in place and every kept state stays) before other kept states give their room for a copy of it.
 const held_wait_ns: u64 = 10 * std.time.ns_per_s;
@@ -677,15 +704,18 @@ pub const Lanes = struct {
         var why: []const u8 = "no kept state"; // (the pass line's reason for running from 0)
         if (s.reuse.saved) |p| {
             const sn: *Snap = @ptrCast(@alignCast(p));
-            if (keyed and self.usable(sn, len)) {
+            // (a prompt with images and no key resumes nothing: its spans' ids are all the image token)
+            const refusing: ?Refusal = if (!keyed) .unkeyed else self.refusal(sn, len);
+            if (refusing) |r| {
+                noteRefusal(sn, len, r, if (self.disk != null) "it runs from 0 or from a state on disk" else "it runs from 0");
+                s.reuse_failed = true;
+                why = r.says();
+            } else {
                 kept = sn;
                 // in place unless the extent runs past the pool, a live stream holds it, or another kept state has
                 // rows past the kept ones (resuming there would stale it: the rows go to a free extent instead, as
                 // the Python lane's _place resumes "here" only in a free extent)
                 moved = sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size) or self.keptOver(sn.base + sn.at, sn.base + size, sn);
-            } else {
-                s.reuse_failed = true;
-                why = "its kept state is not usable";
             }
         }
         // sf-disk: a state on disk past the kept one in memory (after a restart, or when the kept rows went stale)
@@ -1112,11 +1142,16 @@ pub const Lanes = struct {
         return true;
     }
 
-    /// Whether a kept state still restores for a prompt of `len` tokens: live, not stale, a chunk end before the
-    /// prompt's replay (the rows before it ran the encoder layers alone, as a fresh pass of this prompt runs them).
-    fn usable(self: *const Lanes, sn: *const Snap, len: usize) bool {
-        if (std.mem.indexOfScalar(*Snap, self.snaps.items, @constCast(sn)) == null) return false;
-        return !sn.stale and sn.at > 0 and sn.at < len and sn.at % model.chunk_rows == 0 and sn.at <= len -| self.m.cfg.window;
+    /// Why a kept state does not restore for a prompt of `len` tokens (null: it does): it restores while live, not
+    /// stale, at a chunk end before the prompt's replay (the rows before it ran the encoder layers alone, as a fresh
+    /// pass of this prompt runs them).
+    fn refusal(self: *const Lanes, sn: *const Snap, len: usize) ?Refusal {
+        if (std.mem.indexOfScalar(*Snap, self.snaps.items, @constCast(sn)) == null) return .dropped;
+        if (sn.stale) return .stale;
+        if (sn.at == 0 or sn.at >= len) return .short;
+        if (sn.at % model.chunk_rows != 0) return .off_chunk;
+        if (sn.at > len -| self.m.cfg.window) return .near_end;
+        return null;
     }
 
     /// The first extent that fits around the live streams and the kept states. Kept states give their room least
@@ -1408,6 +1443,21 @@ pub const Lanes = struct {
 
     pub fn snapRestoreFn(_: *anyopaque, _: ?*anyopaque, _: *anyopaque) anyerror!void {
         return error.BackendRestores; // the prompt pass restores, before its first chunk
+    }
+
+    /// Whether a kept state restores for a prompt of `len` tokens: the prompt cache passes one that does not over for
+    /// an earlier state (the prompt pass would refuse it, and the prompt would run from 0).
+    pub fn snapResumesFn(ptr: *anyopaque, saved: *anyopaque, len: u32) bool {
+        const sn: *Snap = @ptrCast(@alignCast(saved));
+        const why = of(ptr).refusal(sn, len) orelse return true;
+        noteRefusal(sn, len, why, "the prompt cache looks for an earlier one");
+        return false;
+    }
+
+    /// Whether a kept state still holds its rows: one a stream wrote over leaves the prompt cache.
+    pub fn snapLiveFn(ptr: *anyopaque, saved: *anyopaque) bool {
+        const sn: *Snap = @ptrCast(@alignCast(saved));
+        return std.mem.indexOfScalar(*Snap, of(ptr).snaps.items, sn) != null and !sn.stale;
     }
 
     pub fn snapDropFn(ptr: *anyopaque, saved: *anyopaque) void {
