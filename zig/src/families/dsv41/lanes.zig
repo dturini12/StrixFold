@@ -79,8 +79,9 @@ fn topTwo(row: []const f32) [2]struct { u32, f32 } {
 pub var logits_dump: ?[]const u8 = null;
 
 /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
-/// 10-15 are sf-disk's (disk.zig), sent only when both ranks run it (the handshake's " disk=1").
-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, disk_sync = 10, disk_save = 11, disk_drop = 12, disk_load = 13, disk_outcome = 14, disk_rows = 15 };
+/// 10-15 are sf-disk's (disk.zig), sent only when both ranks run it (the handshake's " disk=1"); 16, fill_resume, only
+/// with TF_FILL_CUT_IN (upstream's 10: sf-disk has that number here).
+pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, disk_sync = 10, disk_save = 11, disk_drop = 12, disk_load = 13, disk_outcome = 14, disk_rows = 15, fill_resume = 16 };
 
 /// A frame being written.
 pub const Wire = struct {
@@ -553,6 +554,7 @@ pub const Lanes = struct {
     next: u64 = 0,
     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, least recently used first (made, or last resumed)
     fill: ?Fill = null, // the prompt pass that runs in pieces between rounds, from its next chunk (none: no pass runs)
+    paused: ?Fill = null, // the pass a short prompt cut into (lanes' cut_in), resumed by its next piece
     next_snap: u64 = 1,
     /// The tokenizer's bytes for structured output (native.zig loads it); null: requests with a structure refused.
     vocab: ?*const grammar.Vocab = null,
@@ -687,7 +689,26 @@ pub const Lanes = struct {
         defer if (self.prof) |*p| {
             p.prefill += m.now() - t0;
         };
-        if (self.fill) |f| if (f.s != s) return error.FillBusy;
+        if (self.fill) |f| if (f.s != s) {
+            // a prompt cuts in between this pass's pieces (TF_FILL_CUT_IN): it waits (one at most, neither with images:
+            // the cut-in's fillBegin clears the image spans), its next piece resumes it
+            if (self.paused != null or f.s.images.len > 0 or s.images.len > 0) return error.FillBusy;
+            self.paused = f;
+            self.fill = null;
+            // sf-disk's pass on its key ends, as rank 1's does at the cut-in's fill_begin (an unkeyed cut-in must not
+            // stream under this prompt's chain); fillResume begins it again
+            if (self.disk) |d| d.endPass();
+        };
+        if (self.fill == null) {
+            if (self.paused) |p| if (p.s == s) {
+                self.fillResume() catch |err| { // it ends, as a pass that failed after its opening
+                    self.paused = null;
+                    self.fill = p;
+                    self.fillFailed(s);
+                    return err;
+                };
+            };
+        }
         if (self.fill == null) {
             errdefer if (self.prof) |*p| {
                 p.prefills += 1;
@@ -752,6 +773,22 @@ pub const Lanes = struct {
         } else try draw(logits, len, s.sampling);
         l.first = self.take(token);
         return true;
+    }
+
+    /// A paused pass resumes: both ranks' model views back on its slot and extent, whose rows, rings and ids it kept, and
+    /// sf-disk's pass on its key again (the cut-in's replaced it on both ranks).
+    fn fillResume(self: *Lanes) !void {
+        const f = self.paused.?;
+        const l = self.streams.get(f.s) orelse return error.UnknownStream;
+        if (try self.begin(.fill_resume)) {
+            try self.wire.int(self.gpa, u32, @intCast(f.slot));
+            try self.wire.int(self.gpa, u64, l.base);
+            try self.flush();
+        }
+        try self.m.fillBegin(f.slot, l.base);
+        if (self.disk) |d| if (!d.off and f.keyed and !d.passing) d.beginPass(std.mem.sliceAsBytes(f.key));
+        self.fill = f;
+        self.paused = null;
     }
 
     /// The pass in pieces ended (its first token drawn, or it failed): sf-disk's pass on this rank ends with it.
@@ -1564,6 +1601,9 @@ pub const Lanes = struct {
             self.m.fill_seq = &.{};
             self.fillEnd();
         };
+        if (self.paused) |f| if (f.s == s) { // a paused pass cancelled (its disk pass ended when it paused)
+            self.paused = null;
+        };
         const kv = self.streams.fetchRemove(s) orelse return;
         self.used[kv.value.slot] = false;
         s.telemetry_len = kv.value.tel.write(if (self.m.graphs) |*g| g else null, &s.telemetry_buf);
@@ -1630,7 +1670,7 @@ fn inPass(kind: Kind) bool {
     return switch (kind) {
         .fill_chunk, .fill_images, .snap_save, .snap_restore, .snap_drop => true,
         .disk_save, .disk_drop, .disk_load, .disk_outcome, .disk_rows => true, // (sf-disk's, sent within a pass)
-        .fill_begin, .verify, .pass, .done, .disk_sync => false,
+        .fill_begin, .verify, .pass, .done, .disk_sync, .fill_resume => false,
     };
 }
 
@@ -1807,6 +1847,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             13 => .disk_load,
             14 => .disk_outcome,
             15 => .disk_rows,
+            16 => .fill_resume,
             else => return error.BadFrame,
         };
         if (try r.int(u64) != step) return error.OutOfStep;
@@ -1841,6 +1882,15 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 notePass(m, step - 1, 1, seqs[slot].items.len, slot, @intCast(base), "");
                 m.fillBegin(slot, @intCast(base)) catch |err| try refused(m, err);
                 m.fill_seq = seqs[slot].items;
+            },
+            .fill_resume => {
+                // a pass a short prompt cut into (TF_FILL_CUT_IN) goes on: its slot's view, ids and disk pass again
+                slot = try r.int(u32);
+                const base = try r.int(u64);
+                try r.end();
+                if (slot >= max_streams) return error.BadSlot;
+                m.fillBegin(slot, @intCast(base)) catch |err| try refused(m, err);
+                rearmPass(m, disk, seqs[slot].items, if (key_slot == slot) key_ids.items else null);
             },
             .fill_chunk => {
                 const f = try ChunkFrame.read(&r);
@@ -2246,7 +2296,7 @@ test "a frame is read to its end or refused; a repeated warning is logged first 
 test "the cache's frames between a pass's chunks leave rank 1's pass as it is; the others end it" {
     for ([_]Kind{ .fill_chunk, .fill_images, .snap_save, .snap_restore, .snap_drop }) |k| try std.testing.expect(inPass(k));
     for ([_]Kind{ .disk_save, .disk_drop, .disk_load, .disk_outcome, .disk_rows }) |k| try std.testing.expect(inPass(k));
-    for ([_]Kind{ .fill_begin, .verify, .pass, .done, .disk_sync }) |k| try std.testing.expect(!inPass(k));
+    for ([_]Kind{ .fill_begin, .verify, .pass, .done, .disk_sync, .fill_resume }) |k| try std.testing.expect(!inPass(k));
 }
 
 test "sf-disk's frames: kinds 10-15 after the stock ones, their keys and fields read back to the frame's end" {
@@ -2363,4 +2413,103 @@ test "a prefix two conversations share: the second one resuming it in place woul
     try ln.snaps.append(std.testing.allocator, &later);
     try std.testing.expect(ln.keptOver(shared.base + shared.at, shared.base + 55296, &shared)); // the second one moves
     try std.testing.expect(!ln.keptOver(later.base + later.at, later.base + 432128, &later)); // the first one's next turn stays
+}
+
+/// A rank's sf-disk pass as the follower's helpers drive it (disk.Disk.beginPass and endPass: the prompt's chain).
+const PassProbe = struct {
+    passing: bool = false,
+    chain: [8]pd.Key = undefined,
+    n: usize = 0,
+    begins: usize = 0,
+    ends: usize = 0,
+    fn beginPass(d: *PassProbe, ids: []const u8) void {
+        d.n = ids.len / 4 / disk_mod.block_tokens;
+        pd.chain(@splat(7), ids, disk_mod.block_tokens * 4, d.chain[0..d.n]);
+        d.passing = true;
+        d.begins += 1;
+    }
+    fn endPass(d: *PassProbe) void {
+        if (!d.passing) return;
+        d.passing = false;
+        d.ends += 1;
+    }
+    fn keys(d: *const PassProbe) []const pd.Key {
+        return d.chain[0..d.n];
+    }
+};
+
+const ModelProbe = struct {
+    fill_seq: []const i32 = &.{},
+    joins: usize = 0,
+    fn joinAhead(m: *ModelProbe) void {
+        m.joins += 1;
+    }
+};
+
+test "rank 1 across a pass's pieces: a round ends its disk pass, the next chunk begins it again on the same chain as rank 0's, a cut-in and the resume too" {
+    const c = model.chunk_rows;
+    const gpa = std.testing.allocator;
+    // pass A (3 blocks) and the short prompt B that cuts in (1 block), as rank 0 keys them (u32 ids) and rank 1 holds them
+    const a_ids = try gpa.alloc(u32, 3 * c + 5);
+    defer gpa.free(a_ids);
+    for (a_ids, 0..) |*x, i| x.* = @intCast(i * 31 % 50000);
+    const b_ids = try gpa.alloc(u32, c + 3);
+    defer gpa.free(b_ids);
+    for (b_ids, 0..) |*x, i| x.* = @intCast(i * 17 % 40000 + 1);
+    const a_seq = try gpa.alloc(i32, a_ids.len);
+    defer gpa.free(a_seq);
+    for (a_seq, a_ids) |*q, x| q.* = @intCast(x);
+    const b_seq = try gpa.alloc(i32, b_ids.len);
+    defer gpa.free(b_seq);
+    for (b_seq, b_ids) |*q, x| q.* = @intCast(x);
+    // rank 0: A's chain at its opening and again at its resume (fillResume: its key's bytes), B's for the cut-in
+    var r0: PassProbe = .{};
+    r0.beginPass(std.mem.sliceAsBytes(a_ids));
+    const a_keys = r0.chain;
+    r0.beginPass(std.mem.sliceAsBytes(b_ids));
+    const b_key = r0.chain[0];
+
+    var m: ModelProbe = .{};
+    var d: PassProbe = .{};
+    const disk: ?*PassProbe = &d;
+    // fill_begin A: its ids and disk pass (the follow loop's own lines)
+    m.fill_seq = a_seq;
+    d.beginPass(std.mem.sliceAsBytes(a_seq));
+    try std.testing.expectEqualSlices(pd.Key, a_keys[0..3], d.keys());
+    // a chunk of a whole pass: nothing happens
+    rearmPass(&m, disk, a_seq, null);
+    try std.testing.expectEqual(@as(usize, 1), d.begins);
+    // a round between two pieces ends the pass on rank 1
+    leavePass(&m, disk);
+    try std.testing.expect(!d.passing and m.fill_seq.len == 0 and d.ends == 1 and m.joins == 1);
+    // the next piece's chunk: ids and disk pass again, on rank 0's chain (a keep's disk_save checks its key there)
+    rearmPass(&m, disk, a_seq, null);
+    try std.testing.expect(d.passing and m.fill_seq.ptr == a_seq.ptr);
+    try std.testing.expectEqualSlices(pd.Key, a_keys[0..3], d.keys());
+    // a round, then B cuts in (fill_begin, not in the pass: leavePass first), runs whole, and a round follows
+    leavePass(&m, disk);
+    leavePass(&m, disk);
+    m.fill_seq = b_seq;
+    d.beginPass(std.mem.sliceAsBytes(b_seq));
+    try std.testing.expectEqual(b_key, d.keys()[0]);
+    rearmPass(&m, disk, b_seq, null);
+    try std.testing.expectEqual(@as(usize, 3), d.begins);
+    leavePass(&m, disk);
+    // fill_resume A (leavePass, its view, then rearmPass), and A's next chunk: A's chain again
+    leavePass(&m, disk);
+    rearmPass(&m, disk, a_seq, null);
+    try std.testing.expectEqualSlices(pd.Key, a_keys[0..3], d.keys());
+    rearmPass(&m, disk, a_seq, null);
+    try std.testing.expectEqual(@as(usize, 4), d.begins);
+    // a prompt with images: rank 1 keys it by the span key ids its fill_begin carried, as rank 0 does
+    leavePass(&m, disk);
+    const key_ids = try gpa.dupe(u32, a_ids);
+    defer gpa.free(key_ids);
+    for (a_seq[c .. c + 4]) |*q| q.* = -1; // an image span's positions on rank 1
+    rearmPass(&m, disk, a_seq, key_ids);
+    try std.testing.expectEqualSlices(pd.Key, a_keys[0..3], d.keys());
+    // without the sf-disk tier: the ids only
+    leavePass(&m, @as(?*PassProbe, null));
+    rearmPass(&m, @as(?*PassProbe, null), a_seq, null);
+    try std.testing.expect(m.fill_seq.ptr == a_seq.ptr);
 }

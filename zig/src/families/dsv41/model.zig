@@ -53,8 +53,10 @@ pub const chunk_rows = 2048;
 /// The version of lanes.zig's frames, rank 0 to rank 1 (the handshake compares it): 2 since fill_chunk carries rank 0's
 /// Engram read-ahead plan (2026-10-22); 3 since fill_begin carries the prompt's image span key ids (the prompt caches
 /// key a prompt with images by its pictures; rank 1 keys its disk states alike); 4 since pass carries whether its
-/// Markov steps draw with the streams' sampling keys, and those keys (draft_temperature).
-pub const frame_protocol = 4;
+/// Markov steps draw with the streams' sampling keys, and those keys (draft_temperature); 5 since a prompt pass may run
+/// in pieces with rounds between them and a short prompt cut in (TF_FILL_*: rank 1 re-arms a pass at its next chunk, and
+/// fill_resume, kind 16, returns it to a paused pass).
+pub const frame_protocol = 5;
 
 /// The prompt chunk buffers' rows: one of chunk_rows, or two halves when chunks split (TF_DS_PREFILL_SPLIT).
 pub fn chunkCaps(split_min: usize) [2]usize {
@@ -1396,16 +1398,16 @@ test "a launch identity is one plan token of at most 16 characters" {
 
 test "the handshake names what orders a prompt chunk's gathers: split, zip, chunk rows, phase timer, frames" {
     var b: [128]u8 = undefined;
-    try std.testing.expectEqualStrings("prefill_split=256 prefill_zip=true chunk_caps=1024/1024 phase_timer=false frames=4", try Model.gatherOrder(&b, 256, true, false));
-    try std.testing.expectEqualStrings("prefill_split=0 prefill_zip=true chunk_caps=2048/0 phase_timer=true frames=4", try Model.gatherOrder(&b, 0, true, true));
+    try std.testing.expectEqualStrings("prefill_split=256 prefill_zip=true chunk_caps=1024/1024 phase_timer=false frames=5", try Model.gatherOrder(&b, 256, true, false));
+    try std.testing.expectEqualStrings("prefill_split=0 prefill_zip=true chunk_caps=2048/0 phase_timer=true frames=5", try Model.gatherOrder(&b, 0, true, true));
 }
 
 test "the handshake's plan text is the stock one with sf-disk off, and says disk=1 only when on" {
     var gb: [128]u8 = undefined;
     const gather = try Model.gatherOrder(&gb, 256, true, false);
-    // 70cfb8c's format, byte for byte but for frames=4 (fill_begin's image span key ids, then pass's sampling keys;
-    // the disk frames did not change the protocol number)
-    const stock = "drafts=true engram=true graphs=false pool=8192 streams=1 round_rows=16 chunk_rows=2048 replay_floor=false aux=hip prefill_split=256 prefill_zip=true chunk_caps=1024/1024 phase_timer=false frames=4 engram_rows=true deploy=70cfb8c bundle=c178a012 conf=abcd kv=win-fp8qd,cmp-fp4,idx-fp4 strict=true";
+    // 70cfb8c's format, byte for byte but for frames=5 (fill_begin's image span key ids, then pass's sampling keys,
+    // then prompt passes in pieces; the disk frames did not change the protocol number)
+    const stock = "drafts=true engram=true graphs=false pool=8192 streams=1 round_rows=16 chunk_rows=2048 replay_floor=false aux=hip prefill_split=256 prefill_zip=true chunk_caps=1024/1024 phase_timer=false frames=5 engram_rows=true deploy=70cfb8c bundle=c178a012 conf=abcd kv=win-fp8qd,cmp-fp4,idx-fp4 strict=true";
     var p: Model.PlanParts = .{ .drafts = true, .engram = true, .graphs = false, .pool = 8192, .streams = 1, .round_rows = 16, .replay_floor = false, .aux = "hip", .gather = gather, .engram_rows = true, .deploy = "70cfb8c", .bundle = "c178a012", .conf = "abcd", .strict = true, .disk = false };
     var buf: [512]u8 = undefined;
     try std.testing.expectEqualStrings(stock, try Model.planText(&buf, p));

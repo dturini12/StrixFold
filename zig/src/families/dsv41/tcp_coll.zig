@@ -597,3 +597,23 @@ test "the GPU wait deadline is in the handshake, the warn threshold is not" {
     loud.gpu_warn_ns = 0;
     try std.testing.expect(compareText(ten, try identityText(&b1, &id, loud, 1)));
 }
+
+test "builds whose lanes frames differ refuse to pair: the plan carries frames=, and the handshake compares it" {
+    const model = @import("model.zig");
+    var g0: [128]u8 = undefined;
+    var g1: [128]u8 = undefined;
+    const ours = try model.Model.gatherOrder(&g0, 256, true, false);
+    try std.testing.expect(std.mem.endsWith(u8, ours, std.fmt.comptimePrint(" frames={d}", .{model.frame_protocol})));
+    // the build before the prompt passes in pieces (TF_FILL_*: fill_resume, rank 1's re-armed passes)
+    const before = try std.fmt.bufPrint(&g1, "{s}{d}", .{ ours[0 .. ours.len - std.fmt.count("{d}", .{model.frame_protocol})], model.frame_protocol - 1 });
+    try std.testing.expect(std.mem.endsWith(u8, before, " frames=4"));
+    const base: Settings = .{ .data_port = 29616, .stripe = null, .opt = .{} };
+    var b0: [1280]u8 = undefined;
+    var b1: [1280]u8 = undefined;
+    var id: coll.Identity = .{ .rank = 0, .world = 2, .kit_abi = 1, .kit_sha256 = @splat('0'), .modalities = 0, .plan = ours };
+    const mine = try identityText(&b0, &id, base, 1);
+    id.plan = before;
+    const theirs = try identityText(&b1, &id, base, 1);
+    try std.testing.expect(compareText(mine, mine));
+    try std.testing.expect(!compareText(mine, theirs)); // handshake: error.Mismatch, naming frames= on both sides
+}
