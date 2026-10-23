@@ -82,6 +82,7 @@ const Trie = struct {
 const Segment = struct { start: usize, end: usize, id: ?u32 };
 
 pub const Tokenizer = struct {
+    /// Owns the loaded tables and backs each call's scratch, so concurrent calls need it thread-safe.
     allocator: Allocator,
     arena: ?*std.heap.ArenaAllocator = null,
     /// Token to id for the model vocabulary and every added token.
@@ -198,7 +199,7 @@ pub const Tokenizer = struct {
 
     /// Text for `ids` through the decoder chain; unknown ids are skipped. Caller frees with `a`.
     pub fn decode(t: *const Tokenizer, a: Allocator, ids: []const u32, skip_special_tokens: bool) Error![]u8 {
-        var arena = std.heap.ArenaAllocator.init(a);
+        var arena = std.heap.ArenaAllocator.init(t.allocator);
         defer arena.deinit();
         var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
         var tokens = try std.ArrayList([]const u8).initCapacity(ctx.a, ids.len);
@@ -502,6 +503,32 @@ fn keptEverywhere(a: std.mem.Allocator, kinds: anytype, repeats: usize) !void {
         };
         try std.testing.expect(t.memo.?.hits >= 10); // every long segment of the second round, at least
     }
+}
+
+test "encode and decode put only their result in the caller's allocator" {
+    const json =
+        \\{"added_tokens":[{"id":7,"content":"<|end|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}],
+        \\ "pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":" ?\\S+|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
+        \\ "decoder":{"type":"ByteLevel"},
+        \\ "model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":"","end_of_word_suffix":"","fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
+        \\  "vocab":{"a":0,"b":1,"Ġ":2,"ab":3,"Ġa":4,"Ġab":5,"c":6},"merges":[["Ġ","a"],"a b","Ġa b"]}}
+    ;
+    const a = std.testing.allocator;
+    var t = try parse(a, json);
+    defer t.deinit();
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(a);
+    try text.appendSlice(a, "<|end|>");
+    while (text.items.len < 1 << 16) try text.appendSlice(a, "ab abc cab ");
+    const encoded = try t.encode(a, text.items);
+    defer a.free(encoded);
+    // a server's request arena keeps all it is given until the reply ends: this budget holds results, not scratch
+    const budget = try a.alloc(u8, 3 * @sizeOf(u32) * encoded.len);
+    defer a.free(budget);
+    var fba = std.heap.FixedBufferAllocator.init(budget);
+    try std.testing.expectEqualSlices(u32, encoded, try t.encode(fba.allocator(), text.items));
+    fba.reset();
+    try std.testing.expectEqualStrings(text.items, try t.decode(fba.allocator(), encoded, false));
 }
 
 test "sentencepiece-style BPE with byte fallback" {
