@@ -2513,3 +2513,17 @@ test "rank 1 across a pass's pieces: a round ends its disk pass, the next chunk 
     rearmPass(&m, @as(?*PassProbe, null), a_seq, null);
     try std.testing.expect(m.fill_seq.ptr == a_seq.ptr);
 }
+
+test "a prompt with images does not cut in between another pass's pieces" {
+    var m: Model = undefined;
+    m.io = std.testing.io;
+    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
+    var long: lanes.Stream = undefined;
+    long.images = &.{};
+    var short: lanes.Stream = undefined;
+    const image = [_]lanes.stream.Image{.{ .at = 0, .tokens = 1, .bytes = "" }};
+    short.images = &image;
+    ln.fill = .{ .s = &long, .slot = 0, .base = 0, .len = 16, .replay = 0, .last_end = 0, .start = 8, .keyed = true, .key = &.{} };
+    try std.testing.expectError(error.FillBusy, ln.prefillPart(&short, 1, true));
+    try std.testing.expect(ln.paused == null and ln.fill.?.s == &long); // the pass in pieces stays as it was
+}
