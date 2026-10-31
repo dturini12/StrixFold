@@ -207,6 +207,8 @@ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.R
     if (kw_object and !has_enable) if (thinkingSwitch(if (kwargs) |k| k.get("thinking") else null)) |sw| {
         enable = .{ .bool = sw };
     };
+    // DeepSeek's own API (and GLM's and Kimi's) switches thinking with a top-level ``thinking``; the kwargs win.
+    const top: ?bool = if (enable == null) thinkingSwitch(body.get("thinking")) else null;
     var effort = body.field("reasoning_effort");
     if (effort == null and kw_object) if (kwargs) |k| {
         effort = k.field("reasoning_effort");
@@ -220,6 +222,10 @@ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.R
         out.enable = on.truthy();
         if (out.enable.? and out.effort != null and std.mem.eql(u8, out.effort.?, "none")) out.effort = null;
     };
+    if (top) |on| {
+        out.enable = on;
+        if (on and out.effort != null and std.mem.eql(u8, out.effort.?, "none")) out.effort = null;
+    }
     return out;
 }
 
@@ -313,4 +319,27 @@ test "efforts and numbers" {
     defer arena.deinit();
     try std.testing.expectEqualStrings("-12", (try pyIntText(arena.allocator(), " -0_12 ")).?);
     try std.testing.expect(try pyIntText(arena.allocator(), "8.0") == null);
+}
+
+test "a top-level thinking switch, as DeepSeek's API sends it; chat_template_kwargs win" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cx: Cx = .{ .a = a };
+    const cases = [_]struct { []const u8, ?bool, ?[]const u8 }{
+        .{ "{\"thinking\":{\"type\":\"disabled\"}}", false, null },
+        .{ "{\"thinking\":{\"type\":\"enabled\"}}", true, null },
+        .{ "{\"thinking\":{\"type\":\"enabled\"},\"reasoning_effort\":\"none\"}", true, null },
+        .{ "{\"thinking\":{\"type\":\"disabled\"},\"reasoning_effort\":\"high\"}", false, "xhigh" },
+        .{ "{\"thinking\":{\"type\":\"disabled\"},\"chat_template_kwargs\":{\"enable_thinking\":true}}", true, null },
+        .{ "{\"thinking\":{\"type\":\"enabled\"},\"chat_template_kwargs\":{\"thinking\":false}}", false, null },
+        .{ "{\"thinking\":\"sometimes\"}", null, null },
+        .{ "{}", null, null },
+    };
+    for (cases) |c| {
+        const body = (try json.parse(a, c[0])).ok;
+        const got = try thinkingFields(&cx, body, &.{});
+        try std.testing.expectEqual(c[1], got.enable);
+        if (c[2]) |e| try std.testing.expectEqualStrings(e, got.effort.?) else try std.testing.expect(got.effort == null);
+    }
 }
