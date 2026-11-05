@@ -10,6 +10,7 @@ const tool_stream = @import("tool_stream.zig");
 const tool_parse = @import("tool_parse.zig");
 const prompt_mod = @import("prompt.zig");
 const log = @import("log.zig");
+const cached_tokens = @import("cached_tokens.zig");
 const ids = @import("ids.zig");
 const clock = @import("clock.zig");
 const Server = @import("server.zig").Server;
@@ -639,7 +640,7 @@ const Generation = struct {
             .tool_calls_streamed = g.calls != null and g.calls.?.streamed,
             .finish_reason = reason,
             .prompt_tokens = prompt_len,
-            .cached_tokens = m.cached orelse 0,
+            .cached_tokens = cached_tokens.within(m.cached, prompt_len),
             .completion_tokens = g.collected.items.len,
             .reasoning_tokens = reply_text.reasoningCount(g.collected.items, think_end),
             .runtime = .{ .object = runtime },
