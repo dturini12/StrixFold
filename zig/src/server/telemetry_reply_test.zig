@@ -136,3 +136,49 @@ test "an engine's telemetry reaches the reply's speculative.proposer intact afte
     try std.testing.expectEqual(@as(usize, 3), rows.len);
     try std.testing.expectEqualStrings("2", rows[0].int);
 }
+
+/// Reports more restored prompt tokens than the prompt holds (issue #1899: the TP=2 doubling).
+const OverCached = struct {
+    fn engine(e: *@This()) api.Engine {
+        return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
+    }
+
+    fn info(_: *anyopaque) api.Info {
+        return .{};
+    }
+
+    fn submit(_: *anyopaque, id: api.Id, request: *const api.Request, sink: api.Sink) api.SubmitError!void {
+        sink.event(sink.ctx, id, &.{ .prefilled = @intCast(request.prompt.len + 5) });
+        sink.event(sink.ctx, id, &.{ .tokens = &.{ 'o', 'k' } });
+        sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .stop } });
+    }
+
+    fn cancel(_: *anyopaque, _: api.Id) void {}
+
+    fn status(_: *anyopaque, out: *api.Status, _: []u32) void {
+        out.* = .{};
+    }
+
+    fn memory(_: *anyopaque, _: bool) ?api.Memory {
+        return null;
+    }
+};
+
+test "cached tokens above the prompt are clamped to the prompt in the reply" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var text: ByteText = .{};
+    var backend: OverCached = .{};
+    var srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{ .served_name = "m", .model_ids = &.{"m"}, .use_drafts = false }, null);
+    defer srv.deinit();
+    const reply = try post(a, srv, "{\"model\":\"m\",\"max_tokens\":2,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
+    try std.testing.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 200"));
+    const at = std.mem.indexOf(u8, reply, "\r\n\r\n") orelse return error.BadReply;
+    const parsed = try json.parse(a, reply[at + 4 ..]);
+    try std.testing.expect(parsed == .ok);
+    const usage = parsed.ok.get("usage").?;
+    const prompt = usage.get("prompt_tokens").?.int;
+    try std.testing.expect(!std.mem.eql(u8, prompt, "0"));
+    try std.testing.expectEqualStrings(prompt, usage.get("prompt_tokens_details").?.get("cached_tokens").?.int);
+}
