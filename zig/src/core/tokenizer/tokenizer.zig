@@ -133,7 +133,7 @@ pub const Tokenizer = struct {
         return a.dupe(u32, ids.items);
     }
 
-    /// encodeText through the memo for a long segment: its kept ids, else encoded and kept.
+    /// encodeText through the memo for a segment of `min_bytes` or more: its kept ids, else encoded and kept.
     fn encodeSegment(t: *const Tokenizer, ctx: *steps.Context, text: []const u8, first: bool, ids: *std.ArrayList(u32)) Error!void {
         const m = t.memo orelse return t.encodeText(ctx, text, first, ids);
         if (text.len < @import("memo.zig").min_bytes) return t.encodeText(ctx, text, first, ids);
@@ -371,6 +371,40 @@ test "with the memo, long segments encode as without it, and the second encode t
     try std.testing.expectEqual(@as(u64, 2), t.memo.?.hits); // both segments, the second time
 }
 
+test "the memo keeps a 64-byte segment and tokenizes one under min_bytes each time" {
+    const json =
+        \\{"added_tokens":[{"id":7,"content":"<|end|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}],
+        \\ "pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":" ?\\S+|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
+        \\ "model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":"","end_of_word_suffix":"","fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
+        \\  "vocab":{"a":0,"b":1,"Ġ":2,"ab":3,"Ġa":4,"Ġab":5,"c":6},"merges":[["Ġ","a"],"a b","Ġa b"]}}
+    ;
+    const a = std.testing.allocator;
+    var t = try parse(a, json);
+    defer t.deinit();
+    const under = @import("memo.zig").min_bytes - 1;
+    const bytes = try a.alloc(u8, @max(64, under));
+    defer a.free(bytes);
+    for (bytes, 0..) |*c, i| c.* = "ab c"[i % 4];
+    // 64 bytes, a short chat message, is kept; one byte under the minimum is not
+    for ([_][]const u8{ bytes[0..64], bytes[0..under] }, [_]u64{ 1, 0 }) |segment, hits| {
+        const text = try std.mem.concat(a, u8, &.{ "<|end|>", segment, "<|end|>" });
+        defer a.free(text);
+        const plain = try t.encode(a, text);
+        defer a.free(plain);
+        t.memo = try Memo.create(a, 1 << 20);
+        defer {
+            t.memo.?.destroy();
+            t.memo = null;
+        }
+        for (0..2) |_| {
+            const kept = try t.encode(a, text);
+            defer a.free(kept);
+            try std.testing.expectEqualSlices(u32, plain, kept);
+        }
+        try std.testing.expectEqual(hits, t.memo.?.hits);
+    }
+}
+
 test "a kept segment's ids equal a fresh encode's wherever the segment sits" {
     const added =
         \\{"added_tokens":[{"id":20,"content":"<|end|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
@@ -390,9 +424,14 @@ test "a kept segment's ids equal a fresh encode's wherever the segment sits" {
         ,
     };
     const a = std.testing.allocator;
+    // a long body and a short chat message's, both kept and read back in every position
+    for ([_]usize{ 200, 10 }) |repeats| try keptEverywhere(a, kinds, repeats); // 1,400 and 70 bytes
+}
+
+fn keptEverywhere(a: std.mem.Allocator, kinds: anytype, repeats: usize) !void {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(a);
-    for (0..200) |i| try body.appendSlice(a, if (i % 3 == 0) "ab abc " else "cab ab ");
+    for (0..repeats) |i| try body.appendSlice(a, if (i % 3 == 0) "ab abc " else "cab ab ");
     const b = body.items;
     // first or not, after lstrip and rstrip tokens, with a leading space, around a lossy byte, repeated in one prompt
     const texts = [_][]const []const u8{
