@@ -491,3 +491,61 @@ test "another identity's directory counts against the budget and goes first when
     _ = c.close(fd);
     try std.testing.expectError(error.ForeignNamespace, Tier.open(gpa, cfg, "new", 0, slot_bytes, &planes));
 }
+
+test "a save refused for the budget leaves no block behind: an unrelated state that fits an empty store still fits" {
+    const gpa = std.testing.allocator;
+    var rb: [128]u8 = undefined;
+    const root = try scratch(&rb, "guard");
+    defer rmTree(root);
+    var ta: [32]u32 = undefined;
+    var ka: [8]Key = undefined;
+    pd.chain(pd.seed("id"), prompt(&ta, null), B, &ka);
+    var tb: [32]u32 = undefined;
+    var kb: [8]Key = undefined;
+    pd.chain(pd.seed("id"), prompt(&tb, 0), B, &kb); // shares nothing with a
+    var cfg = cfgFor(root);
+    cfg.budget = 4 * (pd.head_bytes + block_bytes) + pd.head_bytes + 4 * 32 + slot_bytes; // one four-block state
+    const t = try Tier.open(gpa, cfg, "id", 0, slot_bytes, &planes);
+    defer t.close();
+    var p4 = try save(t, ka[0..4]);
+    p4.deinit(gpa);
+    try std.testing.expect(t.flush(5 * std.time.ns_per_s));
+    // the eight-block state of the same prompt cannot fit even alone: its plan evicts the four-block one and is refused
+    var p8 = try save(t, &ka);
+    defer p8.deinit(gpa);
+    try std.testing.expectEqual(pd.Reason.budget, p8.result.skip);
+    try std.testing.expectEqual(@as(usize, 1), p8.victims.len);
+    try std.testing.expectEqual(@as(usize, 0), t.blocks.count()); // the evicted state's blocks went with it
+    try std.testing.expectEqual(@as(u64, 0), t.bytes);
+    var other = try save(t, kb[0..4]);
+    defer other.deinit(gpa);
+    try std.testing.expect(other.result == .ok);
+    try std.testing.expect(t.flush(5 * std.time.ns_per_s));
+    try std.testing.expectEqual(@as(?u32, 4), t.longest(&kb, 0, 8));
+    var sb: [256]u8 = undefined;
+    const ns = std.fmt.bytesToHex(pd.namespaceOf("id"), .lower);
+    try std.testing.expectEqual(@as(usize, 4), countFiles(try std.fmt.bufPrint(&sb, "{s}/{s}/b", .{ root, &ns }), ".blk"));
+}
+
+test "the writer's queue keeps storage for the jobs outstanding, not for every job that passed through" {
+    const gpa = std.testing.allocator;
+    var f: pd.Fifo(u64) = .{};
+    defer f.deinit(gpa);
+    for (0..10) |i| try f.push(gpa, i); // a backlog of ten that never drains
+    var next: u64 = 0;
+    var most: usize = 0;
+    for (10..100_000) |i| {
+        try f.push(gpa, i);
+        try std.testing.expectEqual(next, f.pop().?); // first in, first out
+        next += 1;
+        most = @max(most, f.items.items.len);
+        try std.testing.expectEqual(@as(usize, 10), f.len());
+    }
+    try std.testing.expect(most <= 2 * 32 + 10); // bounded by the backlog, not by the 100,000 that went through
+    while (f.pop()) |x| {
+        try std.testing.expectEqual(next, x);
+        next += 1;
+    }
+    try std.testing.expectEqual(@as(u64, 100_000), next);
+    try std.testing.expectEqual(@as(usize, 0), f.items.items.len);
+}

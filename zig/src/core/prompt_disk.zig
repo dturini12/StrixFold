@@ -183,6 +183,54 @@ const Job = union(enum) {
 
 const Done = struct { job: Job, ok: bool, reason: Reason = .io };
 
+/// A FIFO over an array whose taken prefix is dropped once it is at least as long as what is left (and 32 items): its
+/// storage stays proportional to the items outstanding, whatever has passed through it.
+pub fn Fifo(comptime T: type) type {
+    return struct {
+        items: std.ArrayList(T) = .empty,
+        head: usize = 0,
+
+        const Self = @This();
+
+        pub fn len(f: *const Self) usize {
+            return f.items.items.len - f.head;
+        }
+
+        pub fn push(f: *Self, gpa: Allocator, x: T) !void {
+            f.compact();
+            try f.items.append(gpa, x);
+        }
+
+        pub fn pop(f: *Self) ?T {
+            if (f.head == f.items.items.len) return null;
+            const x = f.items.items[f.head];
+            f.head += 1;
+            if (f.head == f.items.items.len) {
+                f.items.clearRetainingCapacity();
+                f.head = 0;
+            }
+            return x;
+        }
+
+        fn compact(f: *Self) void {
+            if (f.head < 32 or f.head < f.len()) return;
+            const left = f.len();
+            std.mem.copyForwards(T, f.items.items[0..left], f.items.items[f.head..]);
+            f.items.shrinkRetainingCapacity(left);
+            f.head = 0;
+        }
+
+        /// The items still queued.
+        pub fn rest(f: *const Self) []T {
+            return f.items.items[f.head..];
+        }
+
+        pub fn deinit(f: *Self, gpa: Allocator) void {
+            f.items.deinit(gpa);
+        }
+    };
+}
+
 const Other = struct { name: [32]u8, bytes: u64, used: i128 };
 
 pub const Counts = struct {
@@ -215,8 +263,7 @@ pub const Tier = struct {
     // the writer (`mu` guards jobs, done, queued, stop)
     mu: c.pthread_mutex_t = .{},
     cv: c.pthread_cond_t = .{},
-    jobs: std.ArrayList(Job) = .empty,
-    head: usize = 0,
+    jobs: Fifo(Job) = .{},
     done: std.ArrayList(Done) = .empty,
     queued: u64 = 0,
     stop: bool = false,
@@ -258,7 +305,7 @@ pub const Tier = struct {
         _ = c.pthread_mutex_unlock(&t.mu);
         if (t.thread) |th| th.join();
         t.drain();
-        for (t.jobs.items[t.head..]) |*j| freeJob(t.gpa, j);
+        for (t.jobs.rest()) |*j| freeJob(t.gpa, j);
         t.jobs.deinit(t.gpa);
         t.done.deinit(t.gpa);
         t.freeIndex();
@@ -459,7 +506,7 @@ pub const Tier = struct {
         const until = now() + max_ns;
         while (true) {
             _ = c.pthread_mutex_lock(&t.mu);
-            const idle = t.head == t.jobs.items.len and !t.running;
+            const idle = t.jobs.len() == 0 and !t.running;
             _ = c.pthread_mutex_unlock(&t.mu);
             if (idle) break;
             if (now() > until) return false;
@@ -529,7 +576,7 @@ pub const Tier = struct {
         }
         if (!state and missing == 0) return .{ .result = .ok };
         const kk: u64 = keys.len;
-        const charge_ = missing * t.block_bytes + (if (state) kk * 32 + t.slot_bytes else 0);
+        const charge_ = missing * (t.block_bytes + 32) + (if (state) kk * 32 + t.slot_bytes else 0);
         const files = t.runFiles(missing) + (if (state) t.stateFile(kk) else 0);
         if (charge_ > t.queueRoom()) return t.skipped(.queue);
         if (t.freeBytes() < t.cfg.floor + files) return t.skipped(.floor);
@@ -538,13 +585,13 @@ pub const Tier = struct {
             if (t.cfg.follower) {
                 if (t.bytes + t.others_bytes + files > t.cfg.budget + t.cfg.budget / 16) return t.skipped(.budget);
             } else {
-                // this plan's blocks stay while others go (an older state of the same conversation shares them)
+                // this plan's blocks stay while others go (an older state of the same conversation shares them); if
+                // the plan does not stand, those the evictions left without a state or a pass go after all
                 for (keys) |k| if (t.blocks.getPtr(k)) |b| {
                     b.guard = true;
                 };
-                defer for (keys) |k| if (t.blocks.getPtr(k)) |b| {
-                    b.guard = false;
-                };
+                var stands = false;
+                defer t.unguard(keys, !stands);
                 while (t.bytes + t.others_bytes + files > t.cfg.budget) {
                     const v = t.victim() orelse break;
                     try victims.append(gpa, v);
@@ -556,6 +603,7 @@ pub const Tier = struct {
                     p.victims = try victims.toOwnedSlice(gpa);
                     return p;
                 }
+                stands = true;
             }
         }
         // the plan stands: blocks pending, the state pending with its references, the queue reserved
@@ -589,6 +637,16 @@ pub const Tier = struct {
         return .{ .result = .ok, .victims = out_victims, .runs = out_runs, .charge = charge_ };
     }
 
+    /// A plan's guards released; with `reclaim`, its blocks no state or pass holds go (an eviction may have left them).
+    fn unguard(t: *Tier, keys: []const Key, reclaim: bool) void {
+        var del: std.ArrayList(Key) = .empty;
+        for (keys) |k| if (t.blocks.getPtr(k)) |b| {
+            b.guard = false;
+            if (reclaim and b.refs == 0 and !b.pinned) t.forgetBlock(k, &del);
+        };
+        t.pushDelete(&.{}, del.toOwnedSlice(t.gpa) catch &.{});
+    }
+
     fn skipped(t: *Tier, why: Reason) Plan {
         t.counts.skipped += 1;
         return .{ .result = .{ .skip = why } };
@@ -601,7 +659,7 @@ pub const Tier = struct {
             t.gpa.free(data);
             return e;
         };
-        t.push(.{ .run = .{ .keys = owned, .first_j = first_j, .data = data, .charge = t.block_bytes * keys.len, .t0 = now() } });
+        t.push(.{ .run = .{ .keys = owned, .first_j = first_j, .data = data, .charge = (t.block_bytes + 32) * keys.len, .t0 = now() } });
     }
 
     /// The state's own bytes (gpa, owned now) after its runs; written once they are.
@@ -617,7 +675,7 @@ pub const Tier = struct {
     /// A plan whose bytes never came (a device copy failed): its reservation released, its state and blocks gone.
     pub fn abandon(t: *Tier, p: *const Plan, keys: []const Key, state: bool, submitted_runs: usize) void {
         var left = p.charge;
-        for (p.runs[0..submitted_runs]) |r| left -|= t.block_bytes * r.n;
+        for (p.runs[0..submitted_runs]) |r| left -|= (t.block_bytes + 32) * r.n;
         _ = c.pthread_mutex_lock(&t.mu);
         t.queued -|= left;
         _ = c.pthread_mutex_unlock(&t.mu);
@@ -822,7 +880,7 @@ pub const Tier = struct {
     fn push(t: *Tier, j: Job) void {
         _ = c.pthread_mutex_lock(&t.mu);
         defer _ = c.pthread_mutex_unlock(&t.mu);
-        t.jobs.append(t.gpa, j) catch {
+        t.jobs.push(t.gpa, j) catch {
             // no room for the job itself: it fails at once (its bytes freed, its reservation released)
             var x = j;
             t.queued -|= charge(&x);
@@ -841,18 +899,13 @@ pub const Tier = struct {
         lowerPriority();
         while (true) {
             _ = c.pthread_mutex_lock(&t.mu);
-            while (t.head == t.jobs.items.len and !t.stop) _ = c.pthread_cond_wait(&t.cv, &t.mu);
-            if (t.head == t.jobs.items.len or (t.stop and now() > t.deadline)) {
+            while (t.jobs.len() == 0 and !t.stop) _ = c.pthread_cond_wait(&t.cv, &t.mu);
+            if (t.jobs.len() == 0 or (t.stop and now() > t.deadline)) {
                 _ = c.pthread_mutex_unlock(&t.mu);
                 return;
             }
-            var j = t.jobs.items[t.head];
+            var j = t.jobs.pop().?;
             t.running = true;
-            t.head += 1;
-            if (t.head == t.jobs.items.len) {
-                t.jobs.clearRetainingCapacity();
-                t.head = 0;
-            }
             _ = c.pthread_mutex_unlock(&t.mu);
             var reason: Reason = .io;
             const ok = t.run(&j, &reason);
