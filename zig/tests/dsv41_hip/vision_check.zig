@@ -188,8 +188,10 @@ pub fn main(init: std.process.Init) !u8 {
 
     for (cases.items) |name| {
         const c = try readCase(a, io, golden.?, name);
-        const patches_bytes = try readFile(a, io, c.dir, "patches.bf16");
-        const patches = std.mem.bytesAsSlice(u16, @as([]align(2) u8, @alignCast(patches_bytes)));
+        const read = try readFile(a, io, c.dir, "patches.bf16");
+        const patches_bytes = try a.alignedAlloc(u8, .@"2", read.len); // (a file read is byte aligned)
+        @memcpy(patches_bytes, read);
+        const patches = std.mem.bytesAsSlice(u16, patches_bytes);
         var p: Probed = .{ .a = a, .io = io, .d = &d, .s = s, .case = &c };
         const rows_at = try tower.encode(c.grid, patches, .{ .ctx = &p, .f = Probed.probe });
         try tower.spanRows(c.grid, rows_at, span.ptr, 0);
