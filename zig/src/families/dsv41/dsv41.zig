@@ -9,6 +9,7 @@ pub const picture = @import("picture.zig");
 pub const cublaslt = @import("cublaslt.zig");
 pub const fmha = @import("fmha.zig");
 pub const vit = @import("vit.zig");
+pub const vit_hip = @import("vit_hip.zig");
 pub const vision = @import("vision.zig");
 pub const pil = @import("pil.zig");
 pub const checkpoint = @import("checkpoint.zig");

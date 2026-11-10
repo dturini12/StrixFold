@@ -365,6 +365,16 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         .imports = &.{ .{ .name = "gpu", .module = rs_gpu }, .{ .name = "dsv41", .module = rs_family } },
     }) });
     gpu_test.dependOn(&b.addInstallArtifact(glue_test, .{ .dest_dir = .{ .override = install_test } }).step);
+    // the vision tower against engineLab's host reference, step by step (tools/vision-golden's dumps)
+    const vision_check = b.addExecutable(.{ .name = "tf-dsv41-vision-check", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/dsv41_hip/vision_check.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "gpu", .module = rs_gpu }, .{ .name = "dsv41", .module = rs_family } },
+    }) });
+    gpu_test.dependOn(&b.addInstallArtifact(vision_check, .{ .dest_dir = .{ .override = install_test } }).step);
+    gpu_test.dependOn(noNvidia(b, vision_check));
 
     // the serve kit: glue.hip and aux.hip (and w-exl3's sources as they land), w-tri's Triton kit with -Dhip-triton-kit,
     // every kernel the registry requires for dsv41 checked when a model opens it
