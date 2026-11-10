@@ -20,6 +20,8 @@ const round = @import("round.zig");
 const draft = @import("draft.zig");
 const sampling = @import("sampling.zig");
 const link = @import("link.zig");
+const disk_mod = @import("disk.zig");
+const pd = @import("core").prompt_disk;
 const gpu = @import("gpu");
 /// The vision tower's type: CUDA builds only (gpu.features.vision); an empty type a HIP build never fills.
 pub const VisionTower = if (gpu.features.vision) @import("vision.zig").Vision else opaque {};
@@ -76,7 +78,8 @@ fn topTwo(row: []const f32) [2]struct { u32, f32 } {
 pub var logits_dump: ?[]const u8 = null;
 
 /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9 };
+/// 10-15 are sf-disk's (disk.zig), sent only when both ranks run it (the handshake's " disk=1").
+pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, disk_sync = 10, disk_save = 11, disk_drop = 12, disk_load = 13, disk_outcome = 14, disk_rows = 15 };
 
 /// A frame being written.
 pub const Wire = struct {
@@ -92,6 +95,10 @@ pub const Wire = struct {
         var b: [@sizeOf(T)]u8 = undefined;
         std.mem.writeInt(T, &b, v, .little);
         try w.buf.appendSlice(gpa, &b);
+    }
+
+    pub fn key(w: *Wire, gpa: std.mem.Allocator, k: pd.Key) !void {
+        try w.buf.appendSlice(gpa, &k);
     }
 
     pub fn ids(w: *Wire, gpa: std.mem.Allocator, v: []const i32) !void {
@@ -121,6 +128,13 @@ pub const Reader = struct {
     /// Every byte of the frame was read (else BadFrame: a frame with more fields than this build reads, a mixed pair).
     pub fn end(r: *const Reader) !void {
         if (r.at != r.b.len) return error.BadFrame;
+    }
+
+    pub fn key(r: *Reader) !pd.Key {
+        if (r.at + 32 > r.b.len) return error.ShortFrame;
+        const k = r.b[r.at..][0..32].*;
+        r.at += 32;
+        return k;
     }
 
     /// The frame's bytes after those read.
@@ -465,6 +479,8 @@ pub const Lanes = struct {
     next_snap: u64 = 1,
     /// The tokenizer's bytes for structured output (native.zig loads it); null: requests with a structure refused.
     vocab: ?*const grammar.Vocab = null,
+    /// sf-disk's tier on this rank (attachDisk; null: off).
+    disk: ?*disk_mod.Disk = null,
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
@@ -483,6 +499,8 @@ pub const Lanes = struct {
         }
         self.snaps.deinit(self.gpa);
         if (self.peer != null) self.send(.done) catch {};
+        if (self.disk) |d| d.close(); // (its queued writes finish first, as rank 1's do after done)
+        self.disk = null;
         self.streams.deinit(self.gpa);
         for (&self.seqs) |*q| q.deinit(self.gpa);
         self.wire.deinit(self.gpa);
@@ -632,6 +650,19 @@ pub const Lanes = struct {
                 why = "its kept state is not usable";
             }
         }
+        // sf-disk: a state on disk past the kept one in memory (after a restart, or when the kept rows went stale)
+        var disk_k: u32 = 0;
+        if (self.disk) |d| if (!d.off and s.images.len == 0) {
+            d.beginPass(std.mem.sliceAsBytes(ids));
+            const k_max: u32 = @intCast(@min(len - 1, len -| m.cfg.window) / model.chunk_rows);
+            const k_min: u32 = if (kept) |sn| @intCast(sn.at / model.chunk_rows) else 0;
+            if (d.tier.longest(d.chain.items, k_min, k_max)) |k| {
+                disk_k = k;
+                kept = null; // (left kept in memory: not failed)
+                moved = false;
+            }
+        };
+        defer if (self.disk) |d| d.endPass();
         const base = if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size, kept);
         if (kept) |sn| {
             sn.wanted = 0;
@@ -651,6 +682,8 @@ pub const Lanes = struct {
                 std.fmt.bufPrint(&rb, ", {d} rows; resumes state {d} at {d}, moved from {d}; {d} other stream(s) live", .{ size, sn.id, sn.at, sn.base, nt })
             else
                 std.fmt.bufPrint(&rb, ", {d} rows; resumes state {d} at {d} in place; {d} other stream(s) live", .{ size, sn.id, sn.at, nt }))
+            else if (disk_k > 0)
+                std.fmt.bufPrint(&rb, ", {d} rows; resumes disk state at {d}; {d} other stream(s) live", .{ size, disk_k * model.chunk_rows, nt })
             else
                 std.fmt.bufPrint(&rb, ", {d} rows; from 0: {s}; {d} other stream(s) live", .{ size, why, nt })) catch "";
             notePass(m, self.step, 0, len, slot, base, detail);
@@ -737,10 +770,15 @@ pub const Lanes = struct {
             try m.snapCopy(slot, sn.buf.ptr, false);
             start = sn.at;
             s.cached = @intCast(sn.at);
+        } else if (disk_k > 0) {
+            start = try self.diskResume(slot, base, disk_k);
+            s.cached = @intCast(start);
         }
         // where this pass keeps states: the cache's marks and its last chunk end before the replay (the served lane's
         // kept prompt), each at the chunk end at or before it
         const last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows;
+        // sf-disk: a pass that keeps states writes its finished blocks as it goes (diskStream)
+        if (self.disk) |d| d.streaming = d.passing and !d.off and s.reuse.hook != null and last_end >= d.settings.min_tokens;
         var head = false;
         m.fill_seq = seq.items;
         defer {
@@ -757,6 +795,7 @@ pub const Lanes = struct {
             }
             head = try m.fillChunk(seq.items[0 .. start + n], start, n, replay, f.pre_read);
             start += n;
+            if (self.disk) |d| if (d.streaming and start <= last_end and start % model.chunk_rows == 0) try self.diskStream(d, slot, base, start, last_end);
             if (s.images.len == 0) if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
         }
         if (!head) return error.NoPromptLogits;
@@ -1113,7 +1152,186 @@ pub const Lanes = struct {
             self.sendDrop(sn.id) catch {};
             return err;
         };
+        // sf-disk: the kept state to disk too (its blocks mostly streamed already); never this keep's failure
+        if (self.disk) |d| self.diskSave(d, sn, l.slot, at) catch |err| {
+            if (broken(err)) ended(err) else d.line("event=save result=failed reason={s} tokens={d}", .{ @errorName(err), at });
+        };
         return sn;
+    }
+
+    // -- sf-disk (rank 0's decisions; disk.zig) -------------------------------------------------------------------
+
+    /// Blocks a stream writes in one piece (one run's host bytes at most: ~29 MiB a rank), and in all at one chunk end.
+    const piece_blocks = 16;
+    const blocks_per_end = 128;
+
+    /// Rank 0: sf-disk's tier opened and reconciled with rank 1's; off with one log line on any failure but the pair's.
+    pub fn attachDisk(self: *Lanes) !void {
+        if (self.peer == null or self.m.world != 2 or gpu.backend != .hip) return;
+        const s = disk_mod.Settings.fromEnv(self.gpa) orelse return;
+        const d = disk_mod.Disk.open(self.gpa, self.m, s) orelse return;
+        self.diskSync(d) catch |err| {
+            d.line("event=off reason=reconcile ({s})", .{@errorName(err)});
+            d.close();
+            if (broken(err)) return err;
+            return;
+        };
+        self.disk = d;
+    }
+
+    /// The startup reconcile: rank 0's states on disk to rank 1, which answers which it has (and drops the others);
+    /// each side keeps only the states both have.
+    fn diskSync(self: *Lanes, d: *disk_mod.Disk) !void {
+        const keys = try d.tier.completeKeys();
+        defer self.gpa.free(keys);
+        var off: usize = 0;
+        while (true) {
+            const n = @min(1024, keys.len - off);
+            if (try self.begin(.disk_sync)) {
+                try self.wire.int(self.gpa, u32, @intCast(keys.len));
+                try self.wire.int(self.gpa, u32, @intCast(off));
+                try self.wire.int(self.gpa, u32, @intCast(n));
+                for (keys[off..][0..n]) |k| try self.wire.key(self.gpa, k);
+                try self.flush();
+            }
+            off += n;
+            if (off >= keys.len) break;
+        }
+        const buf = try self.gpa.alloc(u8, 16 + keys.len / 8);
+        defer self.gpa.free(buf);
+        var r: Reader = .{ .b = try self.peer.?.recv(buf) };
+        const peer_on = try r.int(u8);
+        if (try r.int(u32) != keys.len) return error.BadFrame;
+        const map = r.rest();
+        if (map.len != (keys.len + 7) / 8) return error.BadFrame;
+        if (peer_on == 0) return error.PeerDiskOff;
+        var dropped: usize = 0;
+        for (keys, 0..) |k, i| if (!pd.bit(map, i)) {
+            d.tier.drop(&.{k});
+            dropped += 1;
+        };
+        d.line("event=reconcile states={d} dropped={d}", .{ keys.len - dropped, dropped });
+    }
+
+    /// Evicted states to rank 1 (it drops its parts too), in frames of at most 1024 keys.
+    fn diskDrop(self: *Lanes, keys: []const pd.Key) !void {
+        var off: usize = 0;
+        while (off < keys.len) {
+            const n = @min(1024, keys.len - off);
+            if (try self.begin(.disk_drop)) {
+                try self.wire.int(self.gpa, u32, @intCast(n));
+                for (keys[off..][0..n]) |k| try self.wire.key(self.gpa, k);
+                try self.flush();
+            }
+            off += n;
+        }
+        if (keys.len > 0) if (self.disk) |d| d.line("event=evict states={d}", .{keys.len});
+    }
+
+    /// Rank 0, at chunk end `end` of a pass that keeps states: its finished blocks (through last_end) to disk in pieces,
+    /// rank 1 told to write its own; a long first save so never holds its whole state in host memory at once.
+    fn diskStream(self: *Lanes, d: *disk_mod.Disk, slot: usize, base: usize, end: usize, last_end: usize) !void {
+        const upto: u32 = @intCast(@min(end / model.chunk_rows, d.chain.items.len));
+        const last: u32 = @intCast(last_end / model.chunk_rows);
+        if (upto <= d.streamed or (upto - d.streamed < piece_blocks and upto < last)) return;
+        var left: u32 = blocks_per_end;
+        while (d.streamed < upto and left > 0) {
+            const j0 = d.streamed + 1;
+            const j1 = @min(upto, d.streamed + @min(piece_blocks, left)); // the piece's last block
+            const keys = d.chain.items[j0 - 1 .. j1];
+            var p = d.tier.plan(keys, false, true) catch return;
+            defer p.deinit(self.gpa);
+            try self.diskDrop(p.victims);
+            switch (p.result) {
+                .skip => |why| {
+                    d.stream_skips += 1;
+                    if (oftenEnough(d.stream_skips)) d.line("event=blocks result=skipped reason={s} tokens={d} count={d} skips={d}", .{ @tagName(why), (j0 - 1) * model.chunk_rows, j1 - j0 + 1, d.stream_skips });
+                    if (why != .queue) d.streaming = false; // (the keep's save tries again and says why)
+                    return;
+                },
+                .ok => {},
+            }
+            if (p.runs.len > 0) {
+                if (try self.begin(.disk_rows)) {
+                    try self.wire.int(self.gpa, u32, @intCast(slot));
+                    try self.wire.int(self.gpa, u64, base);
+                    try self.wire.int(self.gpa, u32, j0);
+                    try self.wire.int(self.gpa, u32, j1);
+                    try self.flush();
+                }
+                if (!d.write(&p, keys, j0, base, null)) {
+                    d.streaming = false;
+                    return;
+                }
+            }
+            left -|= j1 - j0 + 1;
+            d.streamed = j1;
+        }
+    }
+
+    /// Rank 0: a state just kept (snapSave) to disk: the blocks not there yet and its own bytes, rank 1 the same.
+    fn diskSave(self: *Lanes, d: *disk_mod.Disk, sn: *const Snap, slot: usize, at: u32) !void {
+        if (d.off or !d.passing or at < d.settings.min_tokens) return;
+        const k: u32 = at / model.chunk_rows;
+        if (k == 0 or k > d.chain.items.len) return;
+        const keys = d.chain.items[0..k];
+        var p = try d.tier.plan(keys, true, false);
+        defer p.deinit(self.gpa);
+        try self.diskDrop(p.victims);
+        switch (p.result) {
+            .skip => |why| {
+                d.line("event=save result=skipped reason={s} tokens={d} key={s} skipped={d}", .{ @tagName(why), at, &pd.short(keys[k - 1]), d.tier.counts.skipped });
+                return;
+            },
+            .ok => {},
+        }
+        if (try self.begin(.disk_save)) {
+            try self.wire.key(self.gpa, keys[k - 1]);
+            try self.wire.int(self.gpa, u32, k);
+            try self.wire.int(self.gpa, u64, sn.id);
+            try self.wire.int(self.gpa, u32, @intCast(slot));
+            try self.wire.int(self.gpa, u64, sn.base);
+            try self.flush();
+        }
+        var new: u32 = 0;
+        for (p.runs) |r| new += r.n;
+        if (d.write(&p, keys, 1, sn.base, sn.buf.ptr)) d.line("event=save result=queued tokens={d} new_blocks={d} key={s}", .{ at, new, &pd.short(keys[k - 1]) });
+    }
+
+    /// Rank 0: the pass resumes from state k on disk: both ranks read their parts into slot `slot` and the extent at
+    /// `base`; rank 1 answers how it went and rank 0 tells it the outcome. The position the pass starts at (0: a miss).
+    fn diskResume(self: *Lanes, slot: usize, base: usize, k: u32) !usize {
+        const d = self.disk.?;
+        const key = d.chain.items[k - 1];
+        const t0 = self.m.now();
+        if (try self.begin(.disk_load)) {
+            try self.wire.key(self.gpa, key);
+            try self.wire.int(self.gpa, u32, k);
+            try self.wire.int(self.gpa, u32, @intCast(slot));
+            try self.wire.int(self.gpa, u64, base);
+            try self.flush();
+        }
+        var bytes: u64 = 0;
+        const mine = d.load(slot, base, key, k, &bytes);
+        var rb: [16]u8 = undefined;
+        const got = try self.peer.?.recv(&rb);
+        if (got.len != 1 or got[0] > 2) return error.BadFrame;
+        const theirs: pd.Load = @enumFromInt(got[0]);
+        const out = pd.Outcome.of(mine, theirs);
+        if (try self.begin(.disk_outcome)) {
+            try self.wire.key(self.gpa, key);
+            try self.wire.int(self.gpa, u8, @intFromEnum(out));
+            try self.flush();
+        }
+        d.finish(key, out);
+        if (out == .hit) d.peer_bad = 0 else if (theirs == .bad and mine == .ok) d.peer_bad += 1;
+        const c = d.tier.counts;
+        d.line("event=resume result={s} tokens={d} bytes={d} ms={d} rank0={s} rank1={s} key={s} hits={d} misses={d} forgets={d} states={d} disk_mib={d}", .{ @tagName(out), k * model.chunk_rows, bytes, (self.m.now() - t0) / std.time.ns_per_ms, @tagName(mine), @tagName(theirs), &pd.short(key), c.hits, c.misses, c.forgets, d.tier.states.count(), d.tier.bytes >> 20 });
+        if (d.peer_bad >= 10) {
+            d.off = true;
+            d.line("event=off reason=rank1-bad resumes={d}", .{d.peer_bad});
+        }
+        return if (out == .hit) k * model.chunk_rows else 0;
     }
 
     pub fn snapRestoreFn(_: *anyopaque, _: ?*anyopaque, _: *anyopaque) anyerror!void {
@@ -1189,7 +1407,8 @@ fn oftenEnough(n: u64) bool {
 fn inPass(kind: Kind) bool {
     return switch (kind) {
         .fill_chunk, .fill_images, .snap_save, .snap_restore, .snap_drop => true,
-        .fill_begin, .verify, .pass, .done => false,
+        .disk_save, .disk_drop, .disk_load, .disk_outcome, .disk_rows => true, // (sf-disk's, sent within a pass)
+        .fill_begin, .verify, .pass, .done, .disk_sync => false,
     };
 }
 
@@ -1272,6 +1491,14 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
         while (ki.next()) |b| b.free();
         kept.deinit(gpa);
     }
+    // sf-disk: this rank's tier, opened at rank 0's first disk_sync (rank 0 waits for the answer then, so the scan of
+    // the directory never holds this rank while rank 0 runs collectives); its writes finish before follow returns
+    var disk_settings: ?disk_mod.Settings = if (m.world == 2 and gpu.backend == .hip) disk_mod.Settings.fromEnv(gpa) else null;
+    defer if (disk_settings) |s| gpa.free(s.dir);
+    var disk: ?*disk_mod.Disk = null;
+    defer if (disk) |d| d.close();
+    var sync_keys: std.ArrayList(pd.Key) = .empty;
+    defer sync_keys.deinit(gpa);
     while (true) {
         // the next primitive, polled for 20 ms before the read blocks (rank 0 sends it a fraction of a millisecond
         // after this rank's GPU goes idle in a decode; a sleeping thread would add its core's wake-up to every frame)
@@ -1286,6 +1513,12 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             7 => .snap_drop,
             8 => .fill_images,
             9 => .done,
+            10 => .disk_sync,
+            11 => .disk_save,
+            12 => .disk_drop,
+            13 => .disk_load,
+            14 => .disk_outcome,
+            15 => .disk_rows,
             else => return error.BadFrame,
         };
         if (try r.int(u64) != step) return error.OutOfStep;
@@ -1294,6 +1527,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
         if (!inPass(kind)) {
             m.joinAhead();
             m.fill_seq = &.{};
+            if (disk) |d| d.endPass();
         }
         switch (kind) {
             .fill_begin => {
@@ -1303,6 +1537,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 img_rows.clearRetainingCapacity();
                 try r.ids(gpa, &seqs[slot]);
                 try r.end();
+                if (disk) |d| d.beginPass(std.mem.sliceAsBytes(seqs[slot].items));
                 notePass(m, step - 1, 1, seqs[slot].items.len, slot, @intCast(base), "");
                 m.fillBegin(slot, @intCast(base)) catch |err| try refused(err);
                 m.fill_seq = seqs[slot].items;
@@ -1410,12 +1645,121 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                     b.free();
                 }
             },
+            .disk_sync => {
+                const total = try r.int(u32);
+                const off = try r.int(u32);
+                const n = try r.int(u32);
+                if (off != sync_keys.items.len or @as(u64, off) + n > total) return error.BadFrame;
+                for (0..n) |_| try sync_keys.append(gpa, try r.key());
+                try r.end();
+                if (sync_keys.items.len == total) {
+                    if (disk == null) if (disk_settings) |ds| {
+                        disk_settings = null; // (the tier owns its dir now, or freed it)
+                        disk = disk_mod.Disk.open(gpa, m, ds);
+                    };
+                    try followSync(gpa, disk, sync_keys.items, peer);
+                    sync_keys.clearRetainingCapacity();
+                }
+            },
+            .disk_rows => {
+                const s: usize = try r.int(u32);
+                const base: usize = @intCast(try r.int(u64));
+                const j0 = try r.int(u32);
+                const j1 = try r.int(u32);
+                try r.end();
+                const d = disk orelse continue;
+                if (s != slot or j0 == 0 or j1 < j0 or j1 > d.chain.items.len or !d.passing) continue;
+                const keys = d.chain.items[j0 - 1 .. j1];
+                var p = d.tier.plan(keys, false, true) catch continue;
+                defer p.deinit(gpa);
+                if (p.result == .ok and p.runs.len > 0) _ = d.write(&p, keys, j0, base, null);
+            },
+            .disk_save => {
+                const key = try r.key();
+                const k = try r.int(u32);
+                const id = try r.int(u64);
+                const s: usize = try r.int(u32);
+                const base: usize = @intCast(try r.int(u64));
+                try r.end();
+                const d = disk orelse continue;
+                if (s != slot or k == 0 or k > d.chain.items.len or !std.mem.eql(u8, &d.chain.items[k - 1], &key)) {
+                    d.line("event=save result=skipped reason=hash tokens={d} key={s}", .{ k * model.chunk_rows, &pd.short(key) });
+                    continue;
+                }
+                const b = kept.get(id) orelse {
+                    d.line("event=save result=skipped reason=nostate tokens={d} key={s}", .{ k * model.chunk_rows, &pd.short(key) });
+                    continue;
+                };
+                const keys = d.chain.items[0..k];
+                var p = d.tier.plan(keys, true, false) catch continue;
+                defer p.deinit(gpa);
+                switch (p.result) {
+                    .skip => |why| d.line("event=save result=skipped reason={s} tokens={d} key={s} skipped={d}", .{ @tagName(why), k * model.chunk_rows, &pd.short(key), d.tier.counts.skipped }),
+                    .ok => _ = d.write(&p, keys, 1, base, b.ptr),
+                }
+            },
+            .disk_drop => {
+                const n = try r.int(u32);
+                const keys = try gpa.alloc(pd.Key, n);
+                defer gpa.free(keys);
+                for (keys) |*k| k.* = try r.key();
+                try r.end();
+                if (disk) |d| d.tier.drop(keys);
+            },
+            .disk_load => {
+                const key = try r.key();
+                const k = try r.int(u32);
+                const s: usize = try r.int(u32);
+                const base: usize = @intCast(try r.int(u64));
+                try r.end();
+                if (s >= max_streams) return error.BadSlot;
+                const t0 = m.now();
+                var bytes: u64 = 0;
+                const st: pd.Load = if (disk) |d| d.load(s, base, key, k, &bytes) else .bad;
+                if (disk) |d| d.line("event=load result={s} tokens={d} bytes={d} ms={d} key={s}", .{ @tagName(st), k * model.chunk_rows, bytes, (m.now() - t0) / std.time.ns_per_ms, &pd.short(key) });
+                try peer.send(&.{@intFromEnum(st)}); // rank 0 waits for it, whatever happened here
+            },
+            .disk_outcome => {
+                const key = try r.key();
+                const v = try r.int(u8);
+                try r.end();
+                if (v > 2) return error.BadFrame;
+                if (disk) |d| d.finish(key, @enumFromInt(v));
+            },
             .done => {
                 try r.end();
                 return;
             },
         }
     }
+}
+
+/// Rank 1's side of the startup reconcile: which of rank 0's states it has (a bitmap), its tier usable or not; the
+/// states it has that rank 0 does not list go.
+fn followSync(gpa: std.mem.Allocator, disk: ?*disk_mod.Disk, keys: []const pd.Key, peer: link.Link) !void {
+    var reply: std.ArrayList(u8) = .empty;
+    defer reply.deinit(gpa);
+    try reply.append(gpa, @intFromBool(disk != null));
+    var nb: [4]u8 = undefined;
+    std.mem.writeInt(u32, &nb, @intCast(keys.len), .little);
+    try reply.appendSlice(gpa, &nb);
+    if (disk) |d| {
+        const map = try pd.bitmap(gpa, d.tier, keys);
+        defer gpa.free(map);
+        try reply.appendSlice(gpa, map);
+        var listed: std.AutoHashMapUnmanaged(pd.Key, void) = .empty;
+        defer listed.deinit(gpa);
+        for (keys) |k| try listed.put(gpa, k, {});
+        const mine = try d.tier.completeKeys();
+        defer gpa.free(mine);
+        var dropped: usize = 0;
+        for (mine) |k| if (!listed.contains(k)) {
+            d.tier.drop(&.{k});
+            dropped += 1;
+        };
+        d.line("event=reconcile states={d} dropped={d}", .{ mine.len - dropped, dropped });
+    } else try reply.appendNTimes(gpa, 0, (keys.len + 7) / 8);
+    try peer.send(reply.items);
 }
 
 test "draft chances are the prefix survivals chooseK sums" {
@@ -1579,7 +1923,51 @@ test "a frame is read to its end or refused; a repeated warning is logged first 
 
 test "the cache's frames between a pass's chunks leave rank 1's pass as it is; the others end it" {
     for ([_]Kind{ .fill_chunk, .fill_images, .snap_save, .snap_restore, .snap_drop }) |k| try std.testing.expect(inPass(k));
-    for ([_]Kind{ .fill_begin, .verify, .pass, .done }) |k| try std.testing.expect(!inPass(k));
+    for ([_]Kind{ .disk_save, .disk_drop, .disk_load, .disk_outcome, .disk_rows }) |k| try std.testing.expect(inPass(k));
+    for ([_]Kind{ .fill_begin, .verify, .pass, .done, .disk_sync }) |k| try std.testing.expect(!inPass(k));
+}
+
+test "sf-disk's frames: kinds 10-15 after the stock ones, their keys and fields read back to the frame's end" {
+    // the stock kinds keep their numbers (a pair with the tier off sends none of the new ones)
+    try std.testing.expectEqual(@as(u8, 9), @backingInt(Kind.done));
+    try std.testing.expectEqual(@as(u8, 10), @backingInt(Kind.disk_sync));
+    try std.testing.expectEqual(@as(u8, 15), @backingInt(Kind.disk_rows));
+    const gpa = std.testing.allocator;
+    var w: Wire = .{};
+    defer w.deinit(gpa);
+    var key: pd.Key = undefined;
+    for (&key, 0..) |*b, i| b.* = @intCast(i * 7);
+    try w.begin(gpa, .disk_load, 41);
+    try w.key(gpa, key);
+    try w.int(gpa, u32, 146);
+    try w.int(gpa, u32, 2);
+    try w.int(gpa, u64, 1 << 20);
+    var r: Reader = .{ .b = w.buf.items };
+    try std.testing.expectEqual(@as(u8, 13), try r.int(u8));
+    try std.testing.expectEqual(@as(u64, 41), try r.int(u64));
+    try std.testing.expectEqualSlices(u8, &key, &(try r.key()));
+    try std.testing.expectEqual(@as(u32, 146), try r.int(u32));
+    try std.testing.expectEqual(@as(u32, 2), try r.int(u32));
+    try std.testing.expectEqual(@as(u64, 1 << 20), try r.int(u64));
+    try r.end();
+    try std.testing.expectError(error.ShortFrame, r.key());
+}
+
+test "rank 1 answers the reconcile on the link: its tier usable, then a bitmap of rank 0's keys" {
+    const gpa = std.testing.allocator;
+    var sv: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &sv));
+    defer for (sv) |fd| {
+        _ = std.c.close(fd);
+    };
+    const keys = [_]pd.Key{ @splat(1), @splat(2), @splat(3) };
+    try followSync(gpa, null, &keys, .{ .fd = sv[1] });
+    var buf: [64]u8 = undefined;
+    const back: link.Link = .{ .fd = sv[0] };
+    var r: Reader = .{ .b = try back.recv(&buf) };
+    try std.testing.expectEqual(@as(u8, 0), try r.int(u8)); // no tier on this side: rank 0 turns its own off
+    try std.testing.expectEqual(@as(u32, 3), try r.int(u32));
+    try std.testing.expectEqualSlices(u8, &.{0}, r.rest());
 }
 
 test "a chunk's frame carries rank 0's read-ahead plan to rank 1" {

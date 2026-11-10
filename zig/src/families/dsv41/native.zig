@@ -23,6 +23,7 @@
 //!   TF_DS_L2_PREFETCH=1                         the paced L2 prefetch of the next kernels' weights
 //!   TF_DS_ENGRAM_AIO=1                          a round's Engram reads by Linux AIO on O_DIRECT
 //!   TF_DS_FIX_K=K                               a measurement: every drafted stream verifies K drafts a round
+//!   TF_DS_PROMPT_DISK_*                         sf-disk: kept prompt states on disk on both ranks (disk.zig)
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
 //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
 //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the
@@ -180,9 +181,12 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []
         .modalities = mods,
         .hip_kit = getenv("TF_DS_HIP_KIT") orelse if (gpu.backend == .hip) kernels else null, // HIP: the host's kit
         .open_coll = if (gpu.backend == .hip) @import("tcp_coll.zig").open else null,
+        .disk = @import("disk.zig").wanted(world),
     });
     errdefer st.m.close();
     st.lanes = lanes_mod.Lanes.init(gpa, st.m);
+    // sf-disk: this rank's tier, reconciled with rank 1's before the server takes a request (off: nothing changes)
+    try st.lanes.attachDisk();
     if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
     // structured output: each token's bytes, for the draws that keep a reply inside its grammar (rank 0 draws)
     st.vocab = lanes.grammar.vocab.load(gpa, io, dir) catch |e| blk: {

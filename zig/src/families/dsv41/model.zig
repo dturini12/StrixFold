@@ -95,6 +95,7 @@ pub const Options = struct {
     modalities: Modalities = default_modalities, // .text: the image routing bias is never loaded (native.zig: the tower)
     open_coll: ?coll.Open = null, // the collectives' transport (HIP: w-link's TCP; null on CUDA: NCCL over the links)
     hip_kit: ?[]const u8 = null, // HIP: the AMD kit (manifest.json); null: kit_dir/hip
+    disk: bool = false, // sf-disk on (disk.zig): the handshake's plan says " disk=1", so both ranks must agree
 };
 
 pub const Model = struct {
@@ -195,6 +196,11 @@ pub const Model = struct {
     clk_rounds: u64 = 0,
     t_forward: u64 = 0,
     t_absorb: u64 = 0,
+    // sf-disk's identity (disk.zig): the handshake's plan text and the inputs beyond the bundle
+    plan_text: []const u8 = "",
+    kit_dir: []const u8 = "",
+    engram_dir: ?[]const u8 = null,
+    token_map: ?[]const u8 = null,
     // world 4: the 2D split's exchanges (prompt2d.zig, TP4's), with the RDMA rings when asked
     two: ?TwoNode = null,
     rdma_rings: ?Rings2d = null,
@@ -224,6 +230,10 @@ pub const Model = struct {
         m.ctx = ctx;
         m.rank = o.rank;
         m.world = o.world;
+        m.plan_text = "";
+        m.kit_dir = try a.dupe(u8, o.kit_dir);
+        m.engram_dir = if (o.engram_dir) |e| try a.dupe(u8, e) else null;
+        m.token_map = if (o.token_map) |t| try a.dupe(u8, t) else null;
         if (o.streams == 0 or o.streams > max_streams) return error.BadStreams;
         m.streams = o.streams;
         const profile: draft.scheduler_costs.Profile = .{ .round_ms = o.round_ms orelse &draft.round_ms, .draft_ms = o.draft_ms };
@@ -306,6 +316,7 @@ pub const Model = struct {
         if (o.open_coll) |open_coll| {
             var plan: [512]u8 = undefined;
             const id = try m.identity(o, &plan);
+            m.plan_text = try a.dupe(u8, id.plan);
             m.coll = try open_coll(gpa, io, ctx, if (gpu.backend == .hip) m.kit else null, &m.fan, &id);
         } else if (gpu.backend == .cuda) {
             m.nccl = try comm_mod.Comm.fromFan(&m.fan, o.rank, o.world);
@@ -560,11 +571,51 @@ pub const Model = struct {
         // rank caches) and serve.conf's hash, each a 16-hex prefix; the KV caches' formats; strict mode
         const strict = if (gpu.backend == .hip) m.kit.strict else false;
         var ob: [128]u8 = undefined;
-        id.plan = try std.fmt.bufPrint(buf, "drafts={} engram={} graphs={} pool={d} streams={d} round_rows={d} chunk_rows={d} replay_floor={} aux={s} {s} engram_rows={} deploy={s} bundle={s} conf={s} kv={s} strict={}", .{
-            o.drafts,           m.cfg.engram_layers.slice().len > 0, o.graphs,                  o.pool,                  o.streams,                  o.round_rows, chunk_rows,
-            prompt.replay_floor, m.aux_which.name(&nb), try gatherOrder(&ob, m.split_min, m.split_zip, m.phase_timer), m.engram_rows, launchId("TF_DS_DEPLOY"), launchId("TF_DS_BUNDLE"), launchId("TF_DS_CONF"), kv_format,    strict,
+        id.plan = try planText(buf, .{
+            .drafts = o.drafts,
+            .engram = m.cfg.engram_layers.slice().len > 0,
+            .graphs = o.graphs,
+            .pool = o.pool,
+            .streams = o.streams,
+            .round_rows = o.round_rows,
+            .replay_floor = prompt.replay_floor,
+            .aux = m.aux_which.name(&nb),
+            .gather = try gatherOrder(&ob, m.split_min, m.split_zip, m.phase_timer),
+            .engram_rows = m.engram_rows,
+            .deploy = launchId("TF_DS_DEPLOY"),
+            .bundle = launchId("TF_DS_BUNDLE"),
+            .conf = launchId("TF_DS_CONF"),
+            .strict = strict,
+            .disk = o.disk,
         });
         return id;
+    }
+
+    pub const PlanParts = struct {
+        drafts: bool,
+        engram: bool,
+        graphs: bool,
+        pool: usize,
+        streams: usize,
+        round_rows: usize,
+        replay_floor: bool,
+        aux: []const u8,
+        gather: []const u8,
+        engram_rows: bool,
+        deploy: []const u8,
+        bundle: []const u8,
+        conf: []const u8,
+        strict: bool,
+        disk: bool, // sf-disk: " disk=1" at the end, only when on (the text is the stock one when off)
+    };
+
+    /// The handshake's plan text (identity), in `buf`.
+    pub fn planText(buf: []u8, p: PlanParts) ![]u8 {
+        return std.fmt.bufPrint(buf, "drafts={} engram={} graphs={} pool={d} streams={d} round_rows={d} chunk_rows={d} replay_floor={} aux={s} {s} engram_rows={} deploy={s} bundle={s} conf={s} kv={s} strict={}{s}", .{
+            p.drafts,       p.engram, p.graphs,  p.pool,  p.streams,  p.round_rows, chunk_rows,
+            p.replay_floor, p.aux,    p.gather,  p.engram_rows, p.deploy, p.bundle, p.conf,
+            kv_format,      p.strict, if (p.disk) " disk=1" else "",
+        });
     }
 
     /// The settings that decide the order of a prompt chunk's gathers, for the handshake (two ranks that differ in them
@@ -1282,4 +1333,17 @@ test "the handshake names what orders a prompt chunk's gathers: split, zip, chun
     var b: [128]u8 = undefined;
     try std.testing.expectEqualStrings("prefill_split=256 prefill_zip=true chunk_caps=1024/1024 phase_timer=false frames=2", try Model.gatherOrder(&b, 256, true, false));
     try std.testing.expectEqualStrings("prefill_split=0 prefill_zip=true chunk_caps=2048/0 phase_timer=true frames=2", try Model.gatherOrder(&b, 0, true, true));
+}
+
+test "the handshake's plan text is the stock one with sf-disk off, and says disk=1 only when on" {
+    var gb: [128]u8 = undefined;
+    const gather = try Model.gatherOrder(&gb, 256, true, false);
+    // 70cfb8c's format, byte for byte (frames=2: the disk frames do not change the protocol number)
+    const stock = "drafts=true engram=true graphs=false pool=8192 streams=1 round_rows=16 chunk_rows=2048 replay_floor=false aux=hip prefill_split=256 prefill_zip=true chunk_caps=1024/1024 phase_timer=false frames=2 engram_rows=true deploy=70cfb8c bundle=c178a012 conf=abcd kv=win-fp8qd,cmp-fp4,idx-fp4 strict=true";
+    var p: Model.PlanParts = .{ .drafts = true, .engram = true, .graphs = false, .pool = 8192, .streams = 1, .round_rows = 16, .replay_floor = false, .aux = "hip", .gather = gather, .engram_rows = true, .deploy = "70cfb8c", .bundle = "c178a012", .conf = "abcd", .strict = true, .disk = false };
+    var buf: [512]u8 = undefined;
+    try std.testing.expectEqualStrings(stock, try Model.planText(&buf, p));
+    p.disk = true;
+    try std.testing.expectEqualStrings(stock ++ " disk=1", try Model.planText(&buf, p));
+    try std.testing.expect(!@hasField(Options, "disk") or (Options{ .model_dir = "", .cache_dir = "", .kit_dir = "", .rank = 0, .world = 2, .master = .{ 0, 0, 0, 0 }, .port = 0 }).disk == false);
 }

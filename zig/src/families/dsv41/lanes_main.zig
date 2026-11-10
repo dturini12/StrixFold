@@ -129,6 +129,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (par == 0 or par > o.streams or o.streams > dsv41.model.max_streams) return error.BadArgument;
     o.arena_bytes = (arena_gib orelse 0) << 30; // (0: the arena grows as the buffers ask)
     o.phase_timer = phases; // (in the pair handshake: a timed chunk runs its halves apart)
+    o.disk = dsv41.disk.wanted(o.world); // sf-disk (TF_DS_PROMPT_DISK_*; both ranks alike: the handshake checks it)
 
     var out_buf: [1 << 14]u8 = undefined;
     var out = std.Io.File.stdout().writer(io, &out_buf);
@@ -187,6 +188,7 @@ pub fn main(init: std.process.Init) !u8 {
     const reqs = (try std.json.parseFromSliceLeaky(Requests, a, text, .{ .ignore_unknown_fields = true })).requests;
     var ln = dsv41.lanes.Lanes.init(gpa, m);
     defer ln.deinit();
+    try ln.attachDisk();
     ln.fix_k = fix_k;
     if (profile) {
         ln.prof = .{};

@@ -58,6 +58,7 @@ test {
     _ = @import("round.zig");
     _ = @import("prompt.zig");
     _ = @import("lanes.zig");
+    _ = @import("disk.zig");
     _ = @import("native.zig");
     _ = @import("hipblas.zig");
     _ = @import("hip_load.zig");
