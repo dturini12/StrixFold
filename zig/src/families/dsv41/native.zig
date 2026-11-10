@@ -26,6 +26,10 @@
 //!   TF_DS_PROMPT_DISK_*                         sf-disk: kept prompt states on disk on both ranks (disk.zig)
 //!   TF_DS_POOL                                  the streams' shared pool in positions (unset: --context); at least
 //!                                               --context, which stays one request's window (and the RoPE tables')
+//!   TF_DS_MODALITIES                            text (HIP's default) or text_image: the vision tower on rank 0
+//!   TF_DS_VISION_DIR                            HIP, text_image: the vision tower's weights (a sidecar with its own
+//!                                               model.safetensors.index.json, kit/make_vision_sidecar.py; unset: the
+//!                                               model directory's index)
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds TF_DS_POOL (else --context)
 //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
 //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the
@@ -41,7 +45,7 @@ const draft_mod = @import("draft.zig");
 const link = @import("link.zig");
 const rank_cache = @import("rank_cache.zig");
 const sampling = @import("sampling.zig");
-/// The vision tower exists in CUDA builds only (gpu.features.vision); a HIP build compiles none of it.
+/// The vision tower (gpu.features.vision): CUDA's and HIP's behind vision.zig.
 const vision_mod = if (gpu.features.vision) @import("vision.zig") else struct {
     pub const Vision = lanes_mod.VisionTower;
 };
@@ -218,12 +222,16 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []
     };
     errdefer if (st.vocab) |v| v.deinit(gpa);
     st.lanes.vocab = st.vocab;
-    // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias),
-    // unless this rank serves text only: config.json still declares the tower, nothing of it is opened, and the server
-    // refuses image parts (Loaded.vision null)
+    // a vision checkpoint's tower on this rank (CUDA: from the kit's vision/, torch's attention cubin; HIP: the sidecar
+    // TF_DS_VISION_DIR and the AMD kit's vision kernels; both: the routing bias), unless this rank serves text only:
+    // config.json still declares the tower, nothing of it is opened, and the server refuses image parts
+    // (Loaded.vision null)
     st.vision = null;
     if (st.m.cfg.vision and mods == .text) std.log.info("config.json declares a vision tower; not opened (text capability)", .{});
-    if (gpu.features.vision and st.m.cfg.vision and mods == .text_image) st.vision = try vision_mod.Vision.open(gpa, io, st.m, dir, getenv("TF_DS_KIT").?);
+    if (gpu.features.vision and st.m.cfg.vision and mods == .text_image) {
+        const weights_dir = if (gpu.backend == .hip) (getenv("TF_DS_VISION_DIR") orelse dir) else dir;
+        st.vision = try vision_mod.Vision.open(gpa, io, st.m, weights_dir, getenv("TF_DS_KIT").?);
+    }
     errdefer if (gpu.features.vision) if (st.vision) |v| v.close();
     st.lanes.vision = st.vision;
     // the pool is the model's (preallocated): a stream takes no device memory of its own
@@ -260,7 +268,10 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.BadPool => "TF_DS_POOL: the streams' shared pool in positions, at least --context (unset: --context)",
         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
-        error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",
+        error.NoVisionKit => if (gpu.backend == .hip) "text_image needs the image routing biases: TF_DS_KIT's vision/gate_bias_vl.safetensors (tools/dsv41-zig/kit/make_bias_vl.py)" else "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",
+        error.NoVisionKernels => "text_image on HIP needs the AMD kit's vision.* kernels (vision.hip): a kit built before them",
+        error.NoVisionWeights => "text_image on HIP needs the vision tower's weights: TF_DS_VISION_DIR (a sidecar made by tools/dsv41-zig/kit/make_vision_sidecar.py) with model.safetensors.index.json",
+        error.MissingVisionTensor, error.BadVisionTensor => "the vision weights (TF_DS_VISION_DIR) lack a tower tensor or hold one of another dtype or shape",
         error.VisionUnsupported => "image input is not implemented on this backend: serve text only (TF_DS_MODALITIES=text)",
         error.BadModalities => "TF_DS_MODALITIES: text or text_image",
         error.NoCollective => "this build has no collectives transport for the ranks yet (HIP: w-link's TCP transport, model.Options.open_coll)",

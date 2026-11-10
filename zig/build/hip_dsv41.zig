@@ -213,7 +213,7 @@ fn readelfNotes(b: *std.Build, o: Options, object: std.Build.LazyPath) std.Build
 }
 
 /// The dsv41 kit's HIP sources (registry.json, kit "dsv41") and their code objects' names.
-const native_sources = [_][2][]const u8{ .{ "glue.hip", "glue.hsaco" }, .{ "aux.hip", "aux.hsaco" }, .{ "aux_attn.hip", "aux_attn.hsaco" }, .{ "aux_index.hip", "aux_index.hsaco" }, .{ "aux_hc.hip", "aux_hc.hsaco" }, .{ "exl3.hip", "exl3.hsaco" }, .{ "exl3_pf.hip", "exl3_pf.hsaco" }, .{ "coll.hip", "coll.hsaco" }, .{ "aux_gate.hip", "aux_gate.hsaco" }, .{ "aux_rope.hip", "aux_rope.hsaco" }, .{ "dense.hip", "dense.hsaco" } };
+const native_sources = [_][2][]const u8{ .{ "glue.hip", "glue.hsaco" }, .{ "aux.hip", "aux.hsaco" }, .{ "aux_attn.hip", "aux_attn.hsaco" }, .{ "aux_index.hip", "aux_index.hsaco" }, .{ "aux_hc.hip", "aux_hc.hsaco" }, .{ "exl3.hip", "exl3.hsaco" }, .{ "exl3_pf.hip", "exl3_pf.hsaco" }, .{ "coll.hip", "coll.hsaco" }, .{ "aux_gate.hip", "aux_gate.hsaco" }, .{ "aux_rope.hip", "aux_rope.hsaco" }, .{ "dense.hip", "dense.hsaco" }, .{ "vision.hip", "vision.hsaco" } };
 
 /// The engine graph of a HIP server or its host tests: the shared tokenizer, core, lanes and engine API, the HIP `gpu`
 /// module, the dsv41 family over them, and native/hip.zig (the engine host) as `native_engines`.

@@ -20,6 +20,7 @@ const exl3_experts = @import("exl3_experts.zig");
 const weights = @import("weights.zig");
 const tri_aux = @import("tri_aux.zig");
 const dense_mod = @import("dense.zig");
+const vit_hip = @import("vit_hip.zig");
 
 /// The parameter lists, field for field in the order ops.zig and exact.zig add them (u64: a device address or a u64).
 pub const params = struct {
@@ -117,6 +118,24 @@ pub fn dense(kit: *const gpu.Kit) !?dense_mod.Kernels {
     const swiglu = try optional(kit, "dense.swiglu", params.DenseSwiglu);
     if (gemv == null and swiglu == null) return null;
     return .{ .gemv = gemv orelse return error.MissingKernel, .swiglu = swiglu orelse return error.MissingKernel };
+}
+
+/// vision.hip's kernels (the vision tower, for MODALITIES=text_image): null when the kit has none of them, an error
+/// when it has only some.
+pub fn vision(kit: *const gpu.Kit) !?vit_hip.Kernels {
+    const vp = vit_hip.params;
+    const k: vit_hip.Kernels = .{
+        .linear = try optional(kit, "vision.linear", vp.Linear) orelse return if (kit.find("vision.rms_norm", &.{}) == null) null else error.MissingKernel,
+        .rms_norm = try optional(kit, "vision.rms_norm", vp.RmsNorm) orelse return error.MissingKernel,
+        .attention = try optional(kit, "vision.attention", vp.Attention) orelse return error.MissingKernel,
+        .rope = try optional(kit, "vision.rope", vp.Rope) orelse return error.MissingKernel,
+        .add = try optional(kit, "vision.add", vp.Add) orelse return error.MissingKernel,
+        .silu_mul = try optional(kit, "vision.silu_mul", vp.SiluMul) orelse return error.MissingKernel,
+        .gelu = try optional(kit, "vision.gelu", vp.Gelu) orelse return error.MissingKernel,
+        .unfold = try optional(kit, "vision.unfold", vp.Unfold) orelse return error.MissingKernel,
+        .span = try optional(kit, "vision.span", vp.Span) orelse return error.MissingKernel,
+    };
+    return k;
 }
 
 /// Nanoseconds a tick of a `hz` clock in 32.32 fixed point (glue.clock's ns_q32), rounded to nearest.
@@ -513,6 +532,19 @@ test "every launcher packs exactly the parameter list its kernel is bound with" 
     const dl: @import("weights.zig").Linear = .{ .words = 0, .suh = 0, .svh = 0, .k = 4096, .n = 5120, .k2 = 0, .dense = 0x10000 };
     try expectPacked(dense_mod.gemv(&dk, s, dl, 0x1000, 4096, 0x2000, 5120, 6, true), .{.{ dk.gemv, p.DenseGemv }});
     try expectPacked(dense_mod.swiglu(&dk, s, 0x1000, 0x2000, 1152, 0x3000, 1152, 6, 1152, 10.0), .{.{ dk.swiglu, p.DenseSwiglu }});
+
+    // vision.hip, on a 1920x1080 picture's shapes (8418 patches, 968 cells) through vit_hip.zig's launchers
+    const vk: vit_hip.Kernels = .{ .linear = fake(&n), .rms_norm = fake(&n), .attention = fake(&n), .rope = fake(&n), .add = fake(&n), .silu_mul = fake(&n), .gelu = fake(&n), .unfold = fake(&n), .span = fake(&n) };
+    const vp = vit_hip.params;
+    try expectPacked(vit_hip.linear(&vk, s, 0x1000, 0x2000, 0x3000, 0x4000, 8418, 3072, 1024), .{.{ vk.linear, vp.Linear }});
+    try expectPacked(vit_hip.rmsNorm(&vk, s, 0x1000, 0x2000, 0x3000, 8418), .{.{ vk.rms_norm, vp.RmsNorm }});
+    try expectPacked(vit_hip.add(&vk, s, 0x1000, 0x2000, 8418 * 1024), .{.{ vk.add, vp.Add }});
+    try expectPacked(vit_hip.rope(&vk, s, 0x1000, 0x2000, 0x3000, 8418), .{.{ vk.rope, vp.Rope }});
+    try expectPacked(vit_hip.attention(&vk, s, 0x1000, 0x2000, 8418), .{.{ vk.attention, vp.Attention }});
+    try expectPacked(vit_hip.siluMul(&vk, s, 0x1000, 0x2000, 8418), .{.{ vk.silu_mul, vp.SiluMul }});
+    try expectPacked(vit_hip.gelu(&vk, s, 0x1000, 968 * 5120), .{.{ vk.gelu, vp.Gelu }});
+    try expectPacked(vit_hip.unfold(&vk, s, 0x1000, 0x2000, .{ .best_h = 1078, .best_w = 1918, .n_vit_h = 77, .n_vit_w = 137, .n_llm_h = 26, .n_llm_w = 46 }), .{.{ vk.unfold, vp.Unfold }});
+    try expectPacked(vit_hip.span(&vk, s, 0x1000, 0x2000, 0x3000, 0x4000, 0x5000, 44, 22), .{.{ vk.span, vp.Span }});
 
     // EXL3, on the checkpoint's shapes (hidden 5120; a rank's expert width 1152; 384 routed + the shared expert)
     const cb = exl3_linear.codebook_mul1;

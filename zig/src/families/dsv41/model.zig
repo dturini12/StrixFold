@@ -37,8 +37,9 @@ const rdma = @import("rdma.zig");
 /// What a served request may carry (ADAPTER.md D13): text, or text with images when the vision tower is opened. The
 /// checkpoint's config.json is never changed: a text model keeps its vision_config and simply never opens the tower.
 pub const Modalities = enum { text, text_image };
-/// CUDA keeps serving images when the checkpoint has a tower; the HIP build has no vision path, so text.
-pub const default_modalities: Modalities = if (gpu.features.vision) .text_image else .text;
+/// CUDA keeps serving images when the checkpoint has a tower; HIP serves text unless asked for text_image
+/// (TF_DS_MODALITIES / --modalities): its tower needs the vision sidecar and the kit's vision kernels.
+pub const default_modalities: Modalities = if (gpu.backend == .cuda and gpu.features.vision) .text_image else .text;
 
 /// CUDA-only state (gpu.features): NCCL behind the collectives, the four-node split, its RDMA rings. Empty on HIP.
 const Nccl = if (gpu.backend == .cuda) comm_mod.Comm else void;

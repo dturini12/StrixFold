@@ -229,6 +229,22 @@
     {"id": "dense.gemv", "symbol": "tf_ds_dense_gemv", "block": [256, 1, 1], "numerics": "dense_bf16_gemv_row_invariant"},
     {"id": "dense.swiglu", "symbol": "tf_ds_dense_swiglu", "block": [256, 1, 1], "numerics": "swiglu_bf16"}
    ]
+  },
+  {
+   "source": "vision.hip",
+   "owner": "vision (engineLab's HIP tower, adapted)",
+   "kit": "dsv41",
+   "kernels": [
+    {"id": "vision.linear", "symbol": "tf_ds_vision_linear", "block": [256, 1, 1], "numerics": "vision_declared"},
+    {"id": "vision.rms_norm", "symbol": "tf_ds_vision_rms_norm", "block": [256, 1, 1], "numerics": "vision_declared"},
+    {"id": "vision.attention", "symbol": "tf_ds_vision_attention", "block": [256, 1, 1], "numerics": "vision_declared"},
+    {"id": "vision.rope", "symbol": "tf_ds_vision_rope", "block": [256, 1, 1], "numerics": "vision_declared"},
+    {"id": "vision.add", "symbol": "tf_ds_vision_add", "block": [256, 1, 1], "numerics": "vision_declared"},
+    {"id": "vision.silu_mul", "symbol": "tf_ds_vision_silu_mul", "block": [256, 1, 1], "numerics": "vision_declared"},
+    {"id": "vision.gelu", "symbol": "tf_ds_vision_gelu", "block": [256, 1, 1], "numerics": "vision_declared"},
+    {"id": "vision.unfold", "symbol": "tf_ds_vision_unfold", "block": [256, 1, 1], "numerics": "vision_declared"},
+    {"id": "vision.span", "symbol": "tf_ds_vision_span", "block": [256, 1, 1], "numerics": "vision_declared"}
+   ]
   }
  ]
 }

@@ -23,7 +23,8 @@ const link = @import("link.zig");
 const disk_mod = @import("disk.zig");
 const pd = @import("core").prompt_disk;
 const gpu = @import("gpu");
-/// The vision tower's type: CUDA builds only (gpu.features.vision); an empty type a HIP build never fills.
+/// The vision tower's type (gpu.features.vision: CUDA's vit.zig, HIP's vit_hip.zig behind vision.zig); an empty type
+/// in a build without one.
 pub const VisionTower = if (gpu.features.vision) @import("vision.zig").Vision else opaque {};
 
 const be = lanes.backend;
