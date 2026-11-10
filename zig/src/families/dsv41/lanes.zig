@@ -723,6 +723,7 @@ pub const Lanes = struct {
                     // a prepared picture (vision.zig): the tower's span rows, here on rank 0
                     if (!gpu.features.vision) return error.NoVisionTower;
                     const v = self.vision orelse return error.NoVisionTower;
+                    if (testFault(.tower)) return error.InjectedFault;
                     if (try v.rows(img.bytes, gpa, &rows) != img.tokens) return error.BadImageSpan;
                 }
                 try spans.append(gpa, .{ .at = img.at, .len = img.tokens, .row = at_row });
@@ -740,7 +741,10 @@ pub const Lanes = struct {
             // the spans and their rows, image_piece bytes of rows a frame (a follower's frame buffer holds 64 KiB and
             // the ids of a full pool)
             var off: usize = 0;
+            var pieces: usize = 0;
             while (off < rows.items.len) {
+                if (testFaultAt(.fill_images, pieces)) return error.InjectedFault;
+                pieces += 1;
                 const n = @min(image_piece, rows.items.len - off);
                 if (try self.begin(.fill_images)) {
                     try self.wire.int(gpa, u32, @intCast(spans.items.len));
@@ -1433,6 +1437,33 @@ pub fn survivals(conf: []const f32, out: []f64) void {
     }
 }
 
+/// TF_DS_TEST_FAULT (recovery tests only; unset: never): one injected failure in this process's image path, the first
+/// time it is reached. tower: rank 0 refuses a picture before its tower runs; fill_images:K: rank 0 fails a prompt
+/// after sending K pieces of its image rows to rank 1 (an error that does not break the pair); set_images: rank 1
+/// fails to take a prompt's complete image rows.
+const Fault = enum { tower, fill_images, set_images };
+var fault_fired: std.atomic.Value(bool) = .init(false);
+
+fn faultSetting() ?struct { kind: Fault, at: usize } {
+    const v = std.mem.span(std.c.getenv("TF_DS_TEST_FAULT") orelse return null);
+    const colon = std.mem.indexOfScalar(u8, v, ':');
+    const kind = std.meta.stringToEnum(Fault, v[0 .. colon orelse v.len]) orelse return null;
+    const at = if (colon) |c| std.fmt.parseInt(usize, v[c + 1 ..], 10) catch return null else 0;
+    return .{ .kind = kind, .at = at };
+}
+
+fn testFaultAt(kind: Fault, at: usize) bool {
+    const f = faultSetting() orelse return false;
+    if (f.kind != kind or f.at != at) return false;
+    if (fault_fired.swap(true, .acq_rel)) return false;
+    std.log.warn("lanes: TF_DS_TEST_FAULT={s}: failing here once", .{@tagName(kind)});
+    return true;
+}
+
+fn testFault(kind: Fault) bool {
+    return testFaultAt(kind, 0);
+}
+
 /// A primitive this rank refused: rank 0 runs the same one on the same inputs and refuses it at the same step (its
 /// request ends with the error), so the follower reports it and takes the next frame instead of ending; unless the
 /// pair itself failed (broken), which ends the follower (U47).
@@ -1446,6 +1477,9 @@ fn refused(err: anyerror) !void {
 fn broken(err: anyerror) bool {
     return switch (err) {
         error.CollectiveFailed, error.PeerLost, error.Timeout, error.Mismatch, error.Aborted, error.PeerDown, error.OutOfStep, error.FrameTooLong => true,
+        // a sticky device fault (illegal address, launch failure, ...): every later call on this GPU fails, so the
+        // rank exits and the launcher restarts the pair instead of refusing every request from here on
+        error.DeviceFault => true,
         else => false,
     };
 }
@@ -1608,7 +1642,14 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 if (off != img_rows.items.len or off + piece.len > total or piece.len == 0) return error.BadFrame;
                 try img_rows.appendSlice(gpa, piece);
                 if (img_rows.items.len == total) {
-                    m.setImages(spans.items, img_rows.items) catch |err| try refused(err);
+                    // rank 0 set the same rows before it sent them all, so a refusal here is this rank's alone: going
+                    // on would prefill the spans' tokens without their rows while rank 0 has them. The follower ends
+                    // instead (rank 0 sees the link close and exits; the launcher restarts the pair).
+                    const set = if (testFault(.set_images)) error.InjectedFault else m.setImages(spans.items, img_rows.items);
+                    set catch |err| {
+                        std.log.err("lanes: rank 1 could not take the prompt's image rows ({s}); the follower ends", .{@errorName(err)});
+                        return err;
+                    };
                     img_rows.clearRetainingCapacity();
                 }
             },

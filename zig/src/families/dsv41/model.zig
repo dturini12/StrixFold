@@ -511,7 +511,13 @@ pub const Model = struct {
         // a vision checkpoint's image routing bias (without it a prompt with images is refused; text runs as ever)
         if (gpu.features.vision and c.vision and o.modalities == .text_image) {
             const path = o.vision_bias orelse try std.fs.path.join(a, &.{ o.kit_dir, "vision", "gate_bias_vl.safetensors" });
-            m.loadVisionBias(path) catch |err| if (o.vision_bias != null or err != error.FileNotFound) return err;
+            // HIP: both ranks need it (rank 1 has no tower whose open would refuse its absence; a rank without it would
+            // refuse the image spans its peer routes), so a text_image rank without the file does not start
+            m.loadVisionBias(path) catch |err| if (gpu.backend == .hip or o.vision_bias != null or err != error.FileNotFound) return if (err == error.FileNotFound) error.NoVisionKit else err;
+            // HIP: a request's image rows (image_rows_reserved of them; more grow it) on the device from the start, so a
+            // prompt with images allocates nothing on either rank (a rank-1-only allocation failure would leave the
+            // ranks with different spans)
+            if (gpu.backend == .hip) m.img_buf = try gpu.DeviceBuffer.alloc(m.ctx.d, image_rows_reserved * c.hidden * 2);
         }
 
         // fillSplit's Engram rows exchange: the peer's projection of this rank's columns (both ranks alike)
@@ -810,6 +816,9 @@ pub const Model = struct {
             lay.gate_b_vl = dst;
         }
     }
+
+    /// The image rows a text_image rank keeps on the device from its open (four pictures of a whole span).
+    pub const image_rows_reserved = 4096;
 
     /// The filling prompt's image spans (absolute positions, in order) and their rows bf16 [tokens, hidden] from the
     /// host, after fillBegin and before its chunks.
