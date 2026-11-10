@@ -18,6 +18,8 @@ serve_load() {
   local v
   # in this order: a path may name one expanded before it ($BUNDLE)
   for v in DEPLOY_DIR BUNDLE MODEL_DIR RANK_CACHE DS_KIT ENGRAM_DIR TOKEN_MAP RUN_ROOT; do eval "$v=\"${!v}\""; done
+  PROMPT_DISK_GIB=${PROMPT_DISK_GIB:-0}
+  [ -n "${PROMPT_DISK_DIR:-}" ] && eval "PROMPT_DISK_DIR=\"$PROMPT_DISK_DIR\""
   BIN=$DEPLOY_DIR/native-hip/bin
   KIT=$DEPLOY_DIR/$KIT_SUBDIR
   [ "$PARALLEL" -ge 1 ] && [ "$PARALLEL" -le "$STREAMS" ] || die "PARALLEL $PARALLEL must be 1 .. STREAMS ($STREAMS)"
@@ -40,7 +42,20 @@ serve_load() {
   if [ "$DRAFTS" != 1 ] || [ "$WORLD" != 2 ] || [ "$DRAFT_BYPASS_AT" -gt "$STREAMS" ]; then DRAFT_BYPASS_AT=0; fi
   for v in REPLAY_FLOOR HC_SIDE ENGRAM_AIO SEED_RANDOM L2_PREFETCH; do case ${!v} in 0|1) ;; *) die "$v must be 0 or 1, not ${!v}";; esac; done
   [[ $TOP_K_MAX =~ ^[0-9]+$ ]] || die "TOP_K_MAX must be a whole number (0: off), not $TOP_K_MAX"
+  # sf-disk (off unless PROMPT_DISK_GIB > 0): it writes what the memory tier keeps, so that must be on
+  [[ $PROMPT_DISK_GIB =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "PROMPT_DISK_GIB must be a number of GiB (0: off), not $PROMPT_DISK_GIB"
+  if serve_disk_on; then
+    awk -v g="${PROMPT_CACHE_GIB:-0}" 'BEGIN { exit !(g > 0) }' || die "PROMPT_DISK_GIB=$PROMPT_DISK_GIB needs PROMPT_CACHE_GIB > 0 (the disk tier writes the kept states)"
+    [ "$WORLD" = 2 ] || die "PROMPT_DISK_GIB: the disk tier runs on the TP2 pair (WORLD=2)"
+    local k
+    for k in PROMPT_DISK_FLOOR_GIB PROMPT_DISK_QUEUE_MIB PROMPT_DISK_MIN_TOKENS PROMPT_DISK_RATE_MIB; do
+      [ -z "${!k:-}" ] || [[ ${!k} =~ ^[0-9]+$ ]] || die "$k must be a whole number, not ${!k}"
+    done
+  fi
 }
+
+# serve_disk_on: true when the configuration turns sf-disk on (PROMPT_DISK_GIB > 0).
+serve_disk_on() { awk -v g="${PROMPT_DISK_GIB:-0}" 'BEGIN { exit !(g > 0) }'; }
 
 # serve_check: every input this rank reads is here (paths only; verify_inputs.sh checks the bytes).
 serve_check() {
@@ -114,6 +129,16 @@ serve_env() {
   [ -n "${PREFILL_SPLIT_ZIP:-}" ] && SERVE_ENV+=(TF_DS_PREFILL_SPLIT_ZIP="$PREFILL_SPLIT_ZIP")
   [ -n "${LOGITS_SHA:-}" ] && SERVE_ENV+=(TF_DS_LOGITS_SHA="$LOGITS_SHA")
   [ -n "${WINDOW_LOGITS:-}" ] && SERVE_ENV+=(TF_DS_WINDOW_LOGITS="$WINDOW_LOGITS")
+  # sf-disk, both ranks alike (the handshake compares " disk=1"); nothing at all when off
+  if serve_disk_on; then
+    mkdir -p "${PROMPT_DISK_DIR:-$HOME/strixfold-cache/prefix}" && chmod 700 "${PROMPT_DISK_DIR:-$HOME/strixfold-cache/prefix}" ||
+      die "rank $RANK: cannot make PROMPT_DISK_DIR ${PROMPT_DISK_DIR:-$HOME/strixfold-cache/prefix}"
+    SERVE_ENV+=(TF_DS_PROMPT_DISK_GIB="$PROMPT_DISK_GIB" TF_DS_PROMPT_DISK_DIR="${PROMPT_DISK_DIR:-$HOME/strixfold-cache/prefix}")
+    [ -n "${PROMPT_DISK_FLOOR_GIB:-}" ] && SERVE_ENV+=(TF_DS_PROMPT_DISK_FLOOR_GIB="$PROMPT_DISK_FLOOR_GIB")
+    [ -n "${PROMPT_DISK_QUEUE_MIB:-}" ] && SERVE_ENV+=(TF_DS_PROMPT_DISK_QUEUE_MIB="$PROMPT_DISK_QUEUE_MIB")
+    [ -n "${PROMPT_DISK_MIN_TOKENS:-}" ] && SERVE_ENV+=(TF_DS_PROMPT_DISK_MIN_TOKENS="$PROMPT_DISK_MIN_TOKENS")
+    [ -n "${PROMPT_DISK_RATE_MIB:-}" ] && SERVE_ENV+=(TF_DS_PROMPT_DISK_RATE_MIB="$PROMPT_DISK_RATE_MIB")
+  fi
   # the launch's identity in the peers' handshake (U46): the deployed commit, the bundle's and serve.conf's hashes
   local commit
   commit=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["commit"])' "$DEPLOY_DIR/DEPLOY.json")
