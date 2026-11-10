@@ -53,6 +53,10 @@ git -C "$ROOT" archive HEAD tools/dsv41-hip | tar -x -C "$STAGE"
 if [ -n "$BIN" ]; then mkdir -p "$STAGE/bin"; cp -p "$BIN"/* "$STAGE/bin/"; fi
 if [ -n "$NATIVE" ]; then mkdir -p "$STAGE/native-hip"; cp -pR "$NATIVE"/. "$STAGE/native-hip/"; fi
 if [ -n "$DSKIT" ]; then mkdir -p "$STAGE/ds-kit"; cp -p "$DSKIT"/engram.json "$DSKIT"/rope.json "$DSKIT"/rope-*.f32 "$STAGE/ds-kit/"; fi
+# the image routing biases both ranks load with MODALITIES=text_image (tools/dsv41-zig/kit/make_bias_vl.py), when made
+if [ -n "$DSKIT" ] && [ -f "$DSKIT/vision/gate_bias_vl.safetensors" ]; then
+  mkdir -p "$STAGE/ds-kit/vision"; cp -p "$DSKIT/vision/gate_bias_vl.safetensors" "$STAGE/ds-kit/vision/"
+fi
 (cd "$STAGE" && find . -type f ! -name SHA256SUMS ! -name DEPLOY.json -printf '%P\n' | sort | xargs -d '\n' sha256sum > SHA256SUMS)
 python3 - "$STAGE" "$HEAD" "$(git -C "$ROOT" rev-parse HEAD^{tree})" "$HOST" "$DEST/$SHORT" "${BIN_COMMIT:-}" <<'PY'
 import json, socket, sys, time

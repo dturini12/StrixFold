@@ -1,8 +1,9 @@
 """make_bias_vl.py MODEL_DIR OUT: the kit's vision/gate_bias_vl.safetensors from your own copy of
-deepseek-ai/DeepSeek-V4.1-Flash (MIT), standard library only.
+deepseek-ai/DeepSeek-V4.1-Flash (MIT), or of an EXL3 checkpoint that keeps them, standard library only.
 
-The EXL3 checkpoint leaves out the MoE gates' routing bias for image-span tokens (`*.ffn.gate.bias_vl`, 43 f32 vectors
-of 384). This copies those tensors, byte for byte, from the original checkpoint's shards (found through its
+The MoE gates' routing bias for image-span tokens (`*.ffn.gate.bias_vl`, f32: in the 1017 release 40 layers of 384
+experts and 3 MTP layers of 128) is not in the serving bundle. The LibertAI EXL3 1017 checkpoint (c178a012) keeps them
+unquantized (older EXL3 revisions left them out). This copies those tensors, byte for byte, from the shards (found through its
 model.safetensors.index.json; only the shards that hold them are opened, and only those bytes are read) into one small
 safetensors file. The digest it prints is the one the released kit's README lists."""
 import hashlib
