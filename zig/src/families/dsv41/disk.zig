@@ -229,7 +229,9 @@ fn identity(a: std.mem.Allocator, m: *const Model, planes: []const Plane) !Parts
     const deploy = launchValue("TF_DS_DEPLOY") orelse return error.NoLaunchIdentity;
     const bundle = launchValue("TF_DS_BUNDLE") orelse return error.NoLaunchIdentity;
     var arch_buf: [256]u8 = undefined;
-    const arch = m.ctx.arch(&arch_buf) catch "unknown";
+    // copied into the arena: Parts outlives this frame, and a slice of arch_buf would name a different directory
+    // (and a different chain seed) every start once the stack is reused
+    const arch = try a.dupe(u8, m.ctx.arch(&arch_buf) catch "unknown");
     var pl: std.ArrayList(u8) = .empty;
     for (planes, 0..) |p, i| try pl.appendSlice(a, try std.fmt.allocPrint(a, "{s}{d}:{d}", .{ if (i == 0) "" else ",", p.row, p.ratio }));
     var ds_kit: std.ArrayList(u8) = .empty;
