@@ -97,6 +97,13 @@ class HfCache(unittest.TestCase):
                 (meta / (name + ".metadata")).write_text(f"{'r' * 40}\n{digest}\n1\n")
             code, report = self.run_tool(model)
             self.assertEqual((code, report["status"], len(report["files"])), (0, "pass", 2))
+            # an index kept in git: its etag is the git blob sha1
+            raw = (model / "model.safetensors.index.json").read_bytes()
+            blob = hashlib.sha1(b"blob %d\0" % len(raw) + raw).hexdigest()
+            (meta / "model.safetensors.index.json.metadata").write_text(f"{'r' * 40}\n{blob}\n1\n")
+            code, report = self.run_tool(model)
+            self.assertEqual((code, report["status"]), (0, "pass"))
+            self.assertEqual(report["files"][0]["git_sha1"], blob)
             (model / "s1.safetensors").write_bytes(b"shard!")
             code, report = self.run_tool(model)
             self.assertEqual((code, report["status"]), (1, "fail"))

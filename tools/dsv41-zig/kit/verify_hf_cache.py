@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """verify_hf_cache.py MODEL_DIR REVISION [FILE...]: each file of a huggingface_hub download checked against the sha256
 the Hub reported when it was downloaded (MODEL_DIR/.cache/huggingface/download/<file>.metadata: revision, etag, time).
+An LFS file's etag is its sha256; a file kept in git (often the index) has its git blob sha1 instead, checked as git
+computes it (sha1 of "blob <size>\0" + the bytes).
 
 With no FILE: model.safetensors.index.json and every shard it names. A file passes when its metadata names REVISION
 and its etag is a sha256 equal to the file's own. Prints one JSON report (status pass/fail, each file's sha256);
@@ -13,10 +15,13 @@ import re
 import sys
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
 
 
-def sha256(path):
-    h = hashlib.sha256()
+def sha256(path, git_blob=False):
+    h = hashlib.sha1() if git_blob else hashlib.sha256()
+    if git_blob:
+        h.update(b"blob %d\0" % os.path.getsize(path))
     with open(path, "rb", buffering=0) as f:
         fd, done = f.fileno(), 0
         while True:
@@ -42,11 +47,17 @@ def check(model, revision, name):
             lines = f.read().split("\n")
     except OSError:
         return {"file": name, "ok": False, "why": "no download metadata"}
-    if len(lines) < 2 or lines[0].strip() != revision or not HEX64.match(lines[1].strip()):
-        return {"file": name, "ok": False, "why": "metadata names another revision or no sha256 etag"}
-    got = sha256(path)
-    return {"file": name, "ok": got == lines[1].strip(), "sha256": got, "bytes": os.path.getsize(path),
-            **({} if got == lines[1].strip() else {"why": "sha256 differs from the Hub's", "hub": lines[1].strip()})}
+    etag = lines[1].strip() if len(lines) >= 2 else ""
+    if lines[0].strip() != revision or not (HEX64.match(etag) or HEX40.match(etag)):
+        return {"file": name, "ok": False, "why": "metadata names another revision or no sha256 / git sha1 etag"}
+    kind = "sha256" if HEX64.match(etag) else "git_sha1"
+    got = sha256(path, git_blob=kind == "git_sha1")
+    out = {"file": name, "ok": got == etag, kind: got, "bytes": os.path.getsize(path)}
+    if kind == "git_sha1":
+        out["sha256"] = sha256(path)
+    if got != etag:
+        out.update(why=f"{kind} differs from the Hub's", hub=etag)
+    return out
 
 
 def main():
