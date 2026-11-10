@@ -19,6 +19,7 @@
 //! TF_TP_STRIPE, a slot gather of at least N KiB is split, its second half moved over the second cable by a second
 //! proxy thread on TF_COLL_PROXY_CPU2, default 7), plus tcp_coll.zig's.
 const std = @import("std");
+const builtin = @import("builtin");
 const gpu = @import("gpu");
 const coll = @import("coll.zig");
 const Fan = @import("fan.zig").Fan;
@@ -102,7 +103,11 @@ pub const Core = struct {
                     return k.fail(2);
                 }
                 if (idle_since == 0) idle_since = wire.monotonicNs();
-                if (wire.monotonicNs() - idle_since > 20 * std.time.ns_per_ms) std.Thread.yield() catch {} else std.atomic.spinLoopHint();
+                if (wire.monotonicNs() - idle_since > 20 * std.time.ns_per_ms) {
+                    // a real sleep: sched_yield keeps the thread runnable and burns a core while idle
+                    var ts: std.c.timespec = .{ .sec = 0, .nsec = 50 * std.time.ns_per_us };
+                    _ = std.c.nanosleep(&ts, null);
+                } else std.atomic.spinLoopHint();
                 continue;
             }
             idle_since = 0;
@@ -234,7 +239,11 @@ pub const Second = struct {
                     return s.fail(2);
                 }
                 if (idle_since == 0) idle_since = wire.monotonicNs();
-                if (wire.monotonicNs() - idle_since > 20 * std.time.ns_per_ms) std.Thread.yield() catch {} else std.atomic.spinLoopHint();
+                if (wire.monotonicNs() - idle_since > 20 * std.time.ns_per_ms) {
+                    // a real sleep: sched_yield keeps the thread runnable and burns a core while idle
+                    var ts: std.c.timespec = .{ .sec = 0, .nsec = 50 * std.time.ns_per_us };
+                    _ = std.c.nanosleep(&ts, null);
+                } else std.atomic.spinLoopHint();
                 continue;
             }
             idle_since = 0;
@@ -756,6 +765,44 @@ test "a device wait that gave up (abort word 2) fails the proxy with code 2, mar
     try testing.expectEqual(@as(u32, 3), @atomicLoad(u32, &rk[0].shared.abort, .acquire));
     raiseAbort(&rk[1].shared);
     try testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &rk[1].shared.abort, .acquire));
+}
+
+/// Process CPU time (utime + stime) between two rusage snapshots, in nanoseconds.
+fn cpuNs(a: std.posix.rusage, b: std.posix.rusage) u64 {
+    const of = struct {
+        fn t(v: std.posix.timeval) u64 {
+            return @as(u64, @intCast(v.sec)) * std.time.ns_per_s + @as(u64, @intCast(v.usec)) * std.time.ns_per_us;
+        }
+    }.t;
+    return (of(b.utime) + of(b.stime)) - (of(a.utime) + of(a.stime));
+}
+
+test "an idle proxy sleeps instead of spinning: its CPU time stays far under the wall clock" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const rk = try rankPair(gpa, null);
+    defer for (rk) |r| {
+        r.close();
+        gpa.destroy(r);
+    };
+    // gathers = 0: the fake GPUs stage nothing, so both proxy cores sit in their idle wait
+    var g: [2]FakeGpu = undefined;
+    for (&g, rk, 0..) |*f, r, i| f.* = .{ .shared = &r.shared, .tx = &r.tx, .rx = &r.rx, .nslot = 4, .slot_bytes = 32768, .rank = @intCast(i), .gathers = 0 };
+    const c0 = try std.Thread.spawn(.{}, Rank.runCore, .{rk[0]});
+    const c1 = try std.Thread.spawn(.{}, Rank.runCore, .{rk[1]});
+    defer {
+        for (rk) |r| r.stop.store(1, .release);
+        c0.join();
+        c1.join();
+    }
+
+    const before = std.posix.getrusage(0); // RUSAGE_SELF
+    var ts: std.c.timespec = .{ .sec = 0, .nsec = 300 * std.time.ns_per_ms };
+    _ = std.c.nanosleep(&ts, null);
+    const cpu = cpuNs(before, std.posix.getrusage(0));
+
+    // two spinning threads burn twice the wall clock, sleeping ones far less
+    try testing.expect(cpu < 150 * std.time.ns_per_ms);
 }
 
 test "a peer that stops staging fails the proxy's exchange at the progress deadline (Timeout), not at a GPU wait's" {
