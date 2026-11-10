@@ -244,7 +244,7 @@ pub const Round = struct {
         return e.sendOf(rd.pm, rd.gm, rd.r * e.c.hidden * 4);
     }
 
-    pub fn init(e: *const Engine, a: *prompt.Arena, gpa: std.mem.Allocator, pool_cap: usize) !Round {
+    pub fn init(e: *const Engine, a: *prompt.Arena, gpa: std.mem.Allocator, context_cap: usize) !Round {
         const c = e.c;
         const w = e.w;
         const R = e.round_rows;
@@ -254,7 +254,7 @@ pub const Round = struct {
         const hd = c.head_dim;
         const hl = e.heads();
         const l0 = w.layers[0];
-        const nb_max = bucketFor(pool_cap, pool_cap);
+        const nb_max = bucketFor(context_cap, context_cap); // (a stream reaches context_cap positions at most)
         var rd: Round = undefined;
         rd.r = 0;
         // the profile's clocks off until Model.useClock (rd starts undefined: a field default does not apply)
@@ -986,7 +986,7 @@ pub const Graphs = struct {
 /// compressed rows, the positional store) are the prompt's, extended by the rows; eh: the Engram host (the rows' n-grams
 /// hashed from `seq`, the whole sequence's ids through the rows'). With `graphs` each stretch runs as its graph and a
 /// probe sees only the round's end (its logits and taps).
-pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, rings: []const u64, eh: ?*prompt.EngramHost, seq: []const i32, rows: Rows, pool_cap: usize, probe: ?Probe, graphs: ?*Graphs) !void {
+pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, rings: []const u64, eh: ?*prompt.EngramHost, seq: []const i32, rows: Rows, context_cap: usize, probe: ?Probe, graphs: ?*Graphs) !void {
     const w = e.w;
     const R = rows.ids.len;
     if (R == 0 or R > e.round_rows or rows.pos.len != R) return error.BadRound;
@@ -997,7 +997,7 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
     defer tri.decode_rows = bound;
     var deepest: usize = 0;
     for (rows.pos) |p| deepest = @max(deepest, @as(usize, @intCast(p)) + 1);
-    rd.bucket = bucketFor(deepest, pool_cap);
+    rd.bucket = bucketFor(deepest, context_cap);
     rd.has_cand = false;
     rd.has_cblk = false;
     rd.kk = 0;

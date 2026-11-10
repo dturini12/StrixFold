@@ -6,7 +6,7 @@
 #   stop_r1_decode / stop_r0_decode     SIGSTOP a rank for STOP_S (10 s, past the 2 s progress deadline), then SIGCONT
 #   kill_r1_prefill / stop_r1_prefill   the same inside a long prompt's prefill (--long 1: prompts over 128 rows)
 #   kill_r1_load                        SIGKILL rank 1 while both ranks load: rank 0 must give up, not wait forever
-#   mm_round_rows / mm_aux / mm_streams / mm_context / mm_kit / mm_strict / mm_conf (any other configuration byte: U46)
+#   mm_round_rows / mm_aux / mm_streams / mm_context / mm_pool / mm_kit / mm_strict / mm_conf (any other configuration byte: U46)
 #                                       one rank from a configuration that differs in one setting: the peers' handshake
 #                                       must refuse before serving, naming it
 #   stale_bundle                        the configuration pins another input bundle hash: the launcher refuses
@@ -18,7 +18,7 @@
 # than a reply or a hang and does not report itself healthy on /health (coordinated failure, handoff 6D). Writes ~/tfp/qual/out/BASE_ID/faults.json; exit 0 only if every case that ran passed.
 set -uo pipefail
 QCONF_BASE=${1:?CONF}; BASE=${2:?BASE_ID}; shift 2
-CASES="kill_r1_decode,kill_r0_decode,stop_r1_decode,stop_r0_decode,kill_r1_prefill,stop_r1_prefill,kill_r1_load,mm_round_rows,mm_aux,mm_streams,mm_context,mm_kit,mm_strict,mm_conf,stale_bundle,stale_cache"
+CASES="kill_r1_decode,kill_r0_decode,stop_r1_decode,stop_r0_decode,kill_r1_prefill,stop_r1_prefill,kill_r1_load,mm_round_rows,mm_aux,mm_streams,mm_context,mm_pool,mm_kit,mm_strict,mm_conf,stale_bundle,stale_cache"
 LONG=0
 while [ $# -gt 0 ]; do
   case $1 in --cases) CASES=$2; shift 2;; --long) LONG=$2; shift 2;; *) echo "unknown $1" >&2; exit 2;; esac
@@ -292,7 +292,8 @@ for c in "${list[@]}"; do
     mm_round_rows) run_mismatch "$c" "round_rows" ROUND_ROWS=8;;
     mm_aux) run_mismatch "$c" "aux" AUX=triton;;
     mm_streams) run_mismatch "$c" "streams" STREAMS=2;;
-    mm_context) run_mismatch "$c" "pool" CONTEXT=4096;;
+    mm_context) run_mismatch "$c" "pool|context" CONTEXT=4096;;
+    mm_pool) run_mismatch "$c" "pool" POOL=$(( $(source "${QCONF_BASE//\$HOME/$HOME}"; echo "${POOL:-$CONTEXT}") + 2048 ));;
     mm_kit) run_mismatch "$c" "kit" "DEPLOY_DIR='\$HOME/tfp/deploy/009fe20cfddb'";;
     mm_strict) run_mismatch "$c" "strict" GPU_STRICT=$([ "$(source "${QCONF_BASE//\$HOME/$HOME}"; echo "$GPU_STRICT")" = 1 ] && echo 0 || echo 1);;
     mm_conf) run_mismatch "$c" "conf" MAX_TOKENS=511;;

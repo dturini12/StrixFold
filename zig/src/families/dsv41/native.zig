@@ -24,7 +24,9 @@
 //!   TF_DS_ENGRAM_AIO=1                          a round's Engram reads by Linux AIO on O_DIRECT
 //!   TF_DS_FIX_K=K                               a measurement: every drafted stream verifies K drafts a round
 //!   TF_DS_PROMPT_DISK_*                         sf-disk: kept prompt states on disk on both ranks (disk.zig)
-//! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
+//!   TF_DS_POOL                                  the streams' shared pool in positions (unset: --context); at least
+//!                                               --context, which stays one request's window (and the RoPE tables')
+//! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds TF_DS_POOL (else --context)
 //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
 //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the
 //! other nodes; TF_RDMA_DEVICES (and TF_DS_RDMA_KERNELS: rdma_gather.cu's fatbin, unset: the embedded one) put its
@@ -120,6 +122,26 @@ fn nonEmpty(v: ?[]const u8) ?[]const u8 {
     return if (s.len == 0) null else s;
 }
 
+/// The streams' shared pool: TF_DS_POOL (empty or unset: the context, one stream may take it all), at least the
+/// context (a request's window: model.contextCap refuses a larger one).
+fn poolOf(context: usize) !usize {
+    return poolFrom(nonEmpty(getenv("TF_DS_POOL")), context);
+}
+
+fn poolFrom(v: ?[]const u8, context: usize) !usize {
+    const t = v orelse return context;
+    const p = std.fmt.parseInt(usize, t, 10) catch return error.BadPool;
+    if (p < context) return error.BadPool;
+    return p;
+}
+
+test "TF_DS_POOL: the context unless set, never below it" {
+    try std.testing.expectEqual(@as(usize, 1048527), try poolFrom(null, 1048527));
+    try std.testing.expectEqual(@as(usize, 2097152), try poolFrom("2097152", 1048527));
+    try std.testing.expectError(error.BadPool, poolFrom("65536", 1048527));
+    try std.testing.expectError(error.BadPool, poolFrom("2M", 1048527));
+}
+
 /// The device bytes this rank's weights take, for the host's memory check: its file in TF_DS_RANK_CACHE (the
 /// checkpoint holds both ranks'); 0 when there is none to read (open then says what to set).
 pub fn weightBytes(io: std.Io, dir: []const u8) u64 {
@@ -134,8 +156,8 @@ pub fn weightBytes(io: std.Io, dir: []const u8) u64 {
     return st.size;
 }
 
-/// Loads rank 0 and links rank 1 (which must start against TF_TP_MASTER:TF_TP_PORT); the pool holds `o.context`
-/// positions. Needs `ctx` current.
+/// Loads rank 0 and links rank 1 (which must start against TF_TP_MASTER:TF_TP_PORT); the pool holds TF_DS_POOL
+/// positions (else `o.context`), a request at most `o.context`. Needs `ctx` current.
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []const u8, kernels: []const u8, o: Options) !Loaded {
     const world = std.fmt.parseInt(u32, getenv("TF_TP_WORLD") orelse "2", 10) catch return error.BadWorld;
     if (world != 2 and world != 4) return error.BadWorld; // TP2, or the four-node 2D split
@@ -171,7 +193,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []
         .side = if (getenv("TF_DS_HC_SIDE")) |v| !std.mem.eql(u8, v, "0") else false,
         .prefetch = if (getenv("TF_DS_L2_PREFETCH")) |v| !std.mem.eql(u8, v, "0") else false,
         .engram_aio = if (getenv("TF_DS_ENGRAM_AIO")) |v| !std.mem.eql(u8, v, "0") else false,
-        .pool = o.context,
+        .pool = poolOf(o.context) catch return error.BadPool,
+        .context = o.context,
         .drafts = o.drafts,
         .arena_bytes = arena_gib << 30,
         .round_rows = if (getenv("TF_DS_ROUND_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadRoundRows else round.default_rows,
@@ -206,7 +229,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []
     // the pool is the model's (preallocated): a stream takes no device memory of its own
     const L = lanes_mod.Lanes;
     const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn };
-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (gpu.features.vision) (if (st.vision) |v| v.hook() else null) else null, .structures = st.vocab != null, .context_window = lanes_mod.usableContext(st.m.pool_cap, st.m.eng.round_rows) };
+    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (gpu.features.vision) (if (st.vision) |v| v.hook() else null) else null, .structures = st.vocab != null, .context_window = lanes_mod.usableContext(st.m.context_cap, st.m.eng.round_rows) };
 }
 
 fn deinitFn(ptr: *anyopaque) void {
@@ -234,6 +257,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.BadRoundMs => "TF_DS_ROUND_MS: a round's cost in ms by its rows from 1, comma separated, each finite and above 0 (at most 48)",
         error.BadDraftMs => "TF_DS_DRAFT_MS: a drafter pass's cost in ms, finite and not negative",
         error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 16",
+        error.BadPool => "TF_DS_POOL: the streams' shared pool in positions, at least --context (unset: --context)",
         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
         error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",

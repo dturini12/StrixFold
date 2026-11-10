@@ -28,8 +28,12 @@ serve_load() {
     size=$(stat -L -c %s "$DS_KIT/$f.f32" 2>/dev/null) || die "no RoPE table $DS_KIT/$f.f32 (DS_KIT)"
     [ -z "$rows" ] || [ $((size / 128)) -lt "$rows" ] && rows=$((size / 128))
   done
-  # the engine reads the pool's positions plus a round's 48 rows and one (model.zig rope_rows), 128 B a row
+  # the engine reads a stream's most positions (CONTEXT) plus a round's 48 rows and one (model.zig rope_rows), 128 B a row
   [ "$CONTEXT" -le $((rows - 49)) ] || die "CONTEXT $CONTEXT is past the RoPE tables' $rows rows (at most $((rows - 49)))"
+  # POOL: the streams' shared pool (unset: CONTEXT, one stream may take it all); above CONTEXT, several long streams
+  # share it while each request stays within CONTEXT (rank 0 TF_DS_POOL, rank 1 --pool; both ranks --context CONTEXT)
+  POOL=${POOL:-$CONTEXT}
+  [[ $POOL =~ ^[0-9]+$ ]] && [ "$POOL" -ge "$CONTEXT" ] || die "POOL $POOL must be a position count of at least CONTEXT ($CONTEXT)"
   [ "$GRAPHS" = 0 ] || [ "$TRANSPORT" != tcp ] || [ "$COLL_KIND" = proxy ] || die "GRAPHS=1 over tcp needs COLL_KIND=proxy"
   [ "$GRAPHS" = 0 ] || [ "$COLL_KIND" != proxy ] || [ $((ROUND_ROWS * 64640 * 4)) -le $((COLL_SLOT_KIB * 1024)) ] ||
     die "GRAPHS=1: the head gather at ROUND_ROWS=$ROUND_ROWS ($((ROUND_ROWS * 64640 * 4)) B) exceeds COLL_SLOT_KIB=$COLL_SLOT_KIB"
@@ -147,7 +151,7 @@ serve_env() {
     SERVE_ENV+=(TF_TP_WORLD="$WORLD" TF_TP_MASTER="$MASTER_IP" TF_TP_PORT="$TP_PORT" TF_DS_RANK_CACHE="$RANK_CACHE"
       TF_DS_KIT="$DS_KIT" TF_DS_ENGRAM="$ENGRAM_DIR" TF_DS_TOKEN_MAP="$TOKEN_MAP" TF_DS_STREAMS="$STREAMS"
       TF_DS_ROUND_ROWS="$ROUND_ROWS" TENSORFOLD_HIP_KERNELS="$KIT" TF_DS_HC_SIDE="$HC_SIDE" TF_DS_ENGRAM_AIO="$ENGRAM_AIO"
-      TF_TOP_K_MAX="$TOP_K_MAX" TF_SEED_RANDOM="$SEED_RANDOM" TF_DS_L2_PREFETCH="$L2_PREFETCH")
+      TF_TOP_K_MAX="$TOP_K_MAX" TF_SEED_RANDOM="$SEED_RANDOM" TF_DS_L2_PREFETCH="$L2_PREFETCH" TF_DS_POOL="$POOL")
   fi
 }
 
@@ -155,7 +159,7 @@ serve_env() {
 # command; with rank 0 and --requests, the lane gate of the same configuration: qual/lane_gate.sh).
 serve_lanes_cmd() {
   SERVE_CMD=("$BIN/tf-dsv41-lanes" "$MODEL_DIR" "$RANK_CACHE" "$RANK" "$WORLD" "$MASTER_IP" "$TP_PORT" "$DS_KIT"
-    --pool "$CONTEXT" --streams "$STREAMS" --round-rows "$ROUND_ROWS" --drafts "$DRAFTS"
+    --pool "$POOL" --context "$CONTEXT" --streams "$STREAMS" --round-rows "$ROUND_ROWS" --drafts "$DRAFTS"
     --engram "$ENGRAM_DIR" --token-map "$TOKEN_MAP" --modalities "$MODALITIES" --hip-kit "$KIT"
     --arena-gib "$ARENA_GIB" --graphs "$GRAPHS" --side "$HC_SIDE" --aio "$ENGRAM_AIO" --prefetch "$L2_PREFETCH")
   [ -n "$ROUND_MS" ] && SERVE_CMD+=(--round-ms "$ROUND_MS")
@@ -163,8 +167,8 @@ serve_lanes_cmd() {
   return 0
 }
 
-# serve_cmd: SERVE_CMD, the rank's argv. Rank 1's --pool, --streams, --round-rows and --graphs are rank 0's --context,
-# TF_DS_STREAMS, TF_DS_ROUND_ROWS and TF_DS_GRAPHS (upstream #25), from the same variables (tf-dsv41-lanes reads
+# serve_cmd: SERVE_CMD, the rank's argv. Rank 1's --pool, --context, --streams, --round-rows and --graphs are rank 0's
+# TF_DS_POOL, --context, TF_DS_STREAMS, TF_DS_ROUND_ROWS and TF_DS_GRAPHS (upstream #25), from the same variables (tf-dsv41-lanes reads
 # --graphs, --side, --aio and --prefetch, not TF_DS_GRAPHS, TF_DS_HC_SIDE, TF_DS_ENGRAM_AIO and TF_DS_L2_PREFETCH).
 serve_cmd() {
   if [ "$RANK" = 0 ]; then

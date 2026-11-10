@@ -49,7 +49,7 @@ from provenance import record  # noqa: E402  (before --tools joins sys.path)
 TEMPLATE_SHA256 = "c282975e81949382a878e06060d1ef3e6e7b22628f9b51ee2188b2dfbcc7e217"
 ENGRAM_FIELDS = ("layers", "ngram", "heads", "pad", "primes", "offsets", "multipliers", "token_map_sha256", "token_map_len")
 ROPE_TABLES = ("rope-plain-cos.f32", "rope-plain-sin.f32", "rope-compressed-cos.f32", "rope-compressed-sin.f32")
-ROPE_EXTRA_ROWS = 49  # model.zig: rope_rows = pool + round.max_rows (48) + 1
+ROPE_EXTRA_ROWS = 49  # model.zig: rope_rows = context (a stream's most positions; --pool here) + round.max_rows (48) + 1
 
 
 def file_sha256(path: Path) -> str:

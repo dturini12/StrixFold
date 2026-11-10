@@ -57,6 +57,23 @@ pub const frame_protocol = 2;
 pub fn chunkCaps(split_min: usize) [2]usize {
     return if (split_min > 0) .{ chunk_rows / 2, chunk_rows / 2 } else .{ chunk_rows, 0 };
 }
+
+/// The most positions one stream reaches in a pool of `pool` (Options.context; 0: the pool). A pool larger than the
+/// context holds several streams of that length; one larger than the pool could never be placed.
+pub fn contextCap(pool: usize, context: usize) error{BadPool}!usize {
+    if (pool == 0) return error.BadPool;
+    if (context == 0) return pool;
+    if (context > pool) return error.BadPool;
+    return context;
+}
+
+test "the context defaults to the pool and never exceeds it" {
+    try std.testing.expectEqual(@as(usize, 8192), try contextCap(8192, 0));
+    try std.testing.expectEqual(@as(usize, 1048527), try contextCap(2097152, 1048527));
+    try std.testing.expectEqual(@as(usize, 8192), try contextCap(8192, 8192));
+    try std.testing.expectError(error.BadPool, contextCap(8192, 8193));
+    try std.testing.expectError(error.BadPool, contextCap(0, 0));
+}
 /// The pool's streams (--parallel 4).
 pub const max_streams = draft.max_streams;
 /// The pool's streams when unset (--parallel 4).
@@ -76,6 +93,10 @@ pub const Options = struct {
     engram_dir: ?[]const u8 = null, // the Engram tables (none: a checkpoint without Engram layers)
     token_map: ?[]const u8 = null, // the compressed token map (the lane's JSON cache)
     pool: usize = 1 << 18, // positions of the streams' shared plane (their extents together)
+    // the most positions one stream reaches (its extent: prompt, max_tokens and a round's rows; rank 0's --context):
+    // the RoPE tables' rows, a prompt chunk's compressed keys and a round's context buckets. 0: the pool (one stream
+    // may take the whole pool, the stock layout); below the pool, several streams of that length share it
+    context: usize = 0,
     drafts: bool = true, // load the DSpark drafter
     rdma_devices: ?[]const u8 = null, // the decode gathers over RDMA on these devices (comma separated), else NCCL: TP2's
     // ring (rdma.zig), or at world 4 the 2D split's decode-size exchanges over its rings (ring2d.zig)
@@ -111,6 +132,7 @@ pub const Model = struct {
     round_ms: []const f64, // the lane core's round costs by rows (Options.round_ms, else draft.round_ms)
     draft_ms: f64, // a drafter pass's cost (Options.draft_ms): with round_ms, the profile lanes and chooseK use
     pool_cap: usize,
+    context_cap: usize, // the most positions one stream reaches (Options.context; at most pool_cap)
     cache_dir: std.Io.Dir,
     cache_file: std.Io.File,
     ix: rank_cache.Index,
@@ -241,6 +263,7 @@ pub const Model = struct {
         m.round_ms = try a.dupe(f64, profile.round_ms);
         m.draft_ms = profile.draft_ms;
         m.pool_cap = o.pool;
+        m.context_cap = try contextCap(o.pool, o.context);
         m.fill_slot = 0;
         m.prof = false;
         m.timer = null;
@@ -380,9 +403,10 @@ pub const Model = struct {
             return error.MissingKernel;
         };
 
-        // the RoPE tables (the served build's bits: torch CPU pow and polar), every position of the pool
+        // the RoPE tables (the served build's bits: torch CPU pow and polar), every position a stream reaches (positions
+        // count from each stream's own start, whatever its extent's base in the pool)
         const half = c.rope_dim / 2;
-        const rope_rows = o.pool + round.max_rows + 1;
+        const rope_rows = m.context_cap + round.max_rows + 1;
         m.rope_buf = try gpu.DeviceBuffer.alloc(d, 4 * rope_rows * half * 4);
         errdefer m.rope_buf.free();
         {
@@ -391,7 +415,7 @@ pub const Model = struct {
             for ([_][]const u8{ "rope-plain-cos.f32", "rope-plain-sin.f32", "rope-compressed-cos.f32", "rope-compressed-sin.f32" }, 0..) |name, j| {
                 var f = try std.Io.Dir.cwd().openFile(io, try std.fs.path.join(a, &.{ o.kit_dir, name }), .{});
                 defer f.close(io);
-                if (try f.readPositionalAll(io, part, 0) != part.len) return error.ShortRopeTable; // a table of fewer rows than the pool
+                if (try f.readPositionalAll(io, part, 0) != part.len) return error.ShortRopeTable; // a table of fewer rows than the context
                 try m.rope_buf.upload(j * part.len, part);
             }
         }
@@ -427,8 +451,9 @@ pub const Model = struct {
             for (c.engram_layers.slice()) |l| if (l >= c.layers / 2) return error.SplitEngramPastCut;
         }
         const caps = chunkCaps(m.split_min); // (the handshake's chunk_caps)
-        m.ch = try prompt.Chunk.init(&m.eng, &m.arena, caps[0], o.pool);
-        if (caps[1] > 0) m.ch2 = try prompt.Chunk.init(&m.eng, &m.arena, caps[1], o.pool);
+        // a chunk's compressed keys are its stream's (to the context); the caches hold every stream's extent (the pool)
+        m.ch = try prompt.Chunk.init(&m.eng, &m.arena, caps[0], m.context_cap);
+        if (caps[1] > 0) m.ch2 = try prompt.Chunk.init(&m.eng, &m.arena, caps[1], m.context_cap);
         m.caches = try prompt.Caches.init(&m.eng, &m.arena, o.pool, m.streams);
         m.blas = try blas.Blas.open(m.stream, m.ch.blas_ws);
         errdefer m.blas.close();
@@ -439,7 +464,7 @@ pub const Model = struct {
             r.* = try m.arena.take(m.streams * m.eng.ringBytes());
             try gpu.fill8Async(d, m.stream.handle, r.*, 0, m.streams * m.eng.ringBytes());
         }
-        m.rd = try round.Round.init(&m.eng, &m.arena, a, o.pool);
+        m.rd = try round.Round.init(&m.eng, &m.arena, a, m.context_cap); // its buckets to the context (the kit's variants)
         m.amax = try m.arena.take(round.max_rows * 4);
         if (o.graphs) {
             m.graphs = round.Graphs.init(gpa);
@@ -576,6 +601,7 @@ pub const Model = struct {
             .engram = m.cfg.engram_layers.slice().len > 0,
             .graphs = o.graphs,
             .pool = o.pool,
+            .context = m.context_cap,
             .streams = o.streams,
             .round_rows = o.round_rows,
             .replay_floor = prompt.replay_floor,
@@ -596,6 +622,7 @@ pub const Model = struct {
         engram: bool,
         graphs: bool,
         pool: usize,
+        context: usize = 0, // a stream's most positions: " context=N" after pool= only when below the pool (0: the pool)
         streams: usize,
         round_rows: usize,
         replay_floor: bool,
@@ -611,8 +638,10 @@ pub const Model = struct {
 
     /// The handshake's plan text (identity), in `buf`.
     pub fn planText(buf: []u8, p: PlanParts) ![]u8 {
-        return std.fmt.bufPrint(buf, "drafts={} engram={} graphs={} pool={d} streams={d} round_rows={d} chunk_rows={d} replay_floor={} aux={s} {s} engram_rows={} deploy={s} bundle={s} conf={s} kv={s} strict={}{s}", .{
-            p.drafts,       p.engram, p.graphs,  p.pool,  p.streams,  p.round_rows, chunk_rows,
+        var cb: [32]u8 = undefined;
+        const ctx = if (p.context != 0 and p.context != p.pool) try std.fmt.bufPrint(&cb, " context={d}", .{p.context}) else "";
+        return std.fmt.bufPrint(buf, "drafts={} engram={} graphs={} pool={d}{s} streams={d} round_rows={d} chunk_rows={d} replay_floor={} aux={s} {s} engram_rows={} deploy={s} bundle={s} conf={s} kv={s} strict={}{s}", .{
+            p.drafts,       p.engram, p.graphs,  p.pool,  ctx, p.streams,  p.round_rows, chunk_rows,
             p.replay_floor, p.aux,    p.gather,  p.engram_rows, p.deploy, p.bundle, p.conf,
             kv_format,      p.strict, if (p.disk) " disk=1" else "",
         });
@@ -1192,7 +1221,7 @@ pub const Model = struct {
         const e = &m.eng;
         if (m.prof) try m.stream.synchronize(); // (the GPU idle, so the issue time shows whether the host keeps it fed)
         const t0 = m.now();
-        try round.forward(e, &m.rd, &m.ch, &m.caches, m.rings, if (m.eh) |*x| x else null, &.{}, rows, m.pool_cap, null, if (m.graphs) |*g| g else null);
+        try round.forward(e, &m.rd, &m.ch, &m.caches, m.rings, if (m.eh) |*x| x else null, &.{}, rows, m.context_cap, null, if (m.graphs) |*g| g else null);
         if (m.prof) {
             m.t_enqueue = m.now() - t0;
             try m.stream.synchronize();
@@ -1345,5 +1374,12 @@ test "the handshake's plan text is the stock one with sf-disk off, and says disk
     try std.testing.expectEqualStrings(stock, try Model.planText(&buf, p));
     p.disk = true;
     try std.testing.expectEqualStrings(stock ++ " disk=1", try Model.planText(&buf, p));
+    // a context at the pool is the stock layout (the same text, the same disk namespace); below it, the ranks compare it
+    p.disk = false;
+    p.context = 8192;
+    try std.testing.expectEqualStrings(stock, try Model.planText(&buf, p));
+    p.context = 4096;
+    const split = try Model.planText(&buf, p);
+    try std.testing.expect(std.mem.indexOf(u8, split, "pool=8192 context=4096 streams=1 ") != null);
     try std.testing.expect(!@hasField(Options, "disk") or (Options{ .model_dir = "", .cache_dir = "", .kit_dir = "", .rank = 0, .world = 2, .master = .{ 0, 0, 0, 0 }, .port = 0 }).disk == false);
 }
