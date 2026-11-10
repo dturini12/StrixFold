@@ -3484,6 +3484,423 @@
      true
     ]
    }
+  },
+  {
+   "consts": {
+    "BN": 64,
+    "CB": 8,
+    "DEAD_PAD": true,
+    "HAS_BASE": true,
+    "HAS_CAND": false,
+    "HAS_TMAX": true,
+    "ID": 128,
+    "IH": 32,
+    "KEYS": true,
+    "PACKED": true,
+    "PDL": true,
+    "SKIP_DEAD": true
+   },
+   "derived": {
+    "config_sha256": "eb48f2216645b36f400036fa2d67d8ad6b48233b0f4a1bcb7e99fa6450dad253",
+    "inventory_sha256": "04294708203ffcec5c89ed2e78cd72d559be75e8624fbd06e92ba24909c36015",
+    "rule": "context length (round:r16:derived-b65538)"
+   },
+   "grid": [
+    16,
+    513,
+    1
+   ],
+   "num_warps": 4,
+   "phase": "round:r16:derived-b65538",
+   "scalars": {
+    "cs": 0,
+    "n": 32769,
+    "nt": 513
+   },
+   "tensors": {
+    "CAND": [
+     "int64",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "K": [
+     "uint8",
+     [
+      1048592,
+      64
+     ],
+     [
+      64,
+      1
+     ],
+     true
+    ],
+    "KB": [
+     "int64",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "KS": [
+     "uint8",
+     [
+      1048592,
+      4
+     ],
+     [
+      4,
+      1
+     ],
+     true
+    ],
+    "OUT": [
+     "int64",
+     [
+      16,
+      32769
+     ],
+     [
+      32769,
+      1
+     ],
+     true
+    ],
+    "Q": [
+     "bfloat16",
+     [
+      16,
+      32,
+      128
+     ],
+     [
+      4096,
+      128,
+      1
+     ],
+     true
+    ],
+    "TMAX": [
+     "int64",
+     [
+      16,
+      513
+     ],
+     [
+      513,
+      1
+     ],
+     true
+    ],
+    "VIS": [
+     "int64",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "Wt": [
+     "bfloat16",
+     [
+      16,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ]
+   }
+  },
+  {
+   "consts": {
+    "BN": 64,
+    "CB": 8,
+    "DEAD_PAD": true,
+    "HAS_BASE": true,
+    "HAS_CAND": false,
+    "HAS_TMAX": true,
+    "ID": 128,
+    "IH": 32,
+    "KEYS": true,
+    "PACKED": true,
+    "PDL": true,
+    "SKIP_DEAD": true
+   },
+   "derived": {
+    "config_sha256": "eb48f2216645b36f400036fa2d67d8ad6b48233b0f4a1bcb7e99fa6450dad253",
+    "inventory_sha256": "04294708203ffcec5c89ed2e78cd72d559be75e8624fbd06e92ba24909c36015",
+    "rule": "context length (round:r16:derived-b65568)"
+   },
+   "grid": [
+    16,
+    513,
+    1
+   ],
+   "num_warps": 4,
+   "phase": "round:r16:derived-b65568",
+   "scalars": {
+    "cs": 0,
+    "n": 32784,
+    "nt": 513
+   },
+   "tensors": {
+    "CAND": [
+     "int64",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "K": [
+     "uint8",
+     [
+      1048592,
+      64
+     ],
+     [
+      64,
+      1
+     ],
+     true
+    ],
+    "KB": [
+     "int64",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "KS": [
+     "uint8",
+     [
+      1048592,
+      4
+     ],
+     [
+      4,
+      1
+     ],
+     true
+    ],
+    "OUT": [
+     "int64",
+     [
+      16,
+      32784
+     ],
+     [
+      32784,
+      1
+     ],
+     true
+    ],
+    "Q": [
+     "bfloat16",
+     [
+      16,
+      32,
+      128
+     ],
+     [
+      4096,
+      128,
+      1
+     ],
+     true
+    ],
+    "TMAX": [
+     "int64",
+     [
+      16,
+      513
+     ],
+     [
+      513,
+      1
+     ],
+     true
+    ],
+    "VIS": [
+     "int64",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "Wt": [
+     "bfloat16",
+     [
+      16,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ]
+   }
+  },
+  {
+   "consts": {
+    "BN": 64,
+    "CB": 8,
+    "DEAD_PAD": true,
+    "HAS_BASE": true,
+    "HAS_CAND": false,
+    "HAS_TMAX": true,
+    "ID": 128,
+    "IH": 32,
+    "KEYS": true,
+    "PACKED": true,
+    "PDL": true,
+    "SKIP_DEAD": true
+   },
+   "derived": {
+    "config_sha256": "eb48f2216645b36f400036fa2d67d8ad6b48233b0f4a1bcb7e99fa6450dad253",
+    "inventory_sha256": "04294708203ffcec5c89ed2e78cd72d559be75e8624fbd06e92ba24909c36015",
+    "rule": "context length (round:r16:derived-b67458)"
+   },
+   "grid": [
+    16,
+    528,
+    1
+   ],
+   "num_warps": 4,
+   "phase": "round:r16:derived-b67458",
+   "scalars": {
+    "cs": 0,
+    "n": 33729,
+    "nt": 528
+   },
+   "tensors": {
+    "CAND": [
+     "int64",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "K": [
+     "uint8",
+     [
+      1048592,
+      64
+     ],
+     [
+      64,
+      1
+     ],
+     true
+    ],
+    "KB": [
+     "int64",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "KS": [
+     "uint8",
+     [
+      1048592,
+      4
+     ],
+     [
+      4,
+      1
+     ],
+     true
+    ],
+    "OUT": [
+     "int64",
+     [
+      16,
+      33729
+     ],
+     [
+      33729,
+      1
+     ],
+     true
+    ],
+    "Q": [
+     "bfloat16",
+     [
+      16,
+      32,
+      128
+     ],
+     [
+      4096,
+      128,
+      1
+     ],
+     true
+    ],
+    "TMAX": [
+     "int64",
+     [
+      16,
+      528
+     ],
+     [
+      528,
+      1
+     ],
+     true
+    ],
+    "VIS": [
+     "int64",
+     [
+      16
+     ],
+     [
+      1
+     ],
+     true
+    ],
+    "Wt": [
+     "bfloat16",
+     [
+      16,
+      32
+     ],
+     [
+      32,
+      1
+     ],
+     true
+    ]
+   }
   }
  ],
  "_index_score_cand": [

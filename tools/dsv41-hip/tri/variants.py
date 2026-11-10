@@ -423,7 +423,7 @@ def main():
     ap.add_argument("--inventory", default=str(BUNDLE / "inventory.json"))
     ap.add_argument("--config", default=str(BUNDLE / "model" / "config.json"))
     ap.add_argument("--out", default=str(DERIVED))
-    ap.add_argument("--pool-max", type=int, default=65487, help="the longest pool served (the RoPE tables' rows)")
+    ap.add_argument("--pool-max", type=int, default=1048527, help="the longest pool served (the RoPE tables' rows)")
     a = ap.parse_args()
     sys.path.insert(0, str(HERE))
     rec = json.loads(RECORDED.read_text())
