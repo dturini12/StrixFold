@@ -51,8 +51,13 @@ fn countTokens(srv: *Server, cx: *Cx, chat: Value) errors.Refused!usize {
     const thinking = try fields.thinkingFields(cx, chat, srv.effort_levels);
     const on = thinking.enable orelse srv.config.enable_thinking;
     const tools = try tool_specs.active(cx, chat.get("tools"), chat.get("tool_choice"));
-    const msgs = try messages_mod.normalize(cx, chat.get("messages"), "system", srv.needs_user_after_tool, srv.dialect);
-    const ids_ = prompt.renderIds(srv, cx, msgs, tools, on, srv.effortFor(thinking.effort), true) catch |e| switch (e) {
+    // image blocks count as their spans, as the messages route renders them (an engine without vision refuses them)
+    var images: messages_mod.Images = .{ .placeholder = if (srv.info.vision) |v| v.placeholder else "" };
+    const take: ?*messages_mod.Images = if (srv.info.vision != null) &images else null;
+    const msgs = try messages_mod.normalizeImages(cx, chat.get("messages"), "system", srv.needs_user_after_tool, srv.dialect, take);
+    const ids_ = (if (images.list.items.len > 0)
+        (try prompt.renderImages(srv, cx, msgs, tools, on, srv.effortFor(thinking.effort), true, images.list.items)).ids
+    else prompt.renderIds(srv, cx, msgs, tools, on, srv.effortFor(thinking.effort), true)) catch |e| switch (e) {
         error.Refused => return cx.other(cx.message),
         else => |x| return x,
     };
