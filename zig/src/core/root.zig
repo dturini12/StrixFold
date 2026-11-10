@@ -8,6 +8,8 @@ pub const draft_depth = @import("draft_depth.zig");
 pub const CopyIndex = @import("copy_index.zig").CopyIndex;
 pub const tokenizer = @import("tokenizer"); // a module of its own, so the native server shares it
 pub const ids_json = @import("ids_json.zig");
+/// sf-disk: kept prompt states on disk (blocks and state files), the store a family's disk tier drives.
+pub const prompt_disk = @import("prompt_disk.zig");
 
 test {
     _ = safetensors;
@@ -16,4 +18,5 @@ test {
     _ = draft_depth;
     _ = @import("copy_index.zig");
     _ = ids_json;
+    _ = prompt_disk;
 }
