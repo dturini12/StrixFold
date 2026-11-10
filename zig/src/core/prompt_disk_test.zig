@@ -230,6 +230,8 @@ test "a corrupt or missing file is a bad resume; a state still being written is 
     defer t.close();
     var p = try save(t, &keys);
     p.deinit(gpa);
+    var shorter = try save(t, keys[0..4]); // shares blocks 1-4
+    shorter.deinit(gpa);
     try std.testing.expect(t.flush(5 * std.time.ns_per_s));
     var got: [6]Key = undefined;
     const slot = try gpa.alloc(u8, slot_bytes);
@@ -250,6 +252,12 @@ test "a corrupt or missing file is a bad resume; a state still being written is 
     // a missing block
     _ = c.unlink(try path(&pb, root, keys[0], true));
     try std.testing.expect(!t.readRun(keys[0..1], 1, data, file));
+    // the bad block's key is named, and every state that lists it goes
+    var bad: Key = undefined;
+    try std.testing.expect(!t.readRunOr(&keys, 1, data, file, &bad));
+    try std.testing.expectEqualSlices(u8, &keys[0], &bad);
+    try std.testing.expectEqual(@as(usize, 2), t.dropBlock(bad));
+    try std.testing.expectEqual(@as(?u32, null), t.longest(&keys, 0, 6));
     // an unknown state, and one whose k is not the asked one
     try std.testing.expectEqual(pd.Load.bad, t.readState(keys[3], 4, got[0..4], slot));
     // a state planned but not yet written is busy

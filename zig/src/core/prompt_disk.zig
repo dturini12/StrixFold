@@ -641,6 +641,21 @@ pub const Tier = struct {
         t.pushDelete(&.{}, del.toOwnedSlice(t.gpa) catch return);
     }
 
+    /// A block found missing or corrupt: every state on disk that lists it goes (each would fail the same way).
+    pub fn dropBlock(t: *Tier, key: Key) usize {
+        t.drain();
+        var gone: std.ArrayList(Key) = .empty;
+        defer gone.deinit(t.gpa);
+        var it = t.states.iterator();
+        while (it.next()) |e| if (e.value_ptr.status == .complete) for (e.value_ptr.keys) |bk| if (std.mem.eql(u8, &bk, &key)) {
+            gone.append(t.gpa, e.key_ptr.*) catch {};
+            break;
+        };
+        for (gone.items) |k| t.dropState(k);
+        t.line("event=drop-block states={d} key={s}", .{ gone.items.len, &short(key) });
+        return gone.items.len;
+    }
+
     /// States forgotten (evicted by the leader, a resume found bad, rank 0 lacks them): their files and the blocks only
     /// they held go.
     pub fn drop(t: *Tier, keys: []const Key) void {
@@ -755,11 +770,16 @@ pub const Tier = struct {
     }
 
     /// Blocks `keys` (block first_j onward) read and verified into `data`, laid out as a run (rangeOffset); `scratch`
-    /// holds one block file. False when one is missing or corrupt.
+    /// holds one block file. False when one is missing or corrupt (its key in `bad`, when given).
     pub fn readRun(t: *Tier, keys: []const Key, first_j: u32, data: []u8, scratch: []u8) bool {
+        return t.readRunOr(keys, first_j, data, scratch, null);
+    }
+
+    pub fn readRunOr(t: *Tier, keys: []const Key, first_j: u32, data: []u8, scratch: []u8, bad: ?*Key) bool {
         const n = keys.len;
         if (data.len < n * t.block_bytes or scratch.len < head_bytes + t.block_bytes) return false;
         for (keys, 0..) |k, i| {
+            if (bad) |b| b.* = k;
             var pb: [1400]u8 = undefined;
             const path = t.blockPath(&pb, k, false) catch return false;
             const fd = c.open(path, .{ .ACCMODE = .RDONLY }, @as(c.mode_t, 0));

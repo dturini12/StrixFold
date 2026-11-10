@@ -382,7 +382,11 @@ pub const Disk = struct {
         var j0: u32 = 0;
         while (j0 < k) {
             const n = @min(group, k - j0);
-            if (!d.tier.readRun(keys[j0..][0..n], j0 + 1, data, file)) return .bad;
+            var bad: Key = undefined;
+            if (!d.tier.readRunOr(keys[j0..][0..n], j0 + 1, data, file, &bad)) {
+                _ = d.tier.dropBlock(bad); // (every state listing it would fail the same way)
+                return .bad;
+            }
             for (d.planes, d.plane_bytes, 0..) |p, b, i| {
                 const off = pd.rangeOffset(d.plane_bytes, n, i);
                 try gpu.copyH2D(d.m.ctx.d, rowsAt(p, base, j0 + 1), data[off..][0 .. n * b]);
