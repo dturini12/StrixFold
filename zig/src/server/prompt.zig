@@ -16,7 +16,13 @@ pub const isTitle = messages_mod.isTitleRequest;
 
 /// ``render_prompt_ids``: messages normalized for this template, rendered, and a dangling ``<think>`` closed.
 pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool) errors.Refused![]const u32 {
-    const normalized = try messages_mod.toolArguments(cx, try messages_mod.normalize(cx, messages, srv.late_system, srv.needs_user_after_tool, srv.dialect), srv.dialect);
+    const normalized = try messages_mod.normalize(cx, messages, srv.late_system, srv.needs_user_after_tool, srv.dialect);
+    return renderNormalizedIds(srv, cx, normalized, tools, thinking, effort, generation);
+}
+
+/// Render normalized messages without rejecting authenticated image placeholders a second time.
+fn renderNormalizedIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool) errors.Refused![]const u32 {
+    const normalized = try messages_mod.toolArguments(cx, messages, srv.dialect);
     var problem: []const u8 = "";
     const options: model_text.RenderOptions = .{
         .tools = if (tools.len > 0) Value{ .array = @constCast(tools) } else null,
@@ -51,13 +57,19 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
         } },
         .ids => |ids| return .{ .ids = ids },
     };
+    if (input.images.len > 0) return renderImages(srv, cx, input.messages, input.tools, thinking, effort, true, input.images);
     const prompt = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, true);
-    if (input.images.len > 0) return spans(srv, cx, prompt, input.images); // (no kept history: the cache keys tokens)
     const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
     var history_len: usize = 0;
     if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) history_len = history.len;
     if (history_len == 0 and prompt.len > 1 and std.mem.eql(u32, history, prompt)) history_len = prompt.len - 1; // a template with no generation suffix
     return .{ .ids = prompt, .history_len = history_len };
+}
+
+/// Render authenticated image messages after normalizeImages has escaped literal placeholders.
+pub fn renderImages(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool, images: []const []const u8) errors.Refused!Rendered {
+    const ids = try renderNormalizedIds(srv, cx, messages, tools, thinking, effort, generation);
+    return spans(srv, cx, ids, images);
 }
 
 /// Each image placeholder of the rendered prompt as its image's span (the vision family's prepare: the span's length and

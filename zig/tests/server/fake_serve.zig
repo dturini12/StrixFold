@@ -3,6 +3,11 @@ const std = @import("std");
 const server = @import("server");
 const FakeText = @import("fake_text.zig").FakeText;
 const ScriptEngine = @import("fake_engine.zig").ScriptEngine;
+const api = @import("engine_api");
+
+fn imagePrepare(_: *anyopaque, _: std.mem.Allocator, bytes: []const u8, _: *[]const u8) api.Vision.PrepareError!api.Vision.Prepared {
+    return .{ .tokens = 4, .payload = bytes };
+}
 
 fn announce(port: u16) void {
     var buf: [32]u8 = undefined;
@@ -43,6 +48,11 @@ pub fn main(init: std.process.Init) !u8 {
     const scripts = try std.json.parseFromSliceLeaky(std.json.Value, a, scripts_bytes, .{});
     const context: u32 = if (init.environ_map.get("TF_FAKE_CONTEXT")) |c| try std.fmt.parseInt(u32, c, 10) else 0;
     var engine: ScriptEngine = .{ .gpa = gpa, .io = io, .text = text, .scripts = scripts, .info_ = .{ .lanes = server.cli.parallel(args.parallel) orelse 8, .context_window = context, .call_gates = true } };
+    if (init.environ_map.get("TF_FAKE_VISION")) |v| if (std.mem.eql(u8, v, "1")) {
+        const placeholder = "<\u{ff5c}deepseek_image\u{ff5c}>";
+        engine.info_.vision = .{ .ctx = &engine, .placeholder = placeholder,
+            .token = text.tokenId(placeholder) orelse return error.NoImageToken, .prepare = imagePrepare };
+    };
     return server.serve.run(gpa, io, args, .{
         .engine = engine.engine(),
         .text = text,

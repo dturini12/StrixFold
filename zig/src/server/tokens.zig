@@ -29,14 +29,18 @@ fn tokenize(srv: *Server, cx: *Cx, body: Value) errors.Refused!Value {
     var ids: []const u32 = undefined;
     if (body.has("messages")) {
         const generation = try flag(cx, body, "add_generation_prompt", true);
-        const msgs = try messages.normalize(cx, body.get("messages"), "system", srv.needs_user_after_tool, srv.dialect);
+        var images: messages.Images = .{ .placeholder = if (srv.info.vision) |v| v.placeholder else "" };
+        const take: ?*messages.Images = if (srv.info.vision != null) &images else null;
+        const msgs = try messages.normalizeImages(cx, body.get("messages"), "system", srv.needs_user_after_tool, srv.dialect, take);
         const tools = tool_specs.active(cx, body.get("tools"), body.get("tool_choice")) catch |e| switch (e) {
             error.Refused => return cx.refuse(cx.message), // a ValueError here is a RequestError
             else => |x| return x,
         };
         const thinking = try fields.thinkingFields(cx, body, srv.effort_levels);
         const on = thinking.enable orelse srv.config.enable_thinking;
-        ids = prompt.renderIds(srv, cx, msgs, tools, on, srv.effortFor(thinking.effort), generation) catch |e| switch (e) {
+        ids = (if (images.list.items.len > 0)
+            (try prompt.renderImages(srv, cx, msgs, tools, on, srv.effortFor(thinking.effort), generation, images.list.items)).ids
+        else prompt.renderIds(srv, cx, msgs, tools, on, srv.effortFor(thinking.effort), generation)) catch |e| switch (e) {
             error.Refused => return cx.other(cx.message),
             else => |x| return x,
         };
