@@ -385,8 +385,10 @@ tower on rank 0. Everything above about `text` still holds: a text rank opens, l
   declared exp, the 2D RoPE tables built on the host in double precision (libc pow / cos / sin), erf-GELU the fdlibm
   approximations. Gate: `tf-dsv41-vision-check` (dsv41-hip-gpu-test) against engineLab's `encode_reference` dumps
   (`tools/vision-golden` in the deployment repo): every step (RoPE tables, patch embed, all 32 blocks, final norm,
-  aligner rows) and the span byte for byte, and picture.zig's patches against the reference's prep. Fidelity: about
-  0.999 mean row cosine against the release's FP32 torch tower (not bitwise; CUDA's vit.zig bytes differ too).
+  aligner rows) and the span byte for byte, and picture.zig's patches against the reference's prep. Fidelity (not
+  bitwise; CUDA's vit.zig bytes differ too), mean row cosine of the aligner rows on six pictures (2026-11-10): 0.9978 to
+  0.9997 against the release's FP32 torch tower, 0.9993 to 0.9998 against its BF16 CUDA run (the release's own BF16
+  run is 0.9977 to 0.9998 against FP32); the release's prep gave the same patches on all six.
 - **Assets:** rank 0 reads the 266 tower tensors (926 MiB BF16) from `TF_DS_VISION_DIR`, a one-shard sidecar made by
   `tools/dsv41-zig/kit/make_vision_sidecar.py` from any checkpoint that holds them (the LibertAI EXL3 1017 checkpoint's
   equal the release's: identity `32e3e2cc...`). Both ranks read the image routing biases from
