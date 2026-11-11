@@ -270,6 +270,19 @@ pub fn place(used: []const [2]usize, size: usize, cap: usize) ?usize {
     return null;
 }
 
+/// A drafting stream's key for the drafter pass whose first draft lands at `position`: a sampled stream that asks
+/// for it (draft_temperature above 0) has its drafts drawn with the noise its verify rows will use (the verify row
+/// of the token at position p draws with (seed, p, token): `draw`), on the drafter's scores over the draft
+/// temperature, the request's temperature times draft_temperature. Any other stream: the drafter's best token.
+pub fn draftKey(s: ?lanes.Sampling, position: u64) draft.SampleKey {
+    const sm = s orelse return .{};
+    const t = sm.temperature * sm.draft_temperature;
+    if (!(sm.temperature > 0) or !(t > 0) or !std.math.isFinite(t)) return .{};
+    const inv_t: f32 = @floatCast(1.0 / t);
+    if (!(inv_t > 0) or !std.math.isFinite(inv_t)) return .{};
+    return .{ .seed = sm.seed, .position = position, .inv_t = inv_t };
+}
+
 /// The token a row's logits draw at absolute position `position`: greedy without sampling (or at temperature 0),
 /// else the served sampler with the stream's key.
 pub fn draw(row: []const f32, position: u64, s: ?lanes.Sampling) !u32 {
@@ -1002,6 +1015,8 @@ pub const Lanes = struct {
         var slots: [max_streams]i64 = undefined;
         var depths: [max_streams]usize = undefined;
         var asked: [max_streams]*Lane = undefined;
+        var keys: [max_streams]draft.SampleKey = undefined;
+        var sampled = false;
         var n: usize = 0;
         var steps: usize = 0;
         for (requests) |r| {
@@ -1017,10 +1032,15 @@ pub const Lanes = struct {
             slots[n] = @intCast(l.slot);
             depths[n] = @min(r.depth, block);
             asked[n] = l;
+            keys[n] = draftKey(r.stream.sampling, r.position);
+            sampled = sampled or keys[n].inv_t > 0;
             steps = @max(steps, depths[n]);
             n += 1;
         }
         if (n == 0) return;
+        // a pass with a sampled stream that asks for it draws its drafts with the streams' keys (a kit without the
+        // kernel, or a lane whose Markov loop has no gather: every draft the best token, as upstream)
+        const race = sampled and m.draftRaces();
         if (try self.begin(.pass)) {
             try self.wire.int(gpa, u32, @intCast(n));
             try self.wire.int(gpa, u32, @intCast(steps));
@@ -1029,10 +1049,15 @@ pub const Lanes = struct {
                 try self.wire.int(gpa, i64, q0[i]);
                 try self.wire.int(gpa, i64, slots[i]);
             }
+            try self.wire.int(gpa, u8, @intFromBool(race));
+            if (race) for (keys[0..n]) |k| {
+                try self.wire.int(gpa, u64, k.seed);
+                try self.wire.int(gpa, u32, @bitCast(k.inv_t));
+            };
             try self.flush();
         }
         const t0 = m.now();
-        try m.pass(tokens[0..n], q0[0..n], slots[0..n], steps);
+        try m.pass(tokens[0..n], q0[0..n], slots[0..n], steps, if (race) keys[0..n] else null);
         const pass_ms = @as(f64, @floatFromInt(m.now() - t0)) / 1e6;
         for (asked[0..n]) |l| l.tel.draft.add(pass_ms);
         if (self.prof) |*p| {
@@ -1656,8 +1681,19 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                     q0[i] = try r.int(i64);
                     slots[i] = try r.int(i64);
                 }
+                var keys: [max_streams]draft.SampleKey = undefined;
+                const race = switch (try r.int(u8)) {
+                    0 => false,
+                    1 => true,
+                    else => return error.BadFrame,
+                };
+                // each stream's key: its seed and 1 / its draft temperature; its first draft lands after q0
+                if (race) for (0..n) |i| {
+                    const seed = try r.int(u64);
+                    keys[i] = .{ .seed = seed, .position = @intCast(q0[i] + 1), .inv_t = @bitCast(try r.int(u32)) };
+                };
                 try r.end();
-                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps) catch |err| try refused(err);
+                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps, if (race) keys[0..n] else null) catch |err| try refused(err);
             },
             .fill_images => {
                 const count = try r.int(u32);
@@ -2092,4 +2128,16 @@ test "a request's telemetry: accepted prefixes, first rejections, full acceptanc
     // a buffer too small for the object: nothing, rather than a cut JSON
     var small: [16]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 0), t.write(null, &small));
+}
+
+test "draftKey: a sampled stream that asks for it, at its temperature times the draft temperature" {
+    // greedy streams, sampled streams that do not ask, and settings without a usable temperature: the best token
+    try std.testing.expectEqual(draft.SampleKey{}, draftKey(null, 10));
+    try std.testing.expectEqual(draft.SampleKey{}, draftKey(.{ .seed = 5, .temperature = 1.0 }, 10));
+    try std.testing.expectEqual(draft.SampleKey{}, draftKey(.{ .seed = 5, .temperature = 0, .draft_temperature = 1 }, 10));
+    try std.testing.expectEqual(draft.SampleKey{}, draftKey(.{ .seed = 5, .temperature = 1, .draft_temperature = 1e-60 }, 10));
+    // the key the verify row of the token at `position` draws with, the scores over 0.8 x 0.5
+    const k = draftKey(.{ .seed = 5, .temperature = 0.8, .draft_temperature = 0.5 }, 1234);
+    try std.testing.expectEqual(draft.SampleKey{ .seed = 5, .position = 1234, .inv_t = 2.5 }, k);
+    try std.testing.expectEqual(@as(f32, 1.0), draftKey(.{ .seed = 9, .temperature = 1.0, .draft_temperature = 1.0 }, 7).inv_t);
 }

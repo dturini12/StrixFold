@@ -222,6 +222,14 @@
    ]
   },
   {
+   "source": "aux_markov.hip",
+   "owner": "the drafter's sampled Markov step (draft_temperature)",
+   "kit": "dsv41",
+   "kernels": [
+    {"id": "aux.markov_race", "symbol": "tf_ds_aux_markov_race", "block": [1024, 1, 1], "numerics": "markov_race_fp32"}
+   ]
+  },
+  {
    "source": "dense.hip",
    "owner": "p-par",
    "kit": "dsv41",

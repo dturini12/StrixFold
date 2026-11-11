@@ -11,6 +11,11 @@ pub const Sampling = struct {
     top_k: u32 = 20,
     top_p: f64 = 0.95,
     min_p: f64 = 0.0,
+    /// The draft temperature as a multiple of `temperature`, for an engine whose drafter can draw with the request's
+    /// sampling noise (DeepSeek-V4.1 on HIP): above 0, a draft is the drafter's draw at temperature * this with the
+    /// key the verify row will use; 0 (and every other engine), the drafter's best token. Never changes a reply's
+    /// tokens, only how many drafts land.
+    draft_temperature: f64 = 0.0,
 
     /// ln(min_p), -inf when off.
     pub fn minLog(s: Sampling) f64 {

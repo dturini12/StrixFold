@@ -197,6 +197,7 @@ pub const Server = struct {
             .top_k = top_k,
             .top_p = @floatCast(number(options.get("top_p")) orelse 1.0),
             .min_p = @floatCast(number(options.get("min_p")) orelse 0.0),
+            .draft_temperature = @floatCast(number(options.get("draft_temperature")) orelse 0.0),
         };
     }
 

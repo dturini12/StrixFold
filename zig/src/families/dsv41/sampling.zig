@@ -35,12 +35,16 @@ fn mix(x0: u64) u64 {
     return x ^ (x >> 31);
 }
 
-/// exact_sampling.uniform: a (0, 1) double from a splitmix64 hash of (seed, position, token id).
-pub fn uniform(seed: u64, position: u64, id: u64) f64 {
+/// The key's bits: a splitmix64 chain over (seed, position, token id).
+pub fn keyBits(seed: u64, position: u64, id: u64) u64 {
     var x = mix(seed +% 0x9E3779B97F4A7C15);
     x = mix(x ^ (position *% 0xD1B54A32D192ED03));
-    x = mix(x ^ id);
-    return @as(f64, @floatFromInt(x >> 11)) * 0x1p-53 + 0x1p-54;
+    return mix(x ^ id);
+}
+
+/// exact_sampling.uniform: a (0, 1) double from a splitmix64 hash of (seed, position, token id).
+pub fn uniform(seed: u64, position: u64, id: u64) f64 {
+    return @as(f64, @floatFromInt(keyBits(seed, position, id) >> 11)) * 0x1p-53 + 0x1p-54;
 }
 
 /// numpy's pairwise sum of a contiguous float64 row (umath pairwise_sum, under its 128-element block).

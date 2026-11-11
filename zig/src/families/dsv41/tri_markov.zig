@@ -10,6 +10,8 @@ const aot = gpu.aot;
 const Tri = tri.Tri;
 const u = tri.u;
 const p = aot.ptr;
+const tri_aux = @import("tri_aux.zig");
+const sampling = @import("sampling.zig");
 
 /// markov.BN: vocabulary entries a dot (V / world is a multiple of it).
 pub const bn = 64;
@@ -39,6 +41,56 @@ pub const Gather = struct {
     ctx: *anyopaque,
     run: *const fn (ctx: *anyopaque, send: u64, rows: usize, step: usize) anyerror!u64,
 };
+
+/// A sampled pass's draws (HIP): aux.markov_race and the rows' keys (tri_aux.MarkovKey [rows], on the device).
+pub const Race = struct { f: gpu.Function, keys: u64 };
+
+/// aux.markov_race's launch: a row a workgroup.
+pub fn race(t: Tri, f: gpu.Function, a: tri_aux.MarkovRaceArgs) !void {
+    return t.runHipBlock("aux.markov_race", f, .{ @intCast(a.n_rows), 1, 1 }, tri_aux.markov_race_block, a);
+}
+
+extern "c" fn logf(x: f32) f32;
+extern "c" fn log1pf(x: f32) f32;
+
+/// aux.markov_race's Gumbel draw of the key bits (sampling.keyBits), its fp32 arithmetic: -log(-log(u)) of the
+/// sampler's u, the double nearest ((bits >> 11) + 0.5) 2^-53. Below a half that is exact, and -log(u) is taken
+/// from it; from a half on the double is (a + (a & 1)) 2^-53 (a tie, to even), and -log(u) is taken from 1 - u (the
+/// sampler's u of the last a is 1 and its draw +inf: here too).
+pub fn raceGumbel(bits: u64) f32 {
+    const a = bits >> 11;
+    const e: f32 = if (a < (1 << 52))
+        -logf((@as(f32, @floatFromInt(a)) + 0.5) * 0x1p-53)
+    else
+        -log1pf(-(@as(f32, @floatFromInt((1 << 53) - a - (a & 1))) * 0x1p-53));
+    return -logf(e);
+}
+
+/// _score's order of two (value, token) (kernels.py _better, torch.argmax's): a NaN above everything, then the larger
+/// value, ties (and a NaN against a NaN) to the lower token.
+fn raceBetter(v: f32, i: u32, bv: f32, bi: u32) bool {
+    const n1 = v != v;
+    const n2 = bv != bv;
+    return (n1 and (!n2 or i < bi)) or (!n1 and !n2 and (v > bv or (v == bv and i < bi)));
+}
+
+/// aux.markov_race's pick of one row on the host (its GPU test's reference and the rule's statement): the best, in
+/// _score's order, of score[c] = lg[c] + bias[c] (one fp32 add), times the key's inv_t plus the draw of token
+/// id0 + c at `position` when inv_t > 0 (a greedy row: _score's and _finish's pick). (value, token).
+pub fn raceRow(lg: []const f32, bias: []const f16, key: tri_aux.MarkovKey, position: u64, id0: u32) struct { f32, u32 } {
+    var bv = -std.math.inf(f32);
+    var bi: u32 = std.math.maxInt(u32);
+    for (lg, bias, 0..) |l, b, c| {
+        const score = l + @as(f32, b);
+        const id = id0 + @as(u32, @intCast(c));
+        const v = if (key.inv_t > 0) score * key.inv_t + raceGumbel(sampling.keyBits(key.seed, position, id)) else score;
+        if (raceBetter(v, id, bv, bi)) {
+            bv = v;
+            bi = id;
+        }
+    }
+    return .{ bv, if (bi == std.math.maxInt(u32)) id0 else bi };
+}
 
 /// markov.Markov: one drafter's Markov loop on one rank: the head rows it scores, the cached bias rows, every token's slot.
 pub const Markov = struct {
@@ -127,15 +179,40 @@ pub const Markov = struct {
         return if (m.split) sc.send else null;
     }
 
+    /// Whether a pass's steps can draw with aux.markov_race: this rank scores its own vocabulary columns, one segment
+    /// of the head's TP2 logits, and hands its bests to the ranks' gather.
+    pub fn races(m: Markov) bool {
+        return m.split and m.segs == 1 and m.lg_w == 0;
+    }
+
+    /// localBest for a pass with sampled streams: step i's (value, token) of each row on this rank's columns into
+    /// the returned send [N, 4], a sampled row's by its score over the draft temperature plus its key's draw at the
+    /// step's position, a greedy row's as localBest picks it.
+    pub fn raceBest(m: Markov, t: Tri, rc: Race, lg: u64, out: u64, ts: usize, n: usize, block: usize, i: usize, sc: Scratch) !u64 {
+        if (n > np) return error.TooManyRows;
+        if (!m.races()) return error.BadDraftPass;
+        const nc = m.n_cols;
+        const tok = out + 8 * i;
+        try m.bias(t, tok, ts, m.slot, sc.stage, m.cols, n);
+        try race(t, rc.f, .{
+            .lg = lg + 4 * i * nc,          .tok = tok,                  .slot = m.slot,              .cache = m.cache,
+            .stage = sc.stage,              .keys = rc.keys,             .send = sc.send,             .l_row = @intCast(block * nc),
+            .t_stride = @intCast(ts),       .c_row = @intCast(m.cols),   .s_row = @intCast(m.cols),   .n_rows = @intCast(n),
+            .n_cols = @intCast(nc),         .id0 = @intCast(m.seg0 * nc), .step = @intCast(i),
+        });
+        return sc.send;
+    }
+
     /// Markov.pick: out[:, i + 1] (out [N, steps + 1] int64, row stride ts) from every rank's (value, index) bests g [world, N, 4] fp32.
     pub fn pick(_: Markov, t: Tri, g: u64, world: usize, out: u64, ts: usize, n: usize, i: usize) !void {
         try t.run("_pick", .{ u(n), 1, 1 }, &.{ p("G", "*fp32", g), int("n_rows", n), p("OUT", "*i64", out + 8 * (i + 1)), int("o_stride", ts) }, &.{ ci("WORLD", world), t.pdlConst() });
     }
 
     /// Markov.steps: out [N, count + 1] int64 (out[:, 0] the last tokens) -> out[:, 1:] the drafts, each step's bests gathered over the ranks before its pick.
-    pub fn steps(m: Markov, t: Tri, lg: u64, out: u64, ts: usize, n: usize, block: usize, count: usize, sc: Scratch, gather: Gather) !void {
+    /// `rc` (a pass with sampled streams, races()): each step's bests are raceBest's.
+    pub fn steps(m: Markov, t: Tri, lg: u64, out: u64, ts: usize, n: usize, block: usize, count: usize, sc: Scratch, gather: Gather, rc: ?Race) !void {
         for (0..count) |i| {
-            const send = try m.localBest(t, lg, out, ts, n, block, i, sc) orelse continue;
+            const send = if (rc) |r| try m.raceBest(t, r, lg, out, ts, n, block, i, sc) else (try m.localBest(t, lg, out, ts, n, block, i, sc) orelse continue);
             try m.pick(t, try gather.run(gather.ctx, send, n, i), m.world, out, ts, n, i);
         }
     }
@@ -272,7 +349,7 @@ test "steps: each step's bias, score and finish, then the pick of the ranks' gat
     var ranks: Ranks = .{};
     const out: u64 = 0x7b00_0000_0000;
     const sc: Scratch = .{ .pv = 0x7c00_0000_0000, .pi = 0x7c00_0000_0100, .send = 0x7c00_0000_0200, .stage = 0x7c00_0000_0300 };
-    try m.steps(.{ .log = &log }, elsewhere, out, 4, 3, cfg.dspark_block, 3, sc, .{ .ctx = &ranks, .run = Ranks.run });
+    try m.steps(.{ .log = &log }, elsewhere, out, 4, 3, cfg.dspark_block, 3, sc, .{ .ctx = &ranks, .run = Ranks.run }, null);
     try std.testing.expectEqual(@as(u64, 3), ranks.gathered);
     try std.testing.expectEqual(@as(usize, 12), log.items.items.len);
     const names = [_][]const u8{ "_bias", "_score", "_finish", "_pick" };
@@ -282,4 +359,142 @@ test "steps: each step's bias, score and finish, then the pick of the ranks' gat
         try std.testing.expectEqual(0x7d00_0000_0000 + 0x1000 * @as(u64, j / 4 + 1), k.args[0].value.ptr.addr);
         try std.testing.expectEqual(out + 8 * @as(u64, j / 4 + 1), k.args[2].value.ptr.addr);
     }
+}
+
+test "a sampled pass's steps: each step's bias, the race at its position, then the pick of the ranks' gathered bests" {
+    var log: tri.Log = .{ .gpa = std.testing.allocator };
+    defer log.deinit();
+    const cfg = try modelConfig();
+    var m = try Markov.init(cfg, .{ .rank = 1, .world = tp }, elsewhere, elsewhere, 0x7a00_0000_0000);
+    m.cache = 0x7a00_0000_1000;
+    try std.testing.expect(m.races());
+    const Ranks = struct {
+        gathered: u64 = 0,
+        fn run(ctx: *anyopaque, send: u64, rows: usize, step: usize) anyerror!u64 {
+            const r: *@This() = @ptrCast(@alignCast(ctx));
+            try std.testing.expectEqual(@as(u64, 0x7c00_0000_0200), send);
+            try std.testing.expectEqual(@as(usize, 3), rows);
+            try std.testing.expectEqual(@as(usize, r.gathered), step);
+            r.gathered += 1;
+            return 0x7d00_0000_0000 + 0x1000 * r.gathered;
+        }
+    };
+    var ranks: Ranks = .{};
+    const out: u64 = 0x7b00_0000_0000;
+    const lg: u64 = 0x7900_0000_0000;
+    const keys: u64 = 0x7800_0000_0000;
+    const sc: Scratch = .{ .pv = 0x7c00_0000_0000, .pi = 0x7c00_0000_0100, .send = 0x7c00_0000_0200, .stage = 0x7c00_0000_0300 };
+    const f: gpu.Function = undefined; // the log takes the launch
+    try m.steps(.{ .log = &log }, lg, out, 4, 3, cfg.dspark_block, 3, sc, .{ .ctx = &ranks, .run = Ranks.run }, .{ .f = f, .keys = keys });
+    try std.testing.expectEqual(@as(u64, 3), ranks.gathered);
+    try std.testing.expectEqual(@as(usize, 9), log.items.items.len);
+    const names = [_][]const u8{ "_bias", "aux.markov_race", "_pick" };
+    const nc = cfg.vocab / tp;
+    for (log.items.items, 0..) |k, j| {
+        try std.testing.expectEqualStrings(names[j % 3], k.name);
+        const i = j / 3;
+        if (j % 3 != 1) continue;
+        try std.testing.expectEqual([3]u32{ 3, 1, 1 }, k.grid);
+        try std.testing.expectEqual(@as(u32, tri_aux.markov_race_block), k.block);
+        const a = log.hipArgs(tri_aux.MarkovRaceArgs, j);
+        // step i: its block row's logits, the tokens the last step picked, this rank's half of the vocabulary
+        try std.testing.expectEqual(lg + 4 * i * nc, a.lg);
+        try std.testing.expectEqual(out + 8 * i, a.tok);
+        try std.testing.expectEqual(@as(i64, @intCast(cfg.dspark_block * nc)), a.l_row);
+        try std.testing.expectEqual(@as(i64, 4), a.t_stride);
+        try std.testing.expectEqual(m.slot, a.slot);
+        try std.testing.expectEqual(m.cache, a.cache);
+        try std.testing.expectEqual(sc.stage, a.stage);
+        try std.testing.expectEqual(keys, a.keys);
+        try std.testing.expectEqual(sc.send, a.send);
+        try std.testing.expectEqual(@as(i32, 3), a.n_rows);
+        try std.testing.expectEqual(@as(i32, @intCast(nc)), a.n_cols);
+        try std.testing.expectEqual(@as(i32, @intCast(nc)), a.id0);
+        try std.testing.expectEqual(@as(i32, @intCast(i)), a.step);
+    }
+    // a single rank (no gather to hand the bests to) keeps the Triton steps
+    const one = try Markov.init(cfg, .{ .rank = 0, .world = 1 }, elsewhere, elsewhere, elsewhere);
+    try std.testing.expect(!one.races());
+}
+
+test "raceGumbel is the sampler's draw of the same key bits" {
+    // the sampler's -log(-log(uniform)) in float64, over the uniform's whole range and the key's ordinary bits
+    const edge = [_]u64{ 0, 1 << 11, (1 << 62) - 1, 1 << 62, (1 << 63) - (1 << 11), 1 << 63, (1 << 63) + (1 << 11), std.math.maxInt(u64) - (1 << 11), std.math.maxInt(u64) };
+    for (edge) |bits| {
+        const want = -@log(-@log(@as(f64, @floatFromInt(bits >> 11)) * 0x1p-53 + 0x1p-54));
+        // (the last value's uniform rounds to 1: +inf, there and here)
+        if (std.math.isInf(want)) try std.testing.expect(std.math.isPositiveInf(raceGumbel(bits))) else try std.testing.expectApproxEqAbs(want, @as(f64, raceGumbel(bits)), 1e-5 * @max(1.0, @abs(want)));
+    }
+    try std.testing.expect(std.math.isPositiveInf(raceGumbel(std.math.maxInt(u64))));
+    for (0..20000) |i| {
+        const bits = sampling.keyBits(0x1234_5678_9abc, 100000 + i / 100, i);
+        const want = -@log(-@log(sampling.uniform(0x1234_5678_9abc, 100000 + i / 100, i)));
+        try std.testing.expectApproxEqAbs(want, @as(f64, raceGumbel(bits)), 1e-5 * @max(1.0, @abs(want)));
+    }
+}
+
+test "raceRow: the served sampler's token on the same scores, the greedy token without a key" {
+    const n = 48; // a row the sampler takes whole (top_k 48: every token a candidate)
+    var lg: [n]f32 = undefined;
+    var bias: [n]f16 = undefined;
+    var sum: [n]f32 = undefined;
+    var x: u64 = 0x9E3779B97F4A7C15;
+    var compared: usize = 0;
+    for (0..500) |r| {
+        for (&lg, &bias, &sum) |*l, *b, *s| {
+            x = x *% 6364136223846793005 +% 1442695040888963407;
+            l.* = @as(f32, @floatFromInt(@as(i32, @intCast(x >> 44)) - (1 << 19))) / 131072.0; // -4 .. 4
+            x = x *% 6364136223846793005 +% 1442695040888963407;
+            b.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast(x >> 52)) - 2048)) / 2048.0); // -1 .. 1
+            s.* = l.* + @as(f32, b.*);
+        }
+        const position: u64 = 5000 + r;
+        const seed: u64 = 77 + r;
+        // a greedy row: sampling.argmax of the scores
+        const g = raceRow(&lg, &bias, .{}, position, 0);
+        try std.testing.expectEqual(@as(u32, @intCast(sampling.argmax(&sum))), g[1]);
+        try std.testing.expectEqual(sum[g[1]], g[0]);
+        for ([_]f64{ 1.0, 0.7, 0.25 }) |temp| {
+            for ([_]u32{ 0, 64640 }) |id0| {
+                // the sampler's float64 scores of tokens id0 + c; a row whose two best are nearer than the fp32
+                // draw's error may go either way
+                var best = -std.math.inf(f64);
+                var second = best;
+                var at: u32 = 0;
+                for (sum, 0..) |v, c| {
+                    const sc = @as(f64, v) / temp - @log(-@log(sampling.uniform(seed, position, @as(u64, id0) + c)));
+                    if (sc > best) {
+                        second = best;
+                        best = sc;
+                        at = id0 + @as(u32, @intCast(c));
+                    } else if (sc > second) second = sc;
+                }
+                if (best - second < 1e-3) continue;
+                const got = raceRow(&lg, &bias, .{ .seed = seed, .position = position, .inv_t = @floatCast(1.0 / temp) }, position, id0);
+                try std.testing.expectEqual(at, got[1]);
+                try std.testing.expectApproxEqAbs(best, @as(f64, got[0]), 1e-3);
+                compared += 1;
+                // on token ids from 0 that is the served sampler's draw
+                if (id0 == 0) try std.testing.expectEqual(@as(i64, at), try sampling.sampleRow(&sum, position, .{ .seed = seed, .temperature = temp, .top_k = n, .top_p = 1.0 }));
+            }
+        }
+    }
+    try std.testing.expect(compared > 2800);
+    // _score's order (torch.argmax's), which a greedy row in a pass with sampled ones must keep: a NaN above every
+    // value, the first of two; then the larger value, the first of equals
+    const nan = std.math.nan(f32);
+    @memset(&bias, 0);
+    for (&lg, 0..) |*l, c| l.* = @floatFromInt(c % 7);
+    lg[20] = 100;
+    try std.testing.expectEqual(@as(u32, 20), raceRow(&lg, &bias, .{}, 9, 0)[1]);
+    lg[17] = nan;
+    lg[31] = nan;
+    const g = raceRow(&lg, &bias, .{}, 9, 1000);
+    try std.testing.expectEqual(@as(u32, 1017), g[1]);
+    try std.testing.expect(std.math.isNan(g[0]));
+    try std.testing.expectEqual(@as(u32, 1017), raceRow(&lg, &bias, .{ .seed = 1, .position = 9, .inv_t = 1 }, 9, 1000)[1]);
+    lg[17] = 6;
+    lg[31] = 6;
+    lg[20] = 6;
+    try std.testing.expectEqual(@as(u32, 6), raceRow(&lg, &bias, .{}, 9, 0)[1]); // 6, 13, 17, 20, ... tie at 6
 }

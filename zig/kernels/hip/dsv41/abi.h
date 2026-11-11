@@ -408,4 +408,45 @@ TF_DS_ASSERT(offsetof(tf_ds_prefetch, bytes) == 128, "bytes");
 TF_DS_ASSERT(offsetof(tf_ds_prefetch, n) == 256, "n");
 TF_DS_ASSERT(offsetof(tf_ds_prefetch, pad0) == 260, "pad0");
 
+/* The drafter's sampled Markov step (aux_markov.hip, tf_ds_aux_markov_race). A row's key: its stream's sampling seed,
+ * the absolute position its first draft is drawn at (the kernel adds its step) and 1 / the draft temperature (0: a
+ * greedy row, no draw). */
+typedef struct {
+    uint64_t seed, position;
+    float inv_t;
+    uint32_t pad0;
+} tf_ds_markov_key;
+TF_DS_ASSERT(sizeof(tf_ds_markov_key) == 24, "tf_ds_markov_key size");
+TF_DS_ASSERT(offsetof(tf_ds_markov_key, seed) == 0, "seed");
+TF_DS_ASSERT(offsetof(tf_ds_markov_key, position) == 8, "position");
+TF_DS_ASSERT(offsetof(tf_ds_markov_key, inv_t) == 16, "inv_t");
+TF_DS_ASSERT(offsetof(tf_ds_markov_key, pad0) == 20, "pad0");
+
+/* Device addresses: lg fp32 (row r's n_cols logits at lg + 4 r l_row: this rank's columns of the step's block row);
+ * tok int64 (row r's previous token at tok[r t_stride]); slot int32 [vocabulary] (a token's cached bias row, -1
+ * none); cache fp16 [cached rows, c_row]; stage fp16 [rows, s_row] (the bias rows of tokens without a slot); keys
+ * tf_ds_markov_key [rows]; send fp32 [rows, 4] (value, token id, 0, 0). id0: the token id of column 0. Grid
+ * (n_rows, 1, 1), block 1024. */
+typedef struct {
+    uint64_t lg, tok, slot, cache, stage, keys, send;
+    int64_t l_row, t_stride, c_row, s_row;
+    int32_t n_rows, n_cols, id0, step;
+} tf_ds_aux_markov_race_args;
+TF_DS_ASSERT(sizeof(tf_ds_aux_markov_race_args) == 104, "tf_ds_aux_markov_race_args size");
+TF_DS_ASSERT(offsetof(tf_ds_aux_markov_race_args, lg) == 0, "lg");
+TF_DS_ASSERT(offsetof(tf_ds_aux_markov_race_args, tok) == 8, "tok");
+TF_DS_ASSERT(offsetof(tf_ds_aux_markov_race_args, slot) == 16, "slot");
+TF_DS_ASSERT(offsetof(tf_ds_aux_markov_race_args, cache) == 24, "cache");
+TF_DS_ASSERT(offsetof(tf_ds_aux_markov_race_args, stage) == 32, "stage");
+TF_DS_ASSERT(offsetof(tf_ds_aux_markov_race_args, keys) == 40, "keys");
+TF_DS_ASSERT(offsetof(tf_ds_aux_markov_race_args, send) == 48, "send");
+TF_DS_ASSERT(offsetof(tf_ds_aux_markov_race_args, l_row) == 56, "l_row");
+TF_DS_ASSERT(offsetof(tf_ds_aux_markov_race_args, t_stride) == 64, "t_stride");
+TF_DS_ASSERT(offsetof(tf_ds_aux_markov_race_args, c_row) == 72, "c_row");
+TF_DS_ASSERT(offsetof(tf_ds_aux_markov_race_args, s_row) == 80, "s_row");
+TF_DS_ASSERT(offsetof(tf_ds_aux_markov_race_args, n_rows) == 88, "n_rows");
+TF_DS_ASSERT(offsetof(tf_ds_aux_markov_race_args, n_cols) == 92, "n_cols");
+TF_DS_ASSERT(offsetof(tf_ds_aux_markov_race_args, id0) == 96, "id0");
+TF_DS_ASSERT(offsetof(tf_ds_aux_markov_race_args, step) == 100, "step");
+
 #endif

@@ -6,6 +6,9 @@
 //!   a NaN must stay a NaN (its payload rule is reported, ADAPTER.md 14);
 //! - the row movers byte for byte, including every byte they must leave alone and the gather's invalid flag;
 //! - argmax_rows against sampling.argmax, the host rule it implements (ties, NaN, ±inf, ±0, row lengths);
+//! - aux.markov_race (the drafter's Markov step of a sampled pass) against tri_markov.raceRow, the host statement of
+//!   its rule: greedy rows exactly, sampled rows' tokens wherever the two best scores are not within the fp32 draw's
+//!   error, cached and staged bias rows, both vocabulary halves; and its time a launch;
 //! - the profile clock: count, cap, reset, order, and its nanoseconds bracketed by the host's clock;
 //! - hipBLAS's fp32 GEMMs in the family's four call shapes against an FP64 reference: every element within
 //!   γ_k·Σ|x·w| (u = 2^-24), and a second run bit-identical.
@@ -504,6 +507,137 @@ fn argmaxRows(r: *Receipt, e: *const Env) !void {
     r.note("{d} rows (n {any}, row stride n + 37; ties, NaN first/inside/everywhere, all -inf, +inf twice, +0 before -0, ends): each equals sampling.argmax", .{ cases, lens });
 }
 
+// ---- the drafter's sampled Markov step
+
+fn markovRace(r: *Receipt, e: *const Env) !void {
+    const tri_markov = dsv41.tri_markov;
+    const tri_aux = dsv41.tri_aux;
+    const ax = try hip_load.aux(e.kit, tri_aux.Which.triton);
+    const f = ax.markov_race orelse return r.expect(false, "the kit has no aux.markov_race", .{});
+    const t: dsv41.tri.Tri = .{ .stream = e.s };
+    const nc = 64640; // a TP2 rank's vocabulary columns
+    const rows = 6;
+    const block = 5;
+    const ts = block + 1;
+    const cached = 4;
+    const lg = try e.gpa.alloc(f32, rows * block * nc);
+    defer e.gpa.free(lg);
+    const cache = try e.gpa.alloc(f16, cached * nc);
+    defer e.gpa.free(cache);
+    const stage = try e.gpa.alloc(f16, rows * nc);
+    defer e.gpa.free(stage);
+    const slot = try e.gpa.alloc(i32, 2 * nc);
+    defer e.gpa.free(slot);
+    // logits spread over 24 with a few near the top (a sampled row's draw is among them), bias rows within 2
+    for (lg, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i64, @intCast(mix(i) % 3_000_001)) - 1_500_000)) / 125_000.0;
+    for (0..rows * block) |q| for (0..12) |j| {
+        lg[q * nc + mix(q * 131 + j) % nc] = 13.0 + @as(f32, @floatFromInt(mix(q * 977 + j) % 2001)) / 1000.0;
+    };
+    // _score's order for a NaN (above everything, the first of two): a greedy row's and a sampled row's, at steps 1
+    // and 3 (rows 2 and 3 of the six; row r's step i is logits row r * block + i)
+    for ([_]usize{ 2 * block + 1, 3 * block + 3 }) |q| for ([_]usize{ 40_000, 123, 64_000 }) |c| {
+        lg[q * nc + c] = std.math.nan(f32);
+    };
+    for (cache, 0..) |*v, i| v.* = @floatCast(@as(f32, @floatFromInt(@as(i64, @intCast(mix(i + 7) % 4001)) - 2000)) / 1000.0);
+    for (stage, 0..) |*v, i| v.* = @floatCast(@as(f32, @floatFromInt(@as(i64, @intCast(mix(i + 11) % 4001)) - 2000)) / 1000.0);
+    @memset(slot, -1);
+    // each row's previous token at every step: rows 1 and 4 read cached bias rows, the others their staging rows
+    var tok: [rows * ts]i64 = undefined;
+    for (&tok, 0..) |*v, i| v.* = @intCast(mix(i + 3) % (2 * nc));
+    for ([_]usize{ 1, 4 }, 0..) |row, j| for (0..ts) |i| {
+        slot[@intCast(tok[row * ts + i])] = @intCast((j + i) % cached);
+    };
+    for ([_]usize{ 0, 2, 3, 5 }) |row| for (0..ts) |i| {
+        if (slot[@intCast(tok[row * ts + i])] >= 0) tok[row * ts + i] = @intCast((@as(usize, @intCast(tok[row * ts + i])) + 1) % (2 * nc));
+    };
+    const keys = [rows]tri_aux.MarkovKey{
+        .{ .seed = 0x1122334455667788, .position = 4097, .inv_t = 1.0 },
+        .{ .seed = 7, .position = 1_048_000, .inv_t = 1.0 / 0.7 },
+        .{}, // a greedy stream beside sampled ones
+        .{ .seed = 0x7fff_ffff_ffff_ffff, .position = 0, .inv_t = 4.0 },
+        .{ .seed = 99, .position = 333_333, .inv_t = 0.5 },
+        .{ .seed = 12345, .position = 77, .inv_t = 0 },
+    };
+    var dlg = try upload(e, lg);
+    defer dlg.free();
+    var dcache = try upload(e, cache);
+    defer dcache.free();
+    var dstage = try upload(e, stage);
+    defer dstage.free();
+    var dslot = try upload(e, slot);
+    defer dslot.free();
+    var dtok = try upload(e, tok[0..]);
+    defer dtok.free();
+    var dkeys = try upload(e, keys[0..]);
+    defer dkeys.free();
+    var dsend = try gpu.DeviceBuffer.alloc(e.d, rows * 4 * 4);
+    defer dsend.free();
+    var cases: usize = 0;
+    var near: usize = 0;
+    var nans: usize = 0;
+    for ([_]u32{ 0, nc }) |id0| for (0..block) |i| {
+        const sentinel: [rows * 4]f32 = @splat(-7.5);
+        try dsend.upload(0, std.mem.sliceAsBytes(sentinel[0..]));
+        const a: tri_aux.MarkovRaceArgs = .{
+            .lg = dlg.ptr + 4 * i * nc, .tok = dtok.ptr + 8 * i, .slot = dslot.ptr, .cache = dcache.ptr, .stage = dstage.ptr, .keys = dkeys.ptr, .send = dsend.ptr,
+            .l_row = block * nc, .t_stride = ts, .c_row = nc, .s_row = nc, .n_rows = rows, .n_cols = nc, .id0 = @intCast(id0), .step = @intCast(i),
+        };
+        try tri_markov.race(t, f, a);
+        var got: [rows * 4]f32 = undefined;
+        try download(e, dsend, 0, got[0..]);
+        for (0..rows) |row| {
+            const sl = slot[@intCast(tok[row * ts + i])];
+            const bias = if (sl >= 0) cache[@as(usize, @intCast(sl)) * nc ..][0..nc] else stage[row * nc ..][0..nc];
+            const row_lg = lg[(row * block + i) * nc ..][0..nc];
+            const key = keys[row];
+            const want = tri_markov.raceRow(row_lg, bias, key, key.position + i, id0);
+            // the runner-up on the host: a sampled row whose two best are within the device logs' error may go either way
+            var second = -std.math.inf(f32);
+            for (row_lg, bias, 0..) |l, b, c| {
+                const id = id0 + @as(u32, @intCast(c));
+                if (id == want[1]) continue;
+                const score = l + @as(f32, b);
+                const v = if (key.inv_t > 0) score * key.inv_t + tri_markov.raceGumbel(sampling.keyBits(key.seed, key.position + i, id)) else score;
+                if (v > second) second = v;
+            }
+            cases += 1;
+            const gv = got[row * 4];
+            if (std.math.isNan(want[0])) {
+                // a row with NaNs: the first of them, in either kind of row
+                nans += 1;
+                try r.expect(std.math.isNan(gv) and got[row * 4 + 1] == @as(f32, @floatFromInt(want[1])), "id0 {d} step {d} row {d}: ({d}, {d}), host NaN at {d}", .{ id0, i, row, gv, got[row * 4 + 1], want[1] });
+                continue;
+            }
+            try r.expect(got[row * 4 + 1] >= 0 and got[row * 4 + 1] < 2 * nc, "id0 {d} step {d} row {d}: token {d} is no token", .{ id0, i, row, got[row * 4 + 1] });
+            const gi: u32 = @intFromFloat(got[row * 4 + 1]);
+            try r.expect(got[row * 4 + 2] == 0 and got[row * 4 + 3] == 0, "id0 {d} step {d} row {d}: send[2..] not 0", .{ id0, i, row });
+            if (key.inv_t > 0) {
+                try r.expect(@abs(gv - want[0]) <= 1e-4 * @max(1.0, @abs(want[0])), "id0 {d} step {d} row {d}: value {d}, host {d}", .{ id0, i, row, gv, want[0] });
+                if (want[0] - second < 1e-4) {
+                    near += 1;
+                    continue;
+                }
+                try r.expect(gi == want[1], "id0 {d} step {d} row {d}: token {d}, host {d} (value {d} against {d}, runner-up {d})", .{ id0, i, row, gi, want[1], gv, want[0], second });
+            } else {
+                try r.expect(gi == want[1] and gv == want[0], "id0 {d} step {d} row {d} (greedy): ({d}, {d}), host ({d}, {d})", .{ id0, i, row, gv, gi, want[0], want[1] });
+            }
+        }
+    };
+    // its time a launch: 200 steps of four rows queued, then one wait
+    const a4: tri_aux.MarkovRaceArgs = .{
+        .lg = dlg.ptr, .tok = dtok.ptr, .slot = dslot.ptr, .cache = dcache.ptr, .stage = dstage.ptr, .keys = dkeys.ptr, .send = dsend.ptr,
+        .l_row = block * nc, .t_stride = ts, .c_row = nc, .s_row = nc, .n_rows = 4, .n_cols = nc, .id0 = 0, .step = 0,
+    };
+    for (0..20) |_| try tri_markov.race(t, f, a4);
+    try e.s.synchronize();
+    const t0 = nowNs();
+    for (0..200) |_| try tri_markov.race(t, f, a4);
+    try e.s.synchronize();
+    const us = @as(f64, @floatFromInt(nowNs() - t0)) / 200.0 / 1000.0;
+    r.note("{d} rows of {d} columns (both vocabulary halves, steps 0-{d}, cached and staged bias rows, keys at inv_t 1, 1/0.7, 4, 0.5 and two greedy rows): greedy rows equal the host's (value, token); sampled rows' values within 1e-4 and their tokens the host's ({d} within 1e-4 of the runner-up, not compared); {d} rows with NaNs give the first NaN, _score's order; {d:.1} us a four-row launch", .{ cases, nc, block - 1, near, nans, us });
+    try r.expect(nans == 4, "{d} rows with NaNs, 4 placed", .{nans});
+}
+
 // ---- the profile clock
 
 fn clock(r: *Receipt, e: *const Env) !void {
@@ -956,6 +1090,7 @@ pub fn main(init: std.process.Init) !u8 {
     try r.run("gather_rows", gatherRows, &env);
     try r.run("copy_rows_strided_copy", copyRows, &env);
     try r.run("argmax_rows", argmaxRows, &env);
+    try r.run("markov_race", markovRace, &env);
     try r.run("clock", clock, &env);
     try r.run("hipblas_fp64", hipblas, &env);
     try r.run("exl3_bindings", exl3Bindings, &env);

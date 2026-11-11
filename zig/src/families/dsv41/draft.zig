@@ -20,6 +20,7 @@ const tri_norm = @import("tri_norm.zig");
 const tri = @import("tri.zig");
 const tri_attn = @import("tri_attn.zig");
 const tri_markov = @import("tri_markov.zig");
+const tri_aux = @import("tri_aux.zig");
 const exl3_linear = @import("exl3_linear.zig");
 const exl3_experts = @import("exl3_experts.zig");
 const markov_tokens = @import("markov_tokens.zig");
@@ -122,13 +123,18 @@ const MarkovGather = struct {
     }
 };
 
-/// The drafter pass's CUDA graphs (BatchDraftGraph), one a (streams, steps): every pointer it reads is a fixed
-/// buffer and every per-pass value (ids, positions, slots, the pick lists) is uploaded ahead of the replay.
+/// A drafting stream's sampling key for a pass (tri_aux.MarkovKey): a pass given keys draws its Markov steps with
+/// aux.markov_race (Drafter.pass).
+pub const SampleKey = tri_aux.MarkovKey;
+
+/// The drafter pass's CUDA graphs (BatchDraftGraph), one a (streams, steps) and whether its Markov steps draw with
+/// the streams' keys: every pointer it reads is a fixed buffer and every per-pass value (ids, positions, slots, the
+/// pick lists, the keys) is uploaded ahead of the replay.
 pub const PassGraphs = struct {
     gpa: std.mem.Allocator,
     map: std.AutoHashMapUnmanaged(Key, gpu.graph.Exec) = .empty,
 
-    pub const Key = struct { streams: u32, steps: u32 };
+    pub const Key = struct { streams: u32, steps: u32, race: bool = false };
 
     pub fn init(gpa: std.mem.Allocator) PassGraphs {
         return .{ .gpa = gpa };
@@ -145,11 +151,11 @@ pub const PassGraphs = struct {
         return g.map.count();
     }
 
-    fn run(g: *PassGraphs, dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, N: usize, steps: usize) !void {
-        const key: Key = .{ .streams = @intCast(N), .steps = @intCast(steps) };
+    fn run(g: *PassGraphs, dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, N: usize, steps: usize, race: bool) !void {
+        const key: Key = .{ .streams = @intCast(N), .steps = @intCast(steps), .race = race };
         if (g.map.getPtr(key)) |x| return x.launchOn(e.s);
         try gpu.graph.beginCapture(e.s, .thread_local);
-        dr.body(e, ch, pool, N, steps, null) catch |err| {
+        dr.body(e, ch, pool, N, steps, race, null) catch |err| {
             if (gpu.graph.endCapture(e.s)) |got| {
                 var x = got;
                 x.deinit();
@@ -221,6 +227,7 @@ pub const Drafter = struct {
     mk: tri_markov.Markov,
     msc: tri_markov.Scratch,
     mg: u64, // fp32 [world, max_streams, 4]: a step's gathered bests
+    keys: u64, // tri_aux.MarkovKey [max_streams]: a sampled pass's keys (aux.markov_race reads them)
     out: u64, // int64 [max_streams, n + 1]: each stream's last token, then its drafts
     // the confidence head
     embs: u64, // bf16 [max_rows, rank]: the Markov embedding rows of the tokens each step read
@@ -347,6 +354,7 @@ pub const Drafter = struct {
         };
         try prompt.fill(e, dr.msc.send, 0, max_streams * 4 * 4);
         dr.mg = try a.take(dr.mk.world * max_streams * 4 * 4);
+        dr.keys = try a.take(max_streams * @sizeOf(SampleKey));
         dr.out = try a.take(max_streams * (max_block + 1) * 8);
         // the confidence head
         const rank = c.markov_rank;
@@ -445,14 +453,28 @@ pub const Drafter = struct {
         try prompt.grouped(e, ch, n, ls[0..S], xs[0..S], ldxs[0..S], dr.ak[0..S], ldos[0..S], types[0..S]);
     }
 
+    /// Whether a pass can draw its drafts with the streams' sampling keys: the kit's aux.markov_race over a Markov
+    /// loop whose bests go through the ranks' gather (tri_markov.Markov.races).
+    pub fn races(dr: *const Drafter, e: *const Engine) bool {
+        const ax = e.t.aux orelse return false;
+        return ax.markov_race != null and dr.mk.races();
+    }
+
     /// BatchDraftGraph.run for N streams (tokens at positions q0 in slots): each stream's `steps` drafts and their
-    /// confidences into drafts / confs. Each slot's rings hold its positions before q0 (absorbed).
-    pub fn pass(dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize, probe: ?Probe) !void {
+    /// confidences into drafts / confs. Each slot's rings hold its positions before q0 (absorbed). `keys` (one a
+    /// stream; races()): the Markov steps draw each stream's drafts with its key (a key of inv_t 0: its best token,
+    /// as without keys); without them, or where races() is false, every draft is the drafter's best token.
+    pub fn pass(dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize, keys: ?[]const SampleKey, probe: ?Probe) !void {
         const N = tokens.len;
         const n = dr.n;
         const R = N * n;
         if (N == 0 or N > max_streams or R > max_rows or q0.len != N or slots.len != N) return notPorted(@src());
         if (steps == 0 or steps > n) return error.BadDraftPass;
+        const race = if (keys) |k| blk: {
+            if (k.len != N) return error.BadDraftPass;
+            break :blk dr.races(e);
+        } else false;
+        if (race) try prompt.upload(e, dr.keys, keys.?.ptr, N * @sizeOf(SampleKey));
         // _body's index rows: ids [token, noise ...], positions q0 + j, window positions q0 - 1, ring bases
         var hv: [6 * max_rows]i64 = @splat(0);
         var hb: [max_rows * pick_pad]i64 = @splat(-1);
@@ -477,7 +499,7 @@ pub const Drafter = struct {
         var ho: [max_streams * (max_block + 1)]i64 = @splat(0);
         for (0..N) |i| ho[i * ts] = tokens[i];
         try prompt.upload(e, dr.out, &ho, N * ts * 8);
-        if (dr.graphs != null and probe == null) try dr.graphs.?.run(dr, e, ch, pool, N, steps) else try dr.body(e, ch, pool, N, steps, probe);
+        if (dr.graphs != null and probe == null) try dr.graphs.?.run(dr, e, ch, pool, N, steps, race) else try dr.body(e, ch, pool, N, steps, race, probe);
         // one host read: the drafts and the confidences
         try e.s.synchronize();
         var hc: [max_streams * max_block]f32 = undefined;
@@ -492,8 +514,9 @@ pub const Drafter = struct {
     }
 
     /// The pass's device work for N streams of `steps` drafts, from the rows' embeddings to the confidence head (its
-    /// inputs uploaded: the index rows, the pick lists, the Markov loop's first column): what a pass graph captures.
-    fn body(dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, N: usize, steps: usize, probe: ?Probe) !void {
+    /// inputs uploaded: the index rows, the pick lists, the Markov loop's first column, a sampled pass's keys): what a
+    /// pass graph captures. `race`: the Markov steps draw with the keys (races()).
+    fn body(dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, N: usize, steps: usize, race: bool, probe: ?Probe) !void {
         const c = e.c;
         const t = e.t;
         const n = dr.n;
@@ -538,7 +561,8 @@ pub const Drafter = struct {
         // the Markov loop: out [N, steps + 1], each stream's last token first
         const ts = steps + 1;
         var g: MarkovGather = .{ .e = e, .dst = dr.mg };
-        try dr.mk.steps(t, dr.local, dr.out, ts, N, n, steps, dr.msc, .{ .ctx = &g, .run = MarkovGather.run });
+        const rc: ?tri_markov.Race = if (race) .{ .f = t.aux.?.markov_race.?, .keys = dr.keys } else null;
+        try dr.mk.steps(t, dr.local, dr.out, ts, N, n, steps, dr.msc, .{ .ctx = &g, .run = MarkovGather.run }, rc);
         try Probe.check(probe, .markov, S, dr.out);
         // the confidence head: [xc (fp32), the embedding rows the steps read (fp32)] @ conf^T, a stream's first steps rows
         const rank = c.markov_rank;

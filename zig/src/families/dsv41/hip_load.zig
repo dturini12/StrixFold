@@ -51,6 +51,7 @@ pub const params = struct {
     pub const AuxHcMix = extern struct { a: tri_aux.HcMixArgs };
     pub const AuxGate = extern struct { a: tri_aux.GateArgs };
     pub const AuxRopeHeads = extern struct { a: tri_aux.RopeHeadsArgs };
+    pub const AuxMarkovRace = extern struct { a: tri_aux.MarkovRaceArgs };
 
     // EXL3: exl3_prefill.zig
     pub const Exl3RotIn = extern struct { x: u64, x_dtype: i32, ldx: i64, suh: u64, xh: u64, k: i32 };
@@ -197,6 +198,8 @@ pub fn aux(kit: *const gpu.Kit, which: tri_aux.Which) !tri_aux.Aux {
         .gate = if (which.gate) (try gpu.Kernel("aux.gate_logits", p.AuxGate).bind(kit, &aux_specs.gate)).f else null,
         .gate32 = if (which.idxw) (try gpu.Kernel("aux.gate_logits", p.AuxGate).bind(kit, &aux_specs.gate32)).f else null,
         .rope = if (which.rope) (try gpu.Kernel("aux.rope_heads", p.AuxRopeHeads).bind(kit, &aux_specs.rope)).f else null,
+        // a kit without it (an older one) drafts every stream greedily
+        .markov_race = try optional(kit, "aux.markov_race", p.AuxMarkovRace),
     };
 }
 
@@ -218,6 +221,7 @@ test "the aux kernels' specs are registry.json's" {
     const want = [_]struct { []const u8, []const gpu.kit.SpecItem, i64 }{
         .{ "aux.sparse_attn", &aux_specs.attn, 256 },  .{ "aux.index_rows", &aux_specs.index, 256 },    .{ "aux.hc_mix_pf", &aux_specs.hc, 256 },
         .{ "aux.gate_logits", &aux_specs.gate, 256 }, .{ "aux.gate_logits", &aux_specs.gate32, tri_aux.gate32_block }, .{ "aux.rope_heads", &aux_specs.rope, 256 },
+        .{ "aux.markov_race", &aux_specs.rope, tri_aux.markov_race_block },
     };
     for (want) |w| {
         // exactly one entry of the id has this spec (aux.gate_logits has two builds), with the block the launch uses
@@ -516,7 +520,7 @@ test "every launcher packs exactly the parameter list its kernel is bound with" 
     try expectPacked(x.hcMean4(s, 16, 32, 5120, 4, 5120), .{.{ x.k_hc_mean4, p.HcMean4 }});
 
     // w-tri's kernels for Triton launches, through the Triton wrappers that hand them over (prompt-chunk shapes)
-    const ax: tri_aux.Aux = .{ .attn = fake(&n), .index = fake(&n), .hc_mix = fake(&n), .gate = fake(&n), .gate32 = fake(&n), .rope = fake(&n) };
+    const ax: tri_aux.Aux = .{ .attn = fake(&n), .index = fake(&n), .hc_mix = fake(&n), .gate = fake(&n), .gate32 = fake(&n), .rope = fake(&n), .markov_race = fake(&n) };
     const t: @import("tri.zig").Tri = .{ .stream = s, .aux = &ax };
     const attn = @import("tri_attn.zig");
     try expectPacked(attn.sparseAttn(t, .{ .q = 16, .out = 32, .rows = 2048, .h = 32, .hd = 512, .sink = 48, .wsrc = 64, .wsrc_rows = 2048, .wlo = 80, .ring = false, .comp = .{ .fp4 = .{ .codes = 96, .scales = 112 } }, .idx = 128, .n_idx = 512, .pos = 144, .scale = 0.044194173, .window = 128 }), .{.{ ax.attn.?, p.AuxAttn }});
@@ -526,6 +530,8 @@ test "every launcher packs exactly the parameter list its kernel is bound with" 
     try expectPacked(dropValue(norm.gateLogits(t, 16, 32, 48, 2048, 5120, 384)), .{.{ ax.gate.?, p.AuxGate }});
     try expectPacked(dropValue(norm.gateLogits(t, 16, 32, 48, 2048, 5120, 32)), .{.{ ax.gate32.?, p.AuxGate }});
     try expectPacked(norm.ropeHeads(t, 16, 32, 48, 64, 64, false, 2048, 32, 512), .{.{ ax.rope.?, p.AuxRopeHeads }});
+    const mk = @import("tri_markov.zig");
+    try expectPacked(mk.race(t, ax.markov_race.?, .{ .lg = 16, .tok = 32, .slot = 48, .cache = 64, .stage = 80, .keys = 96, .send = 112, .l_row = 5 * 64640, .t_stride = 6, .c_row = 64640, .s_row = 64640, .n_rows = 4, .n_cols = 64640, .id0 = 64640, .step = 2 }), .{.{ ax.markov_race.?, p.AuxMarkovRace }});
 
     // dense.hip, on a dense pack's shapes (wo_b's rank slice [5120, 4096]; the shared expert's 1152)
     const dk: dense_mod.Kernels = .{ .gemv = fake(&n), .swiglu = fake(&n) };

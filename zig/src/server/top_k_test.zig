@@ -125,17 +125,23 @@ const Seen = struct {
 };
 
 fn send(e: *Engine, body: []const u8) !Seen {
+    return sendWith(e, body, null);
+}
+
+/// `send` on a server whose sampling defaults are `defaults` (the serve flags', a JSON object).
+fn sendWith(e: *Engine, body: []const u8, defaults: ?[]const u8) !Seen {
     var text: TestText = .{};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
     var srv = try server.Server.init(std.testing.allocator, std.testing.io, e.engine(), text.text(), .{
         .served_name = "test-model",
         .model_ids = &.{"test-model"},
         .enable_thinking = false,
         .use_drafts = false,
+        .default_sampling = if (defaults) |d| (try json.parse(a, d)).ok else null,
     }, null);
     defer srv.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
     var seen: Seen = .{};
     openai.run(srv, a, seen.out(), .{ .conn = &conn }, true, (try json.parse(a, body)).ok);
@@ -181,4 +187,33 @@ test "an engine that samples with top_k off serves a request without one" {
     const seen = try send(&e, user ++ ",\"temperature\":0.7,\"top_p\":0.9}");
     try std.testing.expectEqual(@as(?u16, 200), seen.status);
     try std.testing.expectEqual(@as(u32, 0), e.sampling.?.top_k);
+}
+
+test "draft_temperature: the request's own, else the server's; never for a greedy request; refused outside 0 to 100" {
+    var e: Engine = .{};
+    const sampled = ",\"temperature\":0.7,\"top_k\":20,\"seed\":3";
+    // without it anywhere: 0 (the drafts are the drafter's best tokens)
+    try std.testing.expectEqual(@as(?u16, 200), (try send(&e, user ++ sampled ++ "}")).status);
+    try std.testing.expectEqual(@as(f64, 0), e.sampling.?.draft_temperature);
+    try std.testing.expectEqual(@as(?u16, 200), (try send(&e, user ++ sampled ++ ",\"draft_temperature\":0.75}")).status);
+    try std.testing.expectEqual(@as(f64, 0.75), e.sampling.?.draft_temperature);
+    // the server's default (--draft-temperature) for a request without one, beside its default temperature
+    const defaults = "{\"temperature\":1.0,\"top_k\":20,\"draft_temperature\":0.5}";
+    try std.testing.expectEqual(@as(?u16, 200), (try sendWith(&e, user ++ "}", defaults)).status);
+    try std.testing.expectEqual(@as(f64, 0.5), e.sampling.?.draft_temperature);
+    try std.testing.expectEqual(@as(f64, 1.0), e.sampling.?.temperature);
+    try std.testing.expectEqual(@as(?u16, 200), (try sendWith(&e, user ++ ",\"draft_temperature\":1}", defaults)).status);
+    try std.testing.expectEqual(@as(f64, 1.0), e.sampling.?.draft_temperature);
+    try std.testing.expectEqual(@as(?u16, 200), (try sendWith(&e, user ++ ",\"draft_temperature\":0}", defaults)).status);
+    try std.testing.expectEqual(@as(f64, 0), e.sampling.?.draft_temperature);
+    // a greedy request stays greedy: no sampling, so nothing to draw drafts with
+    try std.testing.expectEqual(@as(?u16, 200), (try sendWith(&e, user ++ ",\"temperature\":0}", defaults)).status);
+    try std.testing.expectEqual(@as(?api.Sampling, null), e.sampling);
+    const before = e.submitted;
+    inline for ([_][]const u8{ ",\"draft_temperature\":-0.5}", ",\"draft_temperature\":101}", ",\"draft_temperature\":\"warm\"}" }) |tail| {
+        const seen = try send(&e, user ++ sampled ++ tail);
+        try std.testing.expectEqual(@as(?u16, 400), seen.status);
+        try std.testing.expect(seen.says("draft_temperature"));
+    }
+    try std.testing.expectEqual(before, e.submitted);
 }
