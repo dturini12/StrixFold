@@ -63,6 +63,25 @@ pub const params = struct {
     pub const Collect = extern struct { s: u64, rx: u64, peer: u64, bytes: u64, slot_bytes: u64, nslot: u32, deadline: u64 };
 };
 
+/// A proxy thread with no work spins for `idle_spin_ns`, then sleeps `idle_sleep_ns` per check, and past
+/// `idle_deep_ns` sleeps `idle_deep_sleep_ns`: long enough for its core to reach its deepest idle state between checks.
+pub const idle_spin_ns: u64 = 20 * std.time.ns_per_ms;
+pub const idle_sleep_ns: u64 = 50 * std.time.ns_per_us;
+pub const idle_deep_ns: u64 = std.time.ns_per_s;
+pub const idle_deep_sleep_ns: u64 = 2 * std.time.ns_per_ms;
+
+/// One check's wait of a proxy thread that found no work; `idle_since` is 0 until the first idle check.
+fn idleWait(idle_since: *u64) void {
+    const now = wire.monotonicNs();
+    if (idle_since.* == 0) idle_since.* = now;
+    const idle = now - idle_since.*;
+    if (idle <= idle_spin_ns) return std.atomic.spinLoopHint();
+    // a real sleep: sched_yield keeps the thread runnable and burns a core while idle
+    const ns = if (idle > idle_deep_ns) idle_deep_sleep_ns else idle_sleep_ns;
+    var ts: std.c.timespec = .{ .sec = 0, .nsec = @intCast(ns) };
+    _ = std.c.nanosleep(&ts, null);
+}
+
 const StageK = gpu.Kernel("coll.stage", params.Stage);
 const CollectK = gpu.Kernel("coll.collect", params.Collect);
 
@@ -102,12 +121,7 @@ pub const Core = struct {
                     deviceGaveUp(k.shared, k.rank, q, k.nslot, "waiting for its GPU to stage gather");
                     return k.fail(2);
                 }
-                if (idle_since == 0) idle_since = wire.monotonicNs();
-                if (wire.monotonicNs() - idle_since > 20 * std.time.ns_per_ms) {
-                    // a real sleep: sched_yield keeps the thread runnable and burns a core while idle
-                    var ts: std.c.timespec = .{ .sec = 0, .nsec = 50 * std.time.ns_per_us };
-                    _ = std.c.nanosleep(&ts, null);
-                } else std.atomic.spinLoopHint();
+                idleWait(&idle_since);
                 continue;
             }
             idle_since = 0;
@@ -238,12 +252,7 @@ pub const Second = struct {
                     deviceGaveUp(s.shared, s.rank, last + 1, s.nslot, "(second cable) idle before gather");
                     return s.fail(2);
                 }
-                if (idle_since == 0) idle_since = wire.monotonicNs();
-                if (wire.monotonicNs() - idle_since > 20 * std.time.ns_per_ms) {
-                    // a real sleep: sched_yield keeps the thread runnable and burns a core while idle
-                    var ts: std.c.timespec = .{ .sec = 0, .nsec = 50 * std.time.ns_per_us };
-                    _ = std.c.nanosleep(&ts, null);
-                } else std.atomic.spinLoopHint();
+                idleWait(&idle_since);
                 continue;
             }
             idle_since = 0;
@@ -767,6 +776,12 @@ test "a device wait that gave up (abort word 2) fails the proxy with code 2, mar
     try testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &rk[1].shared.abort, .acquire));
 }
 
+/// Sleeps the calling thread for `ns` nanoseconds.
+fn sleepNs(ns: u64) void {
+    var ts: std.c.timespec = .{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
+    _ = std.c.nanosleep(&ts, null);
+}
+
 /// Process CPU time (utime + stime) between two rusage snapshots, in nanoseconds.
 fn cpuNs(a: std.posix.rusage, b: std.posix.rusage) u64 {
     const of = struct {
@@ -803,6 +818,36 @@ test "an idle proxy sleeps instead of spinning: its CPU time stays far under the
 
     // two spinning threads burn twice the wall clock, sleeping ones far less
     try testing.expect(cpu < 150 * std.time.ns_per_ms);
+}
+
+test "a proxy idle past idle_deep_ns wakes rarely: both threads of both ranks sleep idle_deep_sleep_ns per check" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const rk = try rankPair(gpa, 8192); // a second cable: each rank has a core and a second thread
+    defer for (rk) |r| {
+        r.close();
+        gpa.destroy(r);
+    };
+    var th: [4]std.Thread = undefined;
+    for (rk, 0..) |r, i| {
+        th[2 * i] = try std.Thread.spawn(.{}, Rank.runCore, .{r});
+        th[2 * i + 1] = try std.Thread.spawn(.{}, Rank.runSecond, .{r});
+    }
+    defer {
+        for (rk) |r| r.stop.store(1, .release);
+        for (th) |t| t.join();
+    }
+
+    sleepNs(idle_deep_ns + 200 * std.time.ns_per_ms);
+    const before = std.posix.getrusage(0); // RUSAGE_SELF
+    sleepNs(500 * std.time.ns_per_ms);
+    const after = std.posix.getrusage(0);
+
+    // four threads at one wake per idle_deep_sleep_ns make ~1,000 voluntary switches in 500 ms; at 50 us, ~40,000
+    const wakes: u64 = @intCast(after.nvcsw - before.nvcsw);
+    const bound = 2 * 4 * (500 * std.time.ns_per_ms / idle_deep_sleep_ns);
+    if (wakes >= bound) std.debug.print("idle proxy threads woke {d} times in 500 ms (bound {d})\n", .{ wakes, bound });
+    try testing.expect(wakes < bound);
 }
 
 test "a peer that stops staging fails the proxy's exchange at the progress deadline (Timeout), not at a GPU wait's" {
