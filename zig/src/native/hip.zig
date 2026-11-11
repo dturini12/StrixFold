@@ -154,6 +154,7 @@ const Host = struct {
     startup: []u8 = &.{},
     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
     cache: ?api.prompt_cache.Store = null, // kept prompt states, when the family keeps them
+    cache_images: bool = false, // the family resumes and keeps prompts with images (its pass keys them by picture)
     snap_vt: api.prompt_cache.Snapshots.VTable = undefined,
 
     fn close(p: *anyopaque) void {
@@ -196,6 +197,7 @@ const Host = struct {
         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
         h.host.explain = explain;
         if (h.cache) |*store| h.host.cache = store;
+        h.host.cache_images = h.cache != null and h.cache_images;
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
         try h.host.start();
     }
@@ -377,6 +379,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         if (want > 0) {
             h.snap_vt = .{ .bytes = sn.bytes, .save = sn.save, .restore = sn.restore, .drop = sn.drop };
             h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{}, want);
+            h.cache_images = @hasField(@TypeOf(loaded), "cache_images") and loaded.cache_images;
         }
     };
     // text only on HIP (D13): the family hands no vision hook, so the server refuses image parts

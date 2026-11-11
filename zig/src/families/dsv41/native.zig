@@ -90,6 +90,8 @@ pub const Loaded = struct {
     lone: ?LoneRun = null,
     /// Kept prompt states for the host's prompt cache (core/prompt_cache Snapshots: `ptr` and its functions).
     snaps: ?Snaps = null,
+    /// The prompt pass resumes and keeps prompts with images (lanes.zig keys their states by each picture's digest).
+    cache_images: bool = false,
     /// Images in requests (the server renders their placeholders; the tower runs on this rank).
     vision: ?lanes.stream.Vision = null,
     /// Structured output and required calls (the tokenizer's vocabulary read at open).
@@ -237,7 +239,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []
     // the pool is the model's (preallocated): a stream takes no device memory of its own
     const L = lanes_mod.Lanes;
     const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn };
-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (gpu.features.vision) (if (st.vision) |v| v.hook() else null) else null, .structures = st.vocab != null, .context_window = lanes_mod.usableContext(st.m.context_cap, st.m.eng.round_rows) };
+    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .cache_images = true, .vision = if (gpu.features.vision) (if (st.vision) |v| v.hook() else null) else null, .structures = st.vocab != null, .context_window = lanes_mod.usableContext(st.m.context_cap, st.m.eng.round_rows) };
 }
 
 fn deinitFn(ptr: *anyopaque) void {

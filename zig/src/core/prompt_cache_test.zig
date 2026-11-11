@@ -475,3 +475,37 @@ test "past the learned-state cap the least recently used state is forgotten, and
     try std.testing.expectEqual(fresh(&p3), g.pass(&t, &p3, plan));
     try std.testing.expect(im.has(imprint.Imprint.keyOf(&two))); // learned again by that pass
 }
+
+test "image key ids: a picture's span keys by its digest, so another picture of the same size does not resume past it" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const img: u32 = 99; // the image token: every position of a span holds it
+    const ids = [_]u32{ 1, 2, img, img, img, 3, 4, 5, 9 };
+    const da = pc.imageDigest("picture A");
+    const db = pc.imageDigest("picture B");
+    try std.testing.expect(da != db and da != 0 and db != 0);
+    const ka = try pc.keyIds(a, &ids, &.{.{ .at = 2, .len = 3, .digest = da }});
+    const kb = try pc.keyIds(a, &ids, &.{.{ .at = 2, .len = 3, .digest = db }});
+    try std.testing.expectEqualSlices(u32, ids[0..2], ka[0..2]); // text keeps its ids
+    try std.testing.expectEqualSlices(u32, ids[5..], ka[5..]);
+    for (ka[2..5], kb[2..5], 0..) |x, y, j| {
+        try std.testing.expect(x >= 0x8000_0000 and y >= 0x8000_0000 and x != y);
+        try std.testing.expectEqual(pc.imageKeyId(da, @intCast(j)), x);
+    }
+    try std.testing.expect(ka[2] != ka[3]); // each offset its own id
+    try std.testing.expectError(error.BadImageSpan, pc.keyIds(a, &ids, &.{.{ .at = 7, .len = 3, .digest = da }}));
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.snapshots(), .{ .lookahead = 1, .min_prompt = 0, .min_gap = 1 }, 1 << 20);
+    defer s.deinit();
+    var p = try s.begin(a, ka, 7, &.{}, &.{}, null); // keeps at 7, past the picture
+    try std.testing.expectEqual(fresh(ka), f.pass(&s, ka, p));
+    const next_a = try pc.keyIds(a, &(ids ++ [_]u32{ 6, 6 }), &.{.{ .at = 2, .len = 3, .digest = da }});
+    try std.testing.expectEqual(@as(u32, 7), s.find(next_a, &.{}).?.at); // the same picture: resumes past it
+    const next_b = try pc.keyIds(a, &(ids ++ [_]u32{ 6, 6 }), &.{.{ .at = 2, .len = 3, .digest = db }});
+    try std.testing.expect(s.find(next_b, &.{}) == null); // another picture: nothing past it
+    p = try s.begin(a, next_b, 9, &.{}, &.{}, null);
+    try std.testing.expectEqual(@as(u32, 0), p.from);
+    try std.testing.expectEqual(fresh(next_b), f.pass(&s, next_b, p));
+}

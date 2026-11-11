@@ -57,13 +57,48 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
         } },
         .ids => |ids| return .{ .ids = ids },
     };
-    if (input.images.len > 0) return renderImages(srv, cx, input.messages, input.tools, thinking, effort, true, input.images);
+    if (input.images.len > 0) {
+        // the history found on the rendered ids, each placeholder one id, then moved past the spans before it
+        const raw = try renderNormalizedIds(srv, cx, input.messages, input.tools, thinking, effort, true);
+        const raw_history = try renderNormalizedIds(srv, cx, input.messages, input.tools, thinking, effort, false);
+        var r = try spans(srv, cx, raw, input.images);
+        r.history_len = expandedAt(raw, historyLen(raw, raw_history), srv.info.vision.?.token, r.images);
+        return r;
+    }
     const prompt = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, true);
     const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
-    var history_len: usize = 0;
-    if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) history_len = history.len;
-    if (history_len == 0 and prompt.len > 1 and std.mem.eql(u32, history, prompt)) history_len = prompt.len - 1; // a template with no generation suffix
-    return .{ .ids = prompt, .history_len = history_len };
+    return .{ .ids = prompt, .history_len = historyLen(prompt, history) };
+}
+
+/// The prompt's history length: the generation-free rendering when it is the prompt's prefix (0: none).
+fn historyLen(prompt: []const u32, history: []const u32) usize {
+    if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) return history.len;
+    if (prompt.len > 1 and std.mem.eql(u32, history, prompt)) return prompt.len - 1; // a template with no generation suffix
+    return 0;
+}
+
+/// Position `at` of the rendered ids (each image one placeholder `token`) in the prompt whose spans are `images`.
+fn expandedAt(raw: []const u32, at: usize, token: u32, images: []const api.Image) usize {
+    if (at == 0) return 0;
+    var out = at;
+    var k: usize = 0;
+    for (raw[0..at]) |id| if (id == token) {
+        if (k >= images.len) return 0;
+        out += images[k].tokens - 1;
+        k += 1;
+    };
+    return out;
+}
+
+test "an image prompt's history length moves past the spans before it" {
+    const img = [_]api.Image{ .{ .at = 1, .tokens = 4, .bytes = "" }, .{ .at = 7, .tokens = 3, .bytes = "" } };
+    const raw = [_]u32{ 5, 99, 6, 99, 7, 8 }; // 5 [img0] 6 [img1] 7 | 8 (generation)
+    try std.testing.expectEqual(@as(usize, 5 + 3 + 2), expandedAt(&raw, 5, 99, &img));
+    try std.testing.expectEqual(@as(usize, 1), expandedAt(&raw, 1, 99, &img));
+    try std.testing.expectEqual(@as(usize, 2 + 3), expandedAt(&raw, 2, 99, &img));
+    try std.testing.expectEqual(@as(usize, 0), expandedAt(&raw, 0, 99, &img));
+    try std.testing.expectEqual(@as(usize, 5), historyLen(&raw, raw[0..5]));
+    try std.testing.expectEqual(@as(usize, 0), historyLen(&raw, &.{ 5, 1 }));
 }
 
 /// Render authenticated image messages after normalizeImages has escaped literal placeholders.
@@ -90,7 +125,8 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8) er
             error.OutOfMemory => return error.OutOfMemory,
             error.BadImage => return cx.refuse(problem),
         };
-        try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = prep.tokens, .bytes = prep.payload });
+        // the digest once here: the prompt caches key the span by it on every turn that carries the picture
+        try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = prep.tokens, .bytes = prep.payload, .digest = api.prompt_cache.imageDigest(prep.payload) });
         try out.appendNTimes(cx.a, vision.token, prep.tokens);
     }
     if (placed.items.len != images.len) return cx.refuse("image input: the prompt holds fewer image placeholders than images");

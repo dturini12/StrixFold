@@ -104,6 +104,9 @@ pub const Image = struct {
     tokens: u32,
     bytes: []const u8,
     rows: bool = false,
+    /// The picture's identity for the prompt caches (prompt_cache.imageDigest of `bytes`; 0: not yet taken, the cache
+    /// takes it when it needs it).
+    digest: u64 = 0,
 };
 
 /// A vision family's image input as a server renders it (engine_api.Info.vision): each image part becomes
@@ -137,6 +140,9 @@ pub const Spec = struct {
     chunks: []const u32 = &.{}, // where prefill chunks start after 0 (Python's PrefillPlan); empty: the backend's step
     reuse: Reuse = .{},
     images: []const Image = &.{}, // in prompt order; the caller's until the stream is released
+    // with images: the ids the prompt caches key this prompt by (each span its picture's; the caller's until the
+    // stream is released); empty: the backend keeps and resumes no state of a prompt with images
+    cache_key: []const u32 = &.{},
     structure: ?Structure = null, // the grammar every reply token keeps to (a backend's draws enforce it)
 };
 
@@ -159,6 +165,7 @@ pub const Stream = struct {
     chunks: []const u32,
     reuse: Reuse = .{},
     images: []const Image = &.{},
+    cache_key: []const u32 = &.{},
     structure: ?Structure = null,
     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
@@ -216,6 +223,7 @@ pub const Stream = struct {
             .chunks = spec.chunks,
             .reuse = spec.reuse,
             .images = spec.images,
+            .cache_key = spec.cache_key,
             .structure = spec.structure,
         };
         try s.context.appendSlice(gpa, spec.prompt);

@@ -197,3 +197,98 @@ test "a turn's mark evicting the state it resumed from: the hit is reported firs
         try history.append(gpa, t);
     }
 }
+
+/// One conversation over a fresh lane host and store: turn 1 with picture `first`, turn 2 (turn 1, four reply tokens,
+/// a tool result) with picture `second`; returns turn 2's cached tokens and the store's entry count after it.
+fn imageTurns(cache_images: bool, first: []const u8, second: []const u8) !struct { cached: ?u32, entries: usize, hits: u64 } {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    const Snaps = struct {
+        fn bytes(_: *anyopaque, at: u32) u64 {
+            return 64 + 4 * @as(u64, at);
+        }
+        fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!pc.Saved {
+            const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
+            return f.save(@ptrCast(@alignCast(owner.?)), at);
+        }
+        fn restore(_: *anyopaque, _: ?*anyopaque, _: pc.Saved) anyerror!void {
+            return error.BackendRestores;
+        }
+        fn drop(ptr: *anyopaque, saved: pc.Saved) void {
+            const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
+            f.drop(saved);
+        }
+    };
+    var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
+    defer store.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+    host.cache = &store;
+    host.cache_images = cache_images;
+    try host.start();
+    defer host.stop();
+    const Box = struct {
+        mutex: std.Io.Mutex = .init,
+        tokens: std.ArrayList(u32) = .empty,
+        cached: ?u32 = null,
+        done: ?Reason = null,
+        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
+            const b: *@This() = @ptrCast(@alignCast(ctx));
+            b.mutex.lockUncancelable(std.testing.io);
+            defer b.mutex.unlock(std.testing.io);
+            switch (e.*) {
+                .prefilled => |c| b.cached = c,
+                .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
+                .finished => |f| b.done = f.reason,
+            }
+        }
+        fn wait(b: *@This()) Reason {
+            while (true) {
+                b.mutex.lockUncancelable(std.testing.io);
+                const d = b.done;
+                b.mutex.unlock(std.testing.io);
+                if (d) |r| return r;
+                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+            }
+        }
+    };
+    const e = host.engine();
+    const img: u32 = 11; // the image token: the span's three positions hold it whatever the picture
+    const t1 = [_]u32{ 3, 1, img, img, img, 9, 2, 6, 5, 3 };
+    const im1 = [_]api.Image{.{ .at = 2, .tokens = 3, .bytes = first }};
+    var b1: Box = .{};
+    defer b1.tokens.deinit(gpa);
+    const r1: Request = .{ .prompt = &t1, .images = &im1, .max_tokens = 6, .history_len = 8 };
+    try e.submit(1, &r1, .{ .ctx = &b1, .event = Box.event });
+    try std.testing.expectEqual(Reason.length, b1.wait());
+    try std.testing.expectEqual(@as(?u32, 0), b1.cached);
+    var t2: std.ArrayList(u32) = .empty;
+    defer t2.deinit(gpa);
+    try t2.appendSlice(gpa, &t1);
+    try t2.appendSlice(gpa, b1.tokens.items[0..4]);
+    try t2.appendSlice(gpa, &.{ 7, 7, 5, 3 });
+    const im2 = [_]api.Image{.{ .at = 2, .tokens = 3, .bytes = second, .digest = pc.imageDigest(second) }}; // as the server sets it
+    var b2: Box = .{};
+    defer b2.tokens.deinit(gpa);
+    const r2: Request = .{ .prompt = t2.items, .images = &im2, .max_tokens = 12, .history_len = @intCast(t2.items.len - 2) };
+    try e.submit(2, &r2, .{ .ctx = &b2, .event = Box.event });
+    try std.testing.expectEqual(Reason.length, b2.wait());
+    return .{ .cached = b2.cached, .entries = store.entries.items.len, .hits = store.counts.hits };
+}
+
+test "a conversation with a picture resumes past it when the next turn carries the same picture, and only then" {
+    const same = try imageTurns(true, "picture A", "picture A"); // turn 1's digest taken by the host, turn 2's by the server
+    try std.testing.expectEqual(@as(?u32, 8), same.cached);
+    try std.testing.expectEqual(@as(u64, 1), same.hits);
+    const other = try imageTurns(true, "picture A", "picture B"); // the same tokens, another picture
+    try std.testing.expectEqual(@as(?u32, 0), other.cached);
+    try std.testing.expectEqual(@as(u64, 0), other.hits);
+    const off = try imageTurns(false, "picture A", "picture A"); // a backend that keys no pictures: nothing kept
+    try std.testing.expectEqual(@as(?u32, 0), off.cached);
+    try std.testing.expectEqual(@as(usize, 0), off.entries);
+}
