@@ -44,12 +44,12 @@ serve_load() {
     die "GRAPHS=1: the head gather at ROUND_ROWS=$ROUND_ROWS ($((ROUND_ROWS * 64640 * 4)) B) exceeds COLL_SLOT_KIB=$COLL_SLOT_KIB"
   # (a configuration written before these settings existed runs with them off)
   REPLAY_FLOOR=${REPLAY_FLOOR:-0} HC_SIDE=${HC_SIDE:-0} ENGRAM_AIO=${ENGRAM_AIO:-0} TOP_K_MAX=${TOP_K_MAX:-0} SEED_RANDOM=${SEED_RANDOM:-0}
-  L2_PREFETCH=${L2_PREFETCH:-0}
+  L2_PREFETCH=${L2_PREFETCH:-0} LOOP_GUARD=${LOOP_GUARD:-0}
   DRAFT_BYPASS_AT=${DRAFT_BYPASS_AT:-0}
   [[ $DRAFT_BYPASS_AT =~ ^(0|[2-8])$ ]] || die "DRAFT_BYPASS_AT must be 0 or 2..8"
   # the switch acts only on drafted TP2 shared rounds that can hold that many streams; elsewhere it is off
   if [ "$DRAFTS" != 1 ] || [ "$WORLD" != 2 ] || [ "$DRAFT_BYPASS_AT" -gt "$STREAMS" ]; then DRAFT_BYPASS_AT=0; fi
-  for v in REPLAY_FLOOR HC_SIDE ENGRAM_AIO SEED_RANDOM L2_PREFETCH; do case ${!v} in 0|1) ;; *) die "$v must be 0 or 1, not ${!v}";; esac; done
+  for v in REPLAY_FLOOR HC_SIDE ENGRAM_AIO SEED_RANDOM L2_PREFETCH LOOP_GUARD; do case ${!v} in 0|1) ;; *) die "$v must be 0 or 1, not ${!v}";; esac; done
   [[ $TOP_K_MAX =~ ^[0-9]+$ ]] || die "TOP_K_MAX must be a whole number (0: off), not $TOP_K_MAX"
   # sf-disk (off unless PROMPT_DISK_GIB > 0): it writes what the memory tier keeps, so that must be on
   [[ $PROMPT_DISK_GIB =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "PROMPT_DISK_GIB must be a number of GiB (0: off), not $PROMPT_DISK_GIB"
@@ -194,6 +194,7 @@ serve_cmd() {
       --context "$CONTEXT" --parallel "$PARALLEL" --max-tokens "$MAX_TOKENS" --temperature "$TEMPERATURE"
       --prompt-cache-gib "$PROMPT_CACHE_GIB" --no-update-check)
     [ "$THINKING" = 1 ] && SERVE_CMD+=(--thinking) || SERVE_CMD+=(--no-thinking)
+    [ "$LOOP_GUARD" = 1 ] && SERVE_CMD+=(--loop-guard)
     [ "$DRAFTS" = 1 ] || SERVE_CMD+=(--no-drafts)
   else
     serve_lanes_cmd
