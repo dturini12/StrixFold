@@ -22,7 +22,10 @@ pub const Reason = enum {
 
 pub const Mode = enum { pipe, drain, verify, exit };
 
-pub const loop_max_period: usize = 8;
+// the longest exact cycle the thinking loop guard sees: 64 tokens (upstream 8). DeepSeek-V4.1, greedy, looped in its
+// thinking on a 29-token cycle ("Let me call the tool. / I'll do it. / OK. / ...", 855 times, 63,854 tokens) that a
+// guard of 8 never saw; 256 tokens of a cycle of 64 or less is no reasoning, and the guard only closes the thinking
+pub const loop_max_period: usize = 64;
 pub const loop_min_run: usize = 256;
 pub const loop_warm_in: usize = 64;
 
@@ -377,6 +380,30 @@ test "loop guard stops at the cap even when no cycle fires" {
     defer guarded.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 10), try guarded.commit(gpa, &tokens));
     try std.testing.expect(guarded.finished and guarded.reason == .length);
+}
+
+test "loop guard sees a long sentence cycle (29 tokens) and not one past the longest period" {
+    const gpa = std.testing.allocator;
+    const Case = struct { period: usize, fires: bool };
+    for ([_]Case{ .{ .period = 29, .fires = true }, .{ .period = loop_max_period, .fires = true }, .{ .period = loop_max_period + 1, .fires = false } }) |c| {
+        var tokens: std.ArrayList(u32) = .empty;
+        defer tokens.deinit(gpa);
+        for (0..loop_warm_in) |i| try tokens.append(gpa, @intCast(1000 + i)); // the reasoning before the loop
+        const n = loop_warm_in + loop_min_run + c.period + 3 * c.period; // the cycle a few times past the guard's run
+        while (tokens.items.len < n) try tokens.append(gpa, @intCast(2000 + (tokens.items.len - loop_warm_in) % c.period));
+        var s = try Stream.init(gpa, .{ .id = "loop", .prompt = &.{1}, .max_new = 4096, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .loop_guard = true });
+        defer s.deinit(gpa);
+        const landed = try s.commit(gpa, tokens.items);
+        if (c.fires) {
+            // it fires at the first token that completes loop_min_run tokens of the cycle after its first round
+            try std.testing.expectEqual(loop_warm_in + c.period + loop_min_run, landed);
+            try std.testing.expectEqual(@as(u32, @intCast(c.period)), s.loop_period.?);
+            try std.testing.expect(!s.finished and !s.think_open and s.force.items.len == 3);
+        } else {
+            try std.testing.expectEqual(n, landed);
+            try std.testing.expect(s.loop_period == null and s.think_open);
+        }
+    }
 }
 
 test "loop guard fires, closes thinking, and latches once" {
