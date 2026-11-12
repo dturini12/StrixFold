@@ -283,33 +283,34 @@ pub const LaneHost = struct {
         h.decoded.append(h.gpa, .{ .at = now, .tokens = n }) catch {};
     }
 
-    /// Cancels queued and admitted jobs named since the last round.
-    fn takeCancels(h: *LaneHost) void {
-        h.mutex.lockUncancelable(h.io);
-        const ids = h.gpa.dupe(Id, h.cancels.items) catch &.{};
-        h.cancels.clearRetainingCapacity();
-        var dropped: std.ArrayList(*Job) = .empty;
-        for (ids) |id| {
+    /// Cancels queued and admitted jobs named since the last round; the names are taken whole, so none is lost to
+    /// memory.
+    pub fn takeCancels(h: *LaneHost) void {
+        h.lock();
+        var ids = h.cancels;
+        h.cancels = .empty;
+        h.unlock();
+        defer ids.deinit(h.gpa);
+        for (ids.items) |id| {
+            var found: ?*Job = null;
+            var admitted = false;
+            // only this thread changes `admitted`; the status reader walks it under this lock
+            h.lock();
             for (h.queued.items, 0..) |job, i| if (job.id == id) {
-                dropped.append(h.gpa, h.queued.orderedRemove(i)) catch {};
+                found = h.queued.orderedRemove(i);
                 break;
             };
-        }
-        h.mutex.unlock(h.io);
-        for (dropped.items) |job| h.finish(job, .cancelled, "");
-        dropped.deinit(h.gpa);
-        for (ids) |id| {
-            for (h.admitted.items, 0..) |job, i| if (job.id == id) {
+            if (found == null) for (h.admitted.items, 0..) |job, i| if (job.id == id) {
                 if (h.filling == job) h.filling = null; // its paused pass: the backend frees what it placed
-                if (!job.stream.finished) h.core.discard(&job.stream);
-                h.lock();
-                _ = h.admitted.orderedRemove(i);
-                h.unlock();
-                h.finish(job, .cancelled, "");
+                found = h.admitted.orderedRemove(i);
+                admitted = true;
                 break;
             };
+            h.unlock();
+            const job = found orelse continue;
+            if (admitted and job.started and !job.stream.finished) h.core.discard(&job.stream);
+            h.finish(job, .cancelled, "");
         }
-        h.gpa.free(ids);
     }
 
     fn lock(h: *LaneHost) void {
@@ -613,26 +614,37 @@ pub const LaneHost = struct {
         }
     }
 
-    /// A failed round ends every stream it held, with the backend's error.
-    fn failAll(h: *LaneHost, message: []const u8) void {
+    /// A failed round ends every job it admitted, with the backend's error; the list is taken whole, not copied.
+    pub fn failAll(h: *LaneHost, message: []const u8) void {
         h.filling = null; // (its stream is released with the others)
         h.lock();
-        const jobs = h.gpa.dupe(*Job, h.admitted.items) catch &.{};
-        h.admitted.clearRetainingCapacity();
+        var jobs = h.admitted;
+        h.admitted = .empty;
         h.unlock();
-        for (jobs) |job| {
-            if (!job.stream.finished) h.core.discard(&job.stream);
+        defer jobs.deinit(h.gpa);
+        for (jobs.items) |job| {
+            if (job.started and !job.stream.finished) h.core.discard(&job.stream);
             h.finish(job, .failed, message);
         }
-        h.gpa.free(jobs);
     }
 
-    fn closeAll(h: *LaneHost) void {
-        h.lock();
-        for (h.queued.items) |job| h.cancels.append(h.gpa, job.id) catch {};
-        for (h.admitted.items) |job| h.cancels.append(h.gpa, job.id) catch {};
-        h.unlock();
+    /// Ends every queued and admitted job cancelled (the cancellations named before it first), copying nothing.
+    pub fn closeAll(h: *LaneHost) void {
         h.takeCancels();
+        h.filling = null; // (its stream is released with the others)
+        h.lock();
+        var queued = h.queued;
+        h.queued = .empty;
+        var admitted = h.admitted;
+        h.admitted = .empty;
+        h.unlock();
+        defer queued.deinit(h.gpa);
+        defer admitted.deinit(h.gpa);
+        for (admitted.items) |job| {
+            if (job.started and !job.stream.finished) h.core.discard(&job.stream);
+            h.finish(job, .cancelled, "");
+        }
+        for (queued.items) |job| h.finish(job, .cancelled, "");
     }
 };
 
@@ -741,3 +753,4 @@ test "a lane host serves the core's own tokens, in order, and cancels between ro
 }
 
 test { _ = @import("lane_host_test.zig"); }
+test { _ = @import("lane_host_end_test.zig"); }
