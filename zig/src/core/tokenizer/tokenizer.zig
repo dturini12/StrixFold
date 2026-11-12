@@ -566,4 +566,5 @@ test "without a decoder, decode joins known ids' tokens with spaces" {
 
 test {
     _ = @import("memo.zig");
+    _ = @import("memo_exact_test.zig");
 }
