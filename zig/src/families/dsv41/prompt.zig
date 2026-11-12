@@ -1653,6 +1653,8 @@ pub fn replayCut(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     const first = @max(ch.start, replay) - ch.start;
     if (first >= ch.n) return false;
     if (first == 0) return true;
+    // host_pos must be the slice begin() wrote for this chunk: its rows' positions from ch.start on
+    if (host_pos.len < ch.n or host_pos[0] != @as(i64, @intCast(ch.start))) return error.ReplayPositionsMismatch;
     const c = e.c;
     const n = ch.n - first;
     const row_h = c.hc * c.hidden * 2;

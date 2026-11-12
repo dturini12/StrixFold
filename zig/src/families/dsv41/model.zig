@@ -1167,11 +1167,11 @@ pub const Model = struct {
             }
         }
         // A's cut (its layer-cut mixes and kv source: A's own gathered rows only) while B's last MoE gather moves
-        const a_past = try prompt.replayCut(e, hs[0], &m.view, &sh[0], cut, replay, m.host_pos);
+        const a_past = try prompt.replayCut(e, hs[0], &m.view, &sh[0], cut, replay, m.host_pos[0..s]);
         if (pend) |q| try e.comm.gatherEnd(q, e.s);
         if (a_past) return error.SplitPastReplay;
         const ch = hs[1];
-        if (!try prompt.replayCut(e, ch, &m.view, &sh[1], cut, replay, m.host_pos)) return false;
+        if (!try prompt.replayCut(e, ch, &m.view, &sh[1], cut, replay, m.host_pos[s..n])) return false;
         for (cut..c.layers) |li| {
             try prompt.attnMixes(e, ch, li);
             if (taps) if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(li))) |j| try prompt.tap(e, ch, j); // (after the mixes, U52)
