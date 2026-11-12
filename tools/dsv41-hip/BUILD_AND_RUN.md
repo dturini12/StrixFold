@@ -52,7 +52,7 @@ tools/dsv41-hip/verify_inputs.sh  ~/models/tf-port/inputs-tp2-c178a012 1 ~/model
 ```
 `prepare_inputs.sh` authenticates every checkpoint and Engram file against the pinned Hugging Face metadata, writes the
 token map, the Engram constants (`kit/engram.json`), the RoPE tables (`kit/rope-*.f32`, 65,536 rows by default: they
-set the longest context the engine can serve), both rank caches and the chat template (c282975e), byte-checks each
+set the longest context the engine can serve), both rank caches and the chat template (865cb39b), byte-checks each
 cache in full (`tf-dsv41-check --bytes 1`) and hashes everything into `inputs_manifest.json` (SHA-256 243b984d... for
 this revision; `serve.conf` pins it). About 1 TB is read and 212 GB written. Copy the bundle to node0 (rank 0 needs
 its own rank cache and the tables). `verify_inputs.sh` re-checks a box's copy before that rank loads it (about 15

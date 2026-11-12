@@ -7,7 +7,8 @@
 
   Variables: messages, tools, add_generation_prompt, thinking_mode (thinking or chat) or enable_thinking, and
   reasoning_effort (an integer 1-100, or low, high, max; absent means high = 75). Without a thinking switch the
-  conversation is rendered for chat mode.
+  conversation is rendered for chat mode. response_format (optional): a JSON schema shown as encode_messages shows a
+  system message's response_format; absent or empty, the prompt is exactly as without it.
 
   How it differs from calling encode_messages:
   - Tools passed as the tools variable go on the first system message; an empty system message is added when the
@@ -227,9 +228,13 @@ Otherwise, output directly after </think> with tool calls or final response.
 {%- endif -%}
 {%- set effort_prompt = 'Reasoning Effort: ' ~ budget ~ ' (range 1-100, the higher the value, the more thorough the reasoning)\n\n' -%}
 
-{#- The conversation. Tools given as a variable go on the first system message, which is added empty when the
-    conversation has none. -#}
-{%- if tools and (messages | length == 0 or (messages[0].role != 'system' and messages[0].role != 'developer')) -%}
+{#- A response_format schema given as a variable goes on the first system message after its tools, as encode_messages
+    renders a system message's response_format. -#}
+{%- set rf_schema = response_format if (response_format is defined and response_format) else none -%}
+
+{#- The conversation. Tools or a response_format given as a variable go on the first system message, which is added
+    empty when the conversation has none. -#}
+{%- if (tools or rf_schema) and (messages | length == 0 or (messages[0].role != 'system' and messages[0].role != 'developer')) -%}
   {%- set all_msgs = [{'role': 'system', 'content': ''}] + messages -%}
 {%- else -%}
   {%- set all_msgs = messages -%}
@@ -388,6 +393,9 @@ Otherwise, output directly after </think> with tool calls or final response.
     {%- if sys_tools -%}
       {{- '\n\n' -}}
       {{- render_tools(sys_tools) -}}
+    {%- endif -%}
+    {%- if cur.count == 0 and rf_schema -%}
+      {{- '\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n' ~ (rf_schema | tojson) -}}
     {%- endif -%}
     {{- after_turn(task, cur.count > 0, i, next_role) -}}
     {%- set cur.prev_task = task -%}

@@ -117,7 +117,7 @@ pub fn markers(srv: *Server, a: Allocator, step: u32) !Plan {
 
 fn render(srv: *Server, a: Allocator, talk: []Value, thinking: bool, generation: bool) ?[]const u32 {
     var cx: errors.Cx = .{ .a = a };
-    return prompt.renderIds(srv, &cx, .{ .array = talk }, &.{}, thinking, null, generation) catch null;
+    return prompt.renderIds(srv, &cx, .{ .array = talk }, &.{}, thinking, null, generation, null) catch null;
 }
 
 /// The special tokens every piece of a role starts with.

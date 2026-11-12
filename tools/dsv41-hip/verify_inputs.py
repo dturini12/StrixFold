@@ -7,7 +7,7 @@ One box's inputs for one TP2 rank, checked before that rank may load them:
      value lock.json and PORT_STATUS.md record), so a regenerated bundle with other tables cannot pass;
   2. the bundle's own files: every file present on this box re-hashed against that manifest; the other rank's cache may
      be absent (each box holds only its own), any other missing or changed file fails;
-  3. the CPU assets against identities kept in this repository, not flags in the bundle: chat template c282975e...;
+  3. the CPU assets against identities kept in this repository, not flags in the bundle: chat template 865cb39b...;
      token map, Engram layers/ngram/heads/pad/primes/offsets/multipliers and token-map hash equal to the creator kit
      v0.6.1 engram.json (assets/creator_kit_v0.6.1_engram.json); the four RoPE tables hash equal to the reference for
      their row count (assets/rope_reference_<rows>.json, derived from the creator kit's served tables by
@@ -46,7 +46,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from provenance import record  # noqa: E402  (before --tools joins sys.path)
 
-TEMPLATE_SHA256 = "c282975e81949382a878e06060d1ef3e6e7b22628f9b51ee2188b2dfbcc7e217"
+TEMPLATE_SHA256 = "865cb39b92b1c46fa88b8f27a7c4633d4b441a7bcff3af2a371e29988c0a7ea4"
 ENGRAM_FIELDS = ("layers", "ngram", "heads", "pad", "primes", "offsets", "multipliers", "token_map_sha256", "token_map_len")
 ROPE_TABLES = ("rope-plain-cos.f32", "rope-plain-sin.f32", "rope-compressed-cos.f32", "rope-compressed-sin.f32")
 ROPE_EXTRA_ROWS = 49  # model.zig: rope_rows = context (a stream's most positions; --pool here) + round.max_rows (48) + 1

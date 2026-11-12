@@ -44,6 +44,9 @@ pub const Config = struct {
     /// TENSORFOLD_SSE_KEEPALIVE (seconds): a stream that sent nothing for this long (a long prompt's prefill) sends an
     /// SSE comment, so a client's idle timer does not drop it; 0: never (the stream's bytes as before).
     sse_keepalive_ms: u32 = 0,
+    /// TF_DSV41_SCHEMA_PROMPT=1: a DeepSeek-V4.1 request's response_format schema goes into its prompt as the encoder's
+    /// ``## Response Format`` block (the chat template's ``response_format``); off (the default): the prompt as without it.
+    dsv41_schema_prompt: bool = false,
     dashboard: bool = false,
     /// Sampling when a request names none (generation_config.json and the serve flags), or null for greedy.
     default_sampling: ?Value = null,
@@ -257,7 +260,7 @@ pub const Server = struct {
     fn callForm(srv: *Server, cx: *Cx) errors.Refused!?Form {
         const probe = (try json.parse(cx.a, "[{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_0\", \"type\": \"function\", \"function\": {\"name\": \"tfprobe_fn\", \"arguments\": {}}}]}]")).ok;
         var scratch: Cx = .{ .a = cx.a };
-        const text = if (prompt.renderIds(srv, &scratch, probe, &.{}, false, null, false)) |ids| try srv.text.decode(cx.a, ids) else |_| "";
+        const text = if (prompt.renderIds(srv, &scratch, probe, &.{}, false, null, false, null)) |ids| try srv.text.decode(cx.a, ids) else |_| "";
         if (std.mem.lastIndexOf(u8, text, "tfprobe_fn")) |at| {
             var best: ?usize = null;
             var opener: []const u8 = "";

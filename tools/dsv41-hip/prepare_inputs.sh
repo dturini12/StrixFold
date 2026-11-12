@@ -1,7 +1,7 @@
 #!/bin/bash
 # prepare_inputs.sh MODEL_DIR ENGRAM_DIR OUT_DIR [ROWS]: the CPU-only TP2 inputs bundle (BUILD_AND_RUN.md section 3), no CUDA, no
 # NVIDIA container, no GPU:
-#   model/{config.json,tokenizer.json,chat_template.jinja (c282975e…)}, dsv41_token_map.json, kit/engram.json,
+#   model/{config.json,tokenizer.json,chat_template.jinja (865cb39b…)}, dsv41_token_map.json, kit/engram.json,
 #   kit/rope-*.f32 + rope.json (ROWS rows, default 65536; the engine reads pool + 49 rows, so ROWS covers any
 #   --context up to ROWS - 49), rank{0,1}/rank-cache/rank{R}of2-<index hash>.bin, inputs_manifest.json.
 # Every checkpoint and Engram file is authenticated against the pinned HF metadata first; each rank cache is written
