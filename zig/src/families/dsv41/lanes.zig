@@ -1583,10 +1583,41 @@ fn testFault(kind: Fault) bool {
 
 /// A primitive this rank refused: rank 0 runs the same one on the same inputs and refuses it at the same step (its
 /// request ends with the error), so the follower reports it and takes the next frame instead of ending; unless the
-/// pair itself failed (broken), which ends the follower (U47).
-fn refused(err: anyerror) !void {
+/// pair itself failed (broken), which ends the follower (U47). A device fault is this rank's alone: rank 0 runs on
+/// into its next exchange and waits there for this rank, whose device runs nothing after the fault (tp2 #25). A
+/// sticky fault's own result (DeviceFault) is broken already; a GPU call that failed otherwise asks the device
+/// (Model.contextFailed), and one that is faulted for good ends the follower too: its link closes, and rank 0 stops.
+fn refused(m: anytype, err: anyerror) !void {
     std.debug.print("{{\"follow_refused\": \"{s}\"}}\n", .{@errorName(err)});
     if (broken(err)) return err;
+    if (gpuFailure(err) and m.contextFailed()) return error.GpuContextFailed;
+}
+
+/// A GPU runtime call's failure without a sticky fault's result (HIP's GpuFailed, CUDA's CudaFailed).
+fn gpuFailure(err: anyerror) bool {
+    return err == error.GpuFailed or err == error.CudaFailed;
+}
+
+test "a GPU failure that left the device faulted ends the follower, any other refusal does not" {
+    const Probe = struct {
+        failed: bool,
+        asked: usize = 0,
+        pub fn contextFailed(p: *@This()) bool {
+            p.asked += 1;
+            return p.failed;
+        }
+    };
+    var gone: Probe = .{ .failed = true };
+    try std.testing.expectError(error.GpuContextFailed, refused(&gone, error.GpuFailed));
+    try std.testing.expectError(error.GpuContextFailed, refused(&gone, error.CudaFailed));
+    var alive: Probe = .{ .failed = false }; // a failed call the device survived: refused as before
+    try refused(&alive, error.GpuFailed);
+    try std.testing.expectEqual(@as(usize, 1), alive.asked);
+    var other: Probe = .{ .failed = true }; // rank 0 refuses these too: the device is not asked
+    try refused(&other, error.MissingTritonVariant);
+    try refused(&other, error.OutOfDeviceMemory);
+    try std.testing.expectError(error.DeviceFault, refused(&other, error.DeviceFault)); // a sticky fault: broken already
+    try std.testing.expectEqual(@as(usize, 0), other.asked);
 }
 
 /// A failure of the TP pair itself, after which neither rank can run another primitive: the collectives poisoned
@@ -1597,6 +1628,7 @@ fn broken(err: anyerror) bool {
         // a sticky device fault (illegal address, launch failure, ...): every later call on this GPU fails, so the
         // rank exits and the launcher restarts the pair instead of refusing every request from here on
         error.DeviceFault => true,
+        error.GpuContextFailed => true, // (refused: a failed GPU call that left the device faulted)
         else => false,
     };
 }
@@ -1708,7 +1740,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 try r.end();
                 if (disk) |d| d.beginPass(if (n_spans > 0) std.mem.sliceAsBytes(key_ids.items) else std.mem.sliceAsBytes(seq));
                 notePass(m, step - 1, 1, seqs[slot].items.len, slot, @intCast(base), "");
-                m.fillBegin(slot, @intCast(base)) catch |err| try refused(err);
+                m.fillBegin(slot, @intCast(base)) catch |err| try refused(m, err);
                 m.fill_seq = seqs[slot].items;
             },
             .fill_chunk => {
@@ -1719,7 +1751,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                     plan_diffs += 1;
                     if (oftenEnough(plan_diffs)) std.log.warn("lanes: step {d} rank 1: its Engram read-ahead plan for the chunk at {d} differs from rank 0's ({}); rank 0's orders the gathers ({d} such chunks so far)", .{ step - 1, f.start, f.pre_read, plan_diffs });
                 }
-                _ = m.fillChunk(seqs[slot].items[0 .. f.start + f.n], f.start, f.n, f.replay, f.pre_read) catch |err| try refused(err);
+                _ = m.fillChunk(seqs[slot].items[0 .. f.start + f.n], f.start, f.n, f.replay, f.pre_read) catch |err| try refused(m, err);
             },
             .verify => {
                 const nw = try r.int(u32);
@@ -1736,7 +1768,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 }
                 try r.end();
                 const rows = try built.build(gpa, &seqs, wins[0..nw]);
-                m.verify(rows, built.absorb[0..nw]) catch |err| try refused(err);
+                m.verify(rows, built.absorb[0..nw]) catch |err| try refused(m, err);
                 if (m.prof) {
                     follow_prof.rounds += 1;
                     follow_prof.enqueue += m.t_enqueue;
@@ -1767,7 +1799,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                     keys[i] = .{ .seed = seed, .position = @intCast(q0[i] + 1), .inv_t = @bitCast(try r.int(u32)) };
                 };
                 try r.end();
-                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps, if (race) keys[0..n] else null) catch |err| try refused(err);
+                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps, if (race) keys[0..n] else null) catch |err| try refused(m, err);
             },
             .fill_images => {
                 const count = try r.int(u32);
@@ -1806,7 +1838,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 var b = try gpu.DeviceBuffer.alloc(m.ctx.d, m.snapBytes());
                 m.snapCopy(s, b.ptr, true) catch |err| {
                     b.free();
-                    try refused(err);
+                    try refused(m, err);
                     continue;
                 };
                 try kept.put(gpa, id, b);
@@ -1821,8 +1853,8 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 try r.end();
                 const b = kept.get(id) orelse return error.UnknownSnapshot; // rank 0 restores only states both ranks keep
                 std.log.info("lanes: step {d} rank 1 restores state {d} at {d} into slot {d}, extent {d} from {d}", .{ step - 1, id, at, s, to, from });
-                if (from != to) m.copyExtent(from, to, at) catch |err| try refused(err);
-                m.snapCopy(s, b.ptr, false) catch |err| try refused(err);
+                if (from != to) m.copyExtent(from, to, at) catch |err| try refused(m, err);
+                m.snapCopy(s, b.ptr, false) catch |err| try refused(m, err);
             },
             .snap_drop => {
                 const id = try r.int(u64);
