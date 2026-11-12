@@ -50,4 +50,5 @@ test {
     _ = @import("decisions_test.zig");
     _ = @import("server_recovery_test.zig");
     _ = @import("dsv41_schema_prompt_test.zig");
+    _ = @import("dsv41_schema_routes_test.zig");
 }
