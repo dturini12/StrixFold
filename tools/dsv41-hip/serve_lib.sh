@@ -63,6 +63,7 @@ serve_load() {
   SPAWN_UNIT=${SPAWN_UNIT:-0}
   case $SPAWN_UNIT in 0|1) ;; *) die "SPAWN_UNIT must be 0 or 1, not $SPAWN_UNIT";; esac
   REPLAY_FLOOR=${REPLAY_FLOOR:-0} HC_SIDE=${HC_SIDE:-0} ENGRAM_AIO=${ENGRAM_AIO:-0} TOP_K_MAX=${TOP_K_MAX:-0} SEED_RANDOM=${SEED_RANDOM:-0}
+  SCHEMA_PROMPT=${SCHEMA_PROMPT:-0}
   L2_PREFETCH=${L2_PREFETCH:-0} LOOP_GUARD=${LOOP_GUARD:-1} DRAFT_TEMPERATURE=${DRAFT_TEMPERATURE:-0}
   [[ $DRAFT_TEMPERATURE =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v t="$DRAFT_TEMPERATURE" 'BEGIN { exit !(t <= 100) }' \
     || die "DRAFT_TEMPERATURE must be a number from 0 (off) to 100, not $DRAFT_TEMPERATURE"
@@ -72,7 +73,7 @@ serve_load() {
   [[ $FILL_SLICE_MS =~ ^[0-9]{1,6}$ ]] || die "FILL_SLICE_MS must be a whole number of ms up to 999999 (0: whole prompt passes)"
   # the switch acts only on drafted TP2 shared rounds that can hold that many streams; elsewhere it is off
   if [ "$DRAFTS" != 1 ] || [ "$WORLD" != 2 ] || [ "$DRAFT_BYPASS_AT" -gt "$STREAMS" ]; then DRAFT_BYPASS_AT=0; fi
-  for v in REPLAY_FLOOR HC_SIDE ENGRAM_AIO SEED_RANDOM L2_PREFETCH LOOP_GUARD; do case ${!v} in 0|1) ;; *) die "$v must be 0 or 1, not ${!v}";; esac; done
+  for v in REPLAY_FLOOR HC_SIDE ENGRAM_AIO SEED_RANDOM L2_PREFETCH LOOP_GUARD SCHEMA_PROMPT; do case ${!v} in 0|1) ;; *) die "$v must be 0 or 1, not ${!v}";; esac; done
   [[ $TOP_K_MAX =~ ^[0-9]+$ ]] || die "TOP_K_MAX must be a whole number (0: off), not $TOP_K_MAX"
   # sf-disk (off unless PROMPT_DISK_GIB > 0): it writes what the memory tier keeps, so that must be on
   [[ $PROMPT_DISK_GIB =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "PROMPT_DISK_GIB must be a number of GiB (0: off), not $PROMPT_DISK_GIB"
@@ -233,7 +234,8 @@ serve_env() {
     SERVE_ENV+=(TF_TP_WORLD="$WORLD" TF_TP_MASTER="$MASTER_IP" TF_TP_PORT="$TP_PORT" TF_DS_RANK_CACHE="$RANK_CACHE"
       TF_DS_KIT="$DS_KIT" TF_DS_ENGRAM="$ENGRAM_DIR" TF_DS_TOKEN_MAP="$TOKEN_MAP" TF_DS_STREAMS="$STREAMS"
       TF_DS_ROUND_ROWS="$ROUND_ROWS" TENSORFOLD_HIP_KERNELS="$KIT" TF_DS_HC_SIDE="$HC_SIDE" TF_DS_ENGRAM_AIO="$ENGRAM_AIO"
-      TF_TOP_K_MAX="$TOP_K_MAX" TF_SEED_RANDOM="$SEED_RANDOM" TF_DS_L2_PREFETCH="$L2_PREFETCH" TF_DS_POOL="$POOL")
+      TF_TOP_K_MAX="$TOP_K_MAX" TF_SEED_RANDOM="$SEED_RANDOM" TF_DS_L2_PREFETCH="$L2_PREFETCH" TF_DS_POOL="$POOL"
+      TF_DSV41_SCHEMA_PROMPT="$SCHEMA_PROMPT")
   fi
 }
 

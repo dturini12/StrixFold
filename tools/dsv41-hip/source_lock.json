@@ -42,7 +42,8 @@
   "chat_template": {
     "recipe_path": "runs/2026-10-17-1017-tensorfold/launch/chat_template.jinja",
     "bundled_path": "assets/chat_template.jinja",
-    "sha256": "c282975e81949382a878e06060d1ef3e6e7b22628f9b51ee2188b2dfbcc7e217"
+    "sha256": "865cb39b92b1c46fa88b8f27a7c4633d4b441a7bcff3af2a371e29988c0a7ea4",
+    "recipe_sha256": "c282975e81949382a878e06060d1ef3e6e7b22628f9b51ee2188b2dfbcc7e217"
   },
   "limits": {"header_bytes": 67108864, "io_chunk_bytes": 4194304},
   "qualification": {

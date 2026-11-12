@@ -7,6 +7,7 @@ const model_text = @import("model_text.zig");
 const chat = @import("chat.zig");
 const Server = @import("server.zig").Server;
 const api = @import("engine_api");
+const deepseek_schema = @import("deepseek_schema.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 
@@ -14,14 +15,22 @@ pub const Rendered = struct { ids: []const u32, history_len: usize = 0, images: 
 
 pub const isTitle = messages_mod.isTitleRequest;
 
-/// ``render_prompt_ids``: messages normalized for this template, rendered, and a dangling ``<think>`` closed.
-pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool) errors.Refused![]const u32 {
+/// The schema a request's ``response_format`` shows in a DeepSeek-V4.1 prompt (its ``## Response Format`` block), or null:
+/// always null unless TF_DSV41_SCHEMA_PROMPT=1 (Config.dsv41_schema_prompt) and the template reads the V4.1 dialect.
+pub fn schemaOf(srv: *const Server, a: std.mem.Allocator, response_format: ?Value) std.mem.Allocator.Error!?Value {
+    if (!srv.config.dsv41_schema_prompt or srv.dialect != .deepseek_v41) return null;
+    return deepseek_schema.schemaFor(a, response_format orelse return null);
+}
+
+/// ``render_prompt_ids``: messages normalized for this template, rendered, and a dangling ``<think>`` closed. `schema`:
+/// schemaOf's, or null.
+pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool, schema: ?Value) errors.Refused![]const u32 {
     const normalized = try messages_mod.normalize(cx, messages, srv.late_system, srv.needs_user_after_tool, srv.dialect);
-    return renderNormalizedIds(srv, cx, normalized, tools, thinking, effort, generation);
+    return renderNormalizedIds(srv, cx, normalized, tools, thinking, effort, generation, schema);
 }
 
 /// Render normalized messages without rejecting authenticated image placeholders a second time.
-fn renderNormalizedIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool) errors.Refused![]const u32 {
+fn renderNormalizedIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool, schema: ?Value) errors.Refused![]const u32 {
     const normalized = try messages_mod.toolArguments(cx, messages, srv.dialect);
     var problem: []const u8 = "";
     const options: model_text.RenderOptions = .{
@@ -30,6 +39,7 @@ fn renderNormalizedIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Va
         .enable_thinking = thinking,
         .reasoning_effort = if (thinking) effort else null,
         .reasoning_effort_value = if (thinking) srv.effortValue(effort) else null,
+        .response_format = schema,
     };
     var ids = srv.text.renderIds(cx.a, normalized, options, &problem) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -57,9 +67,10 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
         } },
         .ids => |ids| return .{ .ids = ids },
     };
-    if (input.images.len > 0) return renderImages(srv, cx, input.messages, input.tools, thinking, effort, true, input.images);
-    const prompt = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, true);
-    const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
+    const schema = try schemaOf(srv, cx.a, input.fields.get("response_format"));
+    if (input.images.len > 0) return renderImages(srv, cx, input.messages, input.tools, thinking, effort, true, input.images, schema);
+    const prompt = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, true, schema);
+    const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false, schema);
     var history_len: usize = 0;
     if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) history_len = history.len;
     if (history_len == 0 and prompt.len > 1 and std.mem.eql(u32, history, prompt)) history_len = prompt.len - 1; // a template with no generation suffix
@@ -67,10 +78,10 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
 }
 
 /// Render authenticated image messages after normalizeImages has escaped literal placeholders.
-pub fn renderImages(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool, images: []const []const u8) errors.Refused!Rendered {
+pub fn renderImages(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool, images: []const []const u8, schema: ?Value) errors.Refused!Rendered {
     const vision = srv.info.vision orelse return cx.refuse("image input: this engine has no vision hook");
     const tagged = try imageIdentities(cx, messages, vision.placeholder, images.len);
-    const ids = try renderNormalizedIds(srv, cx, tagged, tools, thinking, effort, generation);
+    const ids = try renderNormalizedIds(srv, cx, tagged, tools, thinking, effort, generation, schema);
     return spans(srv, cx, ids, images);
 }
 
@@ -144,24 +155,25 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8) er
     return .{ .ids = out.items, .images = placed.items };
 }
 
-/// A reusable system prefix, found with a probe in place of the first user message; zero below 512 tokens.
-pub fn systemPrefixLen(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, prompt_ids: []const u32, thinking: bool, effort: ?[]const u8) usize {
+/// A reusable system prefix, found with a probe in place of the first user message; zero below 512 tokens. `schema`: the
+/// prompt's own (schemaOf), so the probe's system block is the prompt's.
+pub fn systemPrefixLen(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, prompt_ids: []const u32, thinking: bool, effort: ?[]const u8, schema: ?Value) usize {
     if (messages != .array) return 0;
     const first_user = for (messages.array, 0..) |m, i| {
         const role = m.get("role") orelse continue;
         if (role == .string and std.mem.eql(u8, role.string, "user")) break i;
     } else return 0;
-    return probedPrefix(srv, cx, messages, first_user, tools, prompt_ids, thinking, effort);
+    return probedPrefix(srv, cx, messages, first_user, tools, prompt_ids, thinking, effort, schema);
 }
 
 /// The tokens the first `k` messages render to as a prefix of `prompt_ids` (`shared_messages`); 0 outside or under 512.
-pub fn messagesPrefixLen(srv: *Server, cx: *Cx, messages: Value, k: usize, tools: []const Value, prompt_ids: []const u32, thinking: bool, effort: ?[]const u8) usize {
+pub fn messagesPrefixLen(srv: *Server, cx: *Cx, messages: Value, k: usize, tools: []const Value, prompt_ids: []const u32, thinking: bool, effort: ?[]const u8, schema: ?Value) usize {
     if (messages != .array or k == 0 or k >= messages.array.len) return 0;
-    return probedPrefix(srv, cx, messages, k, tools, prompt_ids, thinking, effort);
+    return probedPrefix(srv, cx, messages, k, tools, prompt_ids, thinking, effort, schema);
 }
 
 /// The first `n` messages and a probe user turn rendered: how far their ids agree with the prompt's (under 512: 0).
-fn probedPrefix(srv: *Server, cx: *Cx, messages: Value, n: usize, tools: []const Value, prompt_ids: []const u32, thinking: bool, effort: ?[]const u8) usize {
+fn probedPrefix(srv: *Server, cx: *Cx, messages: Value, n: usize, tools: []const Value, prompt_ids: []const u32, thinking: bool, effort: ?[]const u8, schema: ?Value) usize {
     const probe = cx.a.alloc(Value, n + 1) catch return 0;
     @memcpy(probe[0..n], messages.array[0..n]);
     const user = json.newObject(cx.a) catch return 0;
@@ -169,7 +181,7 @@ fn probedPrefix(srv: *Server, cx: *Cx, messages: Value, n: usize, tools: []const
     user.put(cx.a, "content", .{ .string = "\u{2063}probe" }) catch return 0;
     probe[n] = .{ .object = user };
     var scratch: Cx = .{ .a = cx.a };
-    const other = renderIds(srv, &scratch, .{ .array = probe }, tools, thinking, effort, true) catch return 0;
+    const other = renderIds(srv, &scratch, .{ .array = probe }, tools, thinking, effort, true, schema) catch return 0;
     var shared: usize = 0;
     while (shared < @min(prompt_ids.len, other.len) and prompt_ids[shared] == other[shared]) shared += 1;
     return if (shared >= 512) shared else 0;
