@@ -734,6 +734,15 @@ pub const Model = struct {
         return m.fan.links[0 .. m.world - 1];
     }
 
+    /// Whether this rank's device has failed for good: a call saw a sticky fault (gpu.health: an illegal address, a
+    /// trap, a launch failure), or the stream's query fails now (after a kernel fault every later call returns it); a
+    /// device that survived a failed call answers done or busy.
+    pub fn contextFailed(m: *Model) bool {
+        if (gpu.health() != null) return true;
+        _ = m.stream.done() catch return true;
+        return false;
+    }
+
     pub fn drafting(m: *const Model) bool {
         return m.dr != null;
     }
