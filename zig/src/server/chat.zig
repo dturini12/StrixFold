@@ -119,6 +119,27 @@ const Mailbox = struct {
 };
 
 const nowNs = clock.nowNs;
+
+test "Server recovery: token staging allocation failure ends the loop without consuming tokens" {
+    var m: Mailbox = .{ .io = std.testing.io, .gpa = std.testing.allocator, .finished = true };
+    defer m.deinit();
+    try m.tokens.append(std.testing.allocator, 42);
+    try m.chunks.append(std.testing.allocator, 1);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var g: Generation = undefined;
+    g.a = failing.allocator();
+    g.box = &m;
+    g.chunk_index = 0;
+    g.consumed = 0;
+    const Gone = struct {
+        pub fn check(_: @This()) bool {
+            return false;
+        }
+    };
+    try std.testing.expectError(error.OutOfMemory, g.loop(Gone{}));
+    try std.testing.expectEqual(@as(usize, 0), g.consumed);
+    try std.testing.expectEqual(@as(usize, 0), g.chunk_index);
+}
 const seconds = clock.seconds;
 
 /// Python's ``bool(fields.get(key))`` on the sampling fields.
@@ -480,8 +501,11 @@ const Generation = struct {
             var ended = false;
             if (g.chunk_index < m.chunks.items.len) {
                 const end = m.chunks.items[g.chunk_index];
+                chunk = g.a.dupe(u32, m.tokens.items[g.consumed..end]) catch |e| {
+                    m.mutex.unlock(m.io);
+                    return e;
+                };
                 g.chunk_index += 1;
-                chunk = g.a.dupe(u32, m.tokens.items[g.consumed..end]) catch null;
                 g.consumed = end;
             } else if (m.finished) {
                 ended = true;
