@@ -126,6 +126,14 @@ pub const Fake = struct {
         const got = try x.lanes.getOrPut(x.gpa, s);
         if (got.found_existing) freeLane(x.gpa, got.value_ptr);
         got.value_ptr.* = .{};
+        // the kept state's tokens stand in for the prompt's first `at`: restored before the first chunk, as a lane
+        // backend restores (the host reports the restore and lets the state go once the first piece returns)
+        s.cached = 0;
+        if (s.reuse.saved) |saved| {
+            const kept: *std.ArrayList(u32) = @ptrCast(@alignCast(saved));
+            try got.value_ptr.history.appendSlice(x.gpa, kept.items);
+            s.cached = s.reuse.at;
+        }
     }
 
     fn pieces(x: *Fake, s: *Stream, chunks: usize) !bool {
@@ -140,12 +148,6 @@ pub const Fake = struct {
         }
         if (l.pieces < total) return false;
         const h = &l.history;
-        s.cached = 0;
-        if (s.reuse.saved) |saved| { // the kept state's tokens stand in for the prompt's first `at`
-            const kept: *std.ArrayList(u32) = @ptrCast(@alignCast(saved));
-            try h.appendSlice(x.gpa, kept.items);
-            s.cached = s.reuse.at;
-        }
         for (s.prompt()[h.items.len..], h.items.len + 1..) |t, at| {
             try h.append(x.gpa, t);
             if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(at));
