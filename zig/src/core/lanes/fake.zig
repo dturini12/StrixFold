@@ -47,6 +47,7 @@ pub const Fake = struct {
     prefill_hook_ctx: ?*anyopaque = null,
     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
     refuse_full: usize = 0, // prefill refuses this many times with error.ContextFull while another lane is live
+    fail_round: std.atomic.Value(bool) = .init(false), // set (any thread): the next round fails with error.RoundFailed
 
     pub fn deinit(x: *Fake) void {
         var it = x.lanes.valueIterator();
@@ -178,6 +179,7 @@ pub const Fake = struct {
 
     fn queue(ptr: *anyopaque, s: *Stream, feed: be.Feed, position: u64) anyerror!u64 {
         const x = self(ptr);
+        if (x.fail_round.swap(false, .acq_rel)) return error.RoundFailed;
         const l = x.lane(s);
         try l.history.append(x.gpa, x.value(feed));
         return x.draw(l, s, position);
@@ -189,6 +191,7 @@ pub const Fake = struct {
 
     fn verify(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const x = self(ptr);
+        if (x.fail_round.swap(false, .acq_rel)) return error.RoundFailed;
         x.rounds += 1;
         x.max_verify_streams = @max(x.max_verify_streams, windows.len);
         var total_rows: usize = 0;
