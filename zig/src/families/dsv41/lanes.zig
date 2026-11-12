@@ -734,7 +734,9 @@ pub const Lanes = struct {
             m.fill_seq = &.{};
         }
         var ran: usize = 0;
-        while (f.start < len and ran < chunks) : (ran += 1) {
+        // past its chunks a stepped pass runs on while nothing else waits (s.shares), so a pass alone runs as a whole
+        // one; a whole pass (prefill) never asks
+        while (f.start < len and (ran < chunks or !s.shares())) : (ran += 1) {
             const start = f.start;
             if (start > 0 and s.isCancelled()) return error.Cancelled;
             const n = @min(model.chunk_rows, len - start);

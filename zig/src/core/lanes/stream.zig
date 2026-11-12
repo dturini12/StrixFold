@@ -135,6 +135,7 @@ pub const Spec = struct {
     proposer: ?Proposer = null,
     stop_check: ?StopCheck = null,
     cancel_check: ?CancelCheck = null,
+    share_check: ?CancelCheck = null, // a stepped prompt pass: other work waits, so its step ends after its chunks
     think_budget: u32 = 0,
     think_close: []const u32 = &.{},
     think_end: i64 = -1,
@@ -159,6 +160,7 @@ pub const Stream = struct {
     proposer: ?Proposer,
     stop_check: ?StopCheck,
     cancel_check: ?CancelCheck,
+    share_check: ?CancelCheck = null,
     think_budget: u32,
     think_close: []const u32,
     think_end: i64,
@@ -218,6 +220,7 @@ pub const Stream = struct {
             .proposer = if (spec.drafts) spec.proposer else null,
             .stop_check = spec.stop_check,
             .cancel_check = spec.cancel_check,
+            .share_check = spec.share_check,
             .think_budget = spec.think_budget,
             .think_close = spec.think_close,
             .think_end = spec.think_end,
@@ -276,6 +279,13 @@ pub const Stream = struct {
     /// Whether the request was cancelled (false with no hook); a prompt pass asks before each chunk.
     pub fn isCancelled(s: *const Stream) bool {
         const c = s.cancel_check orelse return false;
+        return c.check(c.ptr);
+    }
+
+    /// Whether a stepped prompt pass ends its step after its chunks (true with no hook: every step ends there);
+    /// false while nothing else waits, so a pass alone runs on as a whole pass does. Asked after each chunk.
+    pub fn shares(s: *const Stream) bool {
+        const c = s.share_check orelse return true;
         return c.check(c.ptr);
     }
 
@@ -421,4 +431,20 @@ test "loop guard fires, closes thinking, and latches once" {
     try std.testing.expect(!s.finished and s.force.items.len == 0);
     _ = try s.commit(gpa, &.{8});
     try std.testing.expect(!s.finished and s.loop_period.? == 1);
+}
+
+test "shares: a stepped pass ends its step with no hook, runs on while its hook says nothing waits" {
+    const Flag = struct {
+        fn check(ptr: *anyopaque) bool {
+            return @as(*bool, @ptrCast(@alignCast(ptr))).*;
+        }
+    };
+    var waits = false;
+    var s: Stream = undefined;
+    s.share_check = null;
+    try std.testing.expect(s.shares());
+    s.share_check = .{ .ptr = &waits, .check = Flag.check };
+    try std.testing.expect(!s.shares());
+    waits = true;
+    try std.testing.expect(s.shares());
 }
