@@ -23,12 +23,13 @@ const cases_json = @embedFile("fixtures/dsv41_response_format/cases.json");
 const template_before = @embedFile("fixtures/dsv41_response_format/chat_template_c282975e.jinja");
 const block_head = "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n";
 
-/// An HfText that holds only a compiled template: its own render (the server's Jinja context), bytes for tokens.
-const Rig = struct {
+/// An HfText that holds only a compiled template: its own render (the server's Jinja context), bytes for tokens and
+/// the image placeholder as the one id `image_id`.
+pub const Rig = struct {
     hf: HfText,
     vt: model_text.Text.VTable,
 
-    fn init(a: std.mem.Allocator, source: []const u8) !Rig {
+    pub fn init(a: std.mem.Allocator, source: []const u8) !Rig {
         var diag: template.Diag = .{};
         var r: Rig = .{ .hf = .{ .gpa = a, .arena = .init(a), .tok = undefined, .source = source, .compiled = try template.compile(a, source, &diag) }, .vt = undefined };
         const base = r.hf.text().vtable.*;
@@ -43,24 +44,36 @@ const Rig = struct {
         return r;
     }
 
-    fn text(r: *Rig) model_text.Text {
+    pub const image_placeholder = "<\u{ff5c}deepseek_image\u{ff5c}>";
+    pub const image_id: u32 = 300;
+
+    pub fn text(r: *Rig) model_text.Text {
         return .{ .ctx = &r.hf, .vtable = &r.vt };
     }
 
     fn encode(_: *anyopaque, a: std.mem.Allocator, input: []const u8, _: bool) model_text.Error![]u32 {
-        const ids = try a.alloc(u32, input.len);
-        for (input, ids) |byte, *id| id.* = byte;
-        return ids;
+        var ids: std.ArrayList(u32) = .empty;
+        var i: usize = 0;
+        while (i < input.len) {
+            if (std.mem.startsWith(u8, input[i..], image_placeholder)) {
+                try ids.append(a, image_id);
+                i += image_placeholder.len;
+            } else {
+                try ids.append(a, input[i]);
+                i += 1;
+            }
+        }
+        return ids.items;
     }
 
     fn decode(_: *anyopaque, a: std.mem.Allocator, ids: []const u32) std.mem.Allocator.Error![]u8 {
-        const out = try a.alloc(u8, ids.len);
-        for (ids, out) |id, *byte| byte.* = @intCast(id & 0xff);
-        return out;
+        var out: std.ArrayList(u8) = .empty;
+        for (ids) |id| if (id == image_id) try out.appendSlice(a, image_placeholder) else try out.append(a, @intCast(id & 0xff));
+        return out.items;
     }
 
-    fn tokenId(_: *anyopaque, _: []const u8) ?u32 {
-        return null;
+    fn tokenId(_: *anyopaque, piece: []const u8) ?u32 {
+        return if (std.mem.eql(u8, piece, image_placeholder)) image_id else null;
     }
 
     fn tokenString(_: *anyopaque, a: std.mem.Allocator, id: u32) std.mem.Allocator.Error![]u8 {
@@ -68,7 +81,7 @@ const Rig = struct {
     }
 
     fn vocabSize(_: *anyopaque) u32 {
-        return 256;
+        return 512;
     }
 
     fn eosIds(_: *anyopaque) []const u32 {

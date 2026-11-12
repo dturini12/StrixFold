@@ -1,0 +1,33 @@
+{
+ "generator": "encoding.py (git blob 3c7c357dc9ae3ed37adacb8572a2e9498b7d1bcb) encode_messages(thinking_mode='chat') and to_json",
+ "schema": {
+  "type": "object",
+  "description": "中文 😀",
+  "properties": {
+   "a": {
+    "type": "number",
+    "description": "naïve – “q” \\ /"
+   },
+   "tags": {
+    "type": "array",
+    "items": {
+     "type": "string",
+     "enum": [
+      "x",
+      "y\"z",
+      "é"
+     ]
+    }
+   }
+  },
+  "required": [
+   "a"
+  ]
+ },
+ "schema_json": "{\"type\": \"object\", \"description\": \"中文 😀\", \"properties\": {\"a\": {\"type\": \"number\", \"description\": \"naïve – “q” \\\\ /\"}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\", \"enum\": [\"x\", \"y\\\"z\", \"é\"]}}}, \"required\": [\"a\"]}",
+ "system": "You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. ",
+ "user": "Give me a number.",
+ "block": "\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{\"type\": \"object\", \"description\": \"中文 😀\", \"properties\": {\"a\": {\"type\": \"number\", \"description\": \"naïve – “q” \\\\ /\"}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\", \"enum\": [\"x\", \"y\\\"z\", \"é\"]}}}, \"required\": [\"a\"]}",
+ "prompt_on": "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. \n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{\"type\": \"object\", \"description\": \"中文 😀\", \"properties\": {\"a\": {\"type\": \"number\", \"description\": \"naïve – “q” \\\\ /\"}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\", \"enum\": [\"x\", \"y\\\"z\", \"é\"]}}}, \"required\": [\"a\"]}<｜User｜>Give me a number.<｜Assistant｜></think>",
+ "prompt_off": "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. You are a careful assistant who answers with exactly what is asked. <｜User｜>Give me a number.<｜Assistant｜></think>"
+}
