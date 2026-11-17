@@ -75,6 +75,8 @@ serve_load() {
   if [ "$DRAFTS" != 1 ] || [ "$WORLD" != 2 ] || [ "$DRAFT_BYPASS_AT" -gt "$STREAMS" ]; then DRAFT_BYPASS_AT=0; fi
   for v in REPLAY_FLOOR HC_SIDE ENGRAM_AIO SEED_RANDOM L2_PREFETCH LOOP_GUARD SCHEMA_PROMPT; do case ${!v} in 0|1) ;; *) die "$v must be 0 or 1, not ${!v}";; esac; done
   [[ $TOP_K_MAX =~ ^[0-9]+$ ]] || die "TOP_K_MAX must be a whole number (0: off), not $TOP_K_MAX"
+  # the SSE keepalive (rank 0; unset, empty or 0: off, the server as before)
+  [ -z "${SSE_KEEPALIVE:-}" ] || [[ $SSE_KEEPALIVE =~ ^[0-9]+$ ]] || die "SSE_KEEPALIVE must be a whole number of seconds (0 or empty: off), not $SSE_KEEPALIVE"
   # sf-disk (off unless PROMPT_DISK_GIB > 0): it writes what the memory tier keeps, so that must be on
   [[ $PROMPT_DISK_GIB =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "PROMPT_DISK_GIB must be a number of GiB (0: off), not $PROMPT_DISK_GIB"
   if serve_disk_on; then
@@ -236,6 +238,7 @@ serve_env() {
       TF_DS_ROUND_ROWS="$ROUND_ROWS" TENSORFOLD_HIP_KERNELS="$KIT" TF_DS_HC_SIDE="$HC_SIDE" TF_DS_ENGRAM_AIO="$ENGRAM_AIO"
       TF_TOP_K_MAX="$TOP_K_MAX" TF_SEED_RANDOM="$SEED_RANDOM" TF_DS_L2_PREFETCH="$L2_PREFETCH" TF_DS_POOL="$POOL"
       TF_DSV41_SCHEMA_PROMPT="$SCHEMA_PROMPT")
+    if [ -n "${SSE_KEEPALIVE:-}" ] && [ "$SSE_KEEPALIVE" != 0 ]; then SERVE_ENV+=(TENSORFOLD_SSE_KEEPALIVE="$SSE_KEEPALIVE"); fi
   fi
 }
 
