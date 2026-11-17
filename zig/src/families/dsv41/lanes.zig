@@ -886,9 +886,9 @@ pub const Lanes = struct {
         defer rows.deinit(gpa);
         if (s.images.len > 0) {
             const row_bytes = m.cfg.hidden * 2;
-            var at_row: usize = 0;
+            try fill_spans.rowSpans(gpa, s.images, start, &spans);
             for (s.images, 0..) |img, k| {
-                if (@as(usize, img.at) + img.tokens <= start) continue;
+                if (!fill_spans.pastResume(img.at, img.tokens, start)) continue;
                 if (img.rows) {
                     if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
                     try rows.appendSlice(gpa, img.bytes);
@@ -900,8 +900,6 @@ pub const Lanes = struct {
                     const t = if (self.encoder) |enc| try enc.take(s.images, k, gpa, &rows) else try v.rows(img.bytes, gpa, &rows);
                     if (t != img.tokens) return error.BadImageSpan;
                 }
-                try spans.append(gpa, .{ .at = img.at, .len = img.tokens, .row = at_row });
-                at_row += img.tokens;
             }
         }
         if (spans.items.len > 0) {

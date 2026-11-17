@@ -479,3 +479,33 @@ test "pictures a resume covers are not encoded at submit; one its pass still ask
     e.forget(&a);
     e.forget(&b);
 }
+
+test "a resume inside a picture's span still encodes it at submit; a resume that falls back into a skipped one encodes it then" {
+    const gpa = std.testing.allocator;
+    var fake: Fake = .{};
+    var e = Encoder.init(gpa, std.testing.io, fake.tower(), 1024);
+    try e.start();
+    defer e.stop();
+    var woken: Woken = .{};
+    // a picture the resume covers, and one at [4000, 4200) the resume at 4096 lands inside
+    const a = [_]Image{ .{ .at = 100, .tokens = 200, .bytes = &.{ 200, 7 } }, .{ .at = 4000, .tokens = 200, .bytes = &.{ 200, 8 } } };
+    try e.submit(&a, 4096, woken.wake());
+    waitReady(&e, &a);
+    try std.testing.expectEqual(@as(u32, 1), fake.encodes.load(.acquire)); // the second only, though it began before 4096
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 200), try e.take(&a, 1, gpa, &out)); // its whole span's rows, already there
+    try std.testing.expectEqual(@as(u32, 1), fake.encodes.load(.acquire));
+    try std.testing.expect(out.items.len == 4 * 200 and std.mem.allEqual(u8, out.items, 8));
+    e.forget(&a);
+    // the hint said 6144 (past the picture) and the pass resumed at 4096 after all: the skipped picture on request
+    const b = [_]Image{.{ .at = 4000, .tokens = 200, .bytes = &.{ 200, 9 } }};
+    try e.submit(&b, 6144, woken.wake());
+    try std.testing.expect(e.ready(&b));
+    try std.testing.expectEqual(@as(u32, 1), fake.encodes.load(.acquire));
+    out.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 200), try e.take(&b, 0, gpa, &out));
+    try std.testing.expectEqual(@as(u32, 2), fake.encodes.load(.acquire));
+    try std.testing.expect(out.items.len == 4 * 200 and std.mem.allEqual(u8, out.items, 9));
+    e.forget(&b);
+}

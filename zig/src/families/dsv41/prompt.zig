@@ -175,10 +175,19 @@ pub const Engine = struct {
 
 /// A prompt chunk's buffers for up to `cap` rows (model.py _forward_k's and its steps' torch.empty's).
 /// An image span of the prompt: positions [at, at + len), its rows from row `row` of the image rows buffer.
-pub const Span = struct { at: usize, len: usize, row: usize };
+pub const Span = struct {
+    at: usize,
+    len: usize,
+    row: usize,
+
+    /// The image rows buffer's row for the span's position `pos`.
+    pub fn rowOf(sp: Span, pos: usize) usize {
+        return sp.row + (pos - sp.at);
+    }
+};
 
 /// The rows [r0, r1) of the chunk (relative to its start) a span covers, if any.
-fn overlap(sp: Span, start: usize, n: usize) ?[2]usize {
+pub fn overlap(sp: Span, start: usize, n: usize) ?[2]usize {
     const lo = @max(sp.at, start);
     const hi = @min(sp.at + sp.len, start + n);
     return if (lo < hi) .{ lo - start, hi - start } else null;
@@ -762,7 +771,7 @@ pub fn embedSpans(e: *const Engine, ch: *Chunk) !void {
     const row = c.hidden * 2;
     for (ch.spans) |sp| {
         const o = overlap(sp, ch.start, ch.n) orelse continue;
-        const src = ch.img_rows + (sp.row + (ch.start + o[0] - sp.at)) * row;
+        const src = ch.img_rows + sp.rowOf(ch.start + o[0]) * row;
         for (0..c.hc) |s| try e.ops.copyRows(e.s, src, row, ch.h + (o[0] * c.hc + s) * row, c.hc * row, row, o[1] - o[0]);
     }
 }
