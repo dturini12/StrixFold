@@ -133,6 +133,8 @@ pub const Info = struct {
     prefill_step: u32 = 0,
     /// A prompt pass reads this long between rounds while other streams decode (0: a whole pass at once).
     fill_slice_ns: u64 = 0,
+    /// Between a paused pass's slices a queued prompt of at most this many tokens, no images, reads whole (0: none).
+    fill_cut_in: u32 = 0,
     /// A line the server prints once at startup (the engine's memory plan); empty: none.
     startup: []const u8 = "",
     /// The reasoning efforts the family's template takes as numbers: each name passes as asked and the template hears

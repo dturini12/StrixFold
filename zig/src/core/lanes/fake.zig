@@ -47,7 +47,9 @@ pub const Fake = struct {
     prefill_hook_ctx: ?*anyopaque = null,
     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
     refuse_full: usize = 0, // prefill refuses this many times with error.ContextFull while another lane is live
+    refuse_hook: ?*const fn (ctx: *anyopaque, s: *Stream) void = null, // called as it refuses one for room
     slice_chunks: usize = 0, // prefill_slice reads this many chunks a call short of a whole pass (0: all)
+    fail_round: std.atomic.Value(bool) = .init(false), // set (any thread): the next round fails with error.RoundFailed
 
     pub fn deinit(x: *Fake) void {
         var it = x.lanes.valueIterator();
@@ -118,11 +120,18 @@ pub const Fake = struct {
             if (x.refuse_sampled and s.sampling != null) return error.SamplingRefused;
             if (x.refuse_full > 0 and x.lanes.count() > 0 and !x.lanes.contains(s)) {
                 x.refuse_full -= 1;
+                if (x.refuse_hook) |hook| hook(x.prefill_hook_ctx.?, s);
                 return error.ContextFull;
             }
             const got = try x.lanes.getOrPut(x.gpa, s);
             if (got.found_existing) freeLane(x.gpa, got.value_ptr);
             got.value_ptr.* = .{ .filled = 0 };
+            s.cached = 0;
+            if (s.reuse.saved) |saved| { // restored before the first chunk, as a lane backend restores
+                const kept: *std.ArrayList(u32) = @ptrCast(@alignCast(saved));
+                try got.value_ptr.history.appendSlice(x.gpa, kept.items);
+                s.cached = s.reuse.at;
+            }
         }
         const l = x.lane(s);
         const per = if (budget_ns == std.math.maxInt(u64) or x.slice_chunks == 0) chunks else x.slice_chunks;
@@ -136,13 +145,7 @@ pub const Fake = struct {
         }
         if (l.filled.? < chunks) return false;
         l.filled = null;
-        const h = &l.history;
-        s.cached = 0;
-        if (s.reuse.saved) |saved| { // the kept state's tokens stand in for the prompt's first `at`
-            const kept: *std.ArrayList(u32) = @ptrCast(@alignCast(saved));
-            try h.appendSlice(x.gpa, kept.items);
-            s.cached = s.reuse.at;
-        }
+        const h = &l.history; // (the kept state's tokens stand in for the prompt's first `at`)
         for (s.prompt()[h.items.len..], h.items.len + 1..) |t, at| {
             try h.append(x.gpa, t);
             if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(at));
@@ -184,6 +187,7 @@ pub const Fake = struct {
 
     fn verify(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const x = self(ptr);
+        if (x.fail_round.swap(false, .acq_rel)) return error.RoundFailed;
         x.rounds += 1;
         x.max_verify_streams = @max(x.max_verify_streams, windows.len);
         var total_rows: usize = 0;
