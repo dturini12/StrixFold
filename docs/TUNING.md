@@ -57,3 +57,10 @@ for the others between slices. Beside three answering chats, a 100K prompt left 
 against 71 s when read whole, and itself took 76 s instead of 72. A shorter slice gives the others more rounds, down to
 one chunk a slice (where 500 and 1,000 already are); 2,000 reads a little faster and makes them wait up to 3 s. 0 reads
 every prompt whole.
+
+A request that arrives while such a prompt is being read waits for the whole read, minutes for a very long one.
+`FILL_CUT_IN=4096` lets a waiting request of at most that many prompt tokens, without images, go first: between two
+slices its prompt is read whole and it starts answering, then the long read goes on. One request cuts in per slice, so
+the long read never stops, and it needs a free stream slot and room in the pool like any request. The others wait for
+the short prompt's read on top of the slice, so keep the size small. With it set, a long prompt is read in slices even
+when nothing else is answering, so that a request can cut in. It is off by default and needs `FILL_SLICE_MS` above 0.
