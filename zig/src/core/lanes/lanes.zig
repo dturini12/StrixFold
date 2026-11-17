@@ -14,6 +14,7 @@ pub const gpu_full = @import("gpu_full.zig");
 pub const depth = @import("depth.zig");
 pub const config = @import("config.zig");
 pub const stream = @import("stream.zig");
+pub const image_key = @import("image_key.zig");
 pub const backend = @import("backend.zig");
 pub const events = @import("events.zig");
 pub const windows = @import("windows.zig");

@@ -6,6 +6,7 @@ const core = @import("core");
 const model = @import("model.zig");
 const identity_mod = @import("disk_identity.zig");
 const pd = core.prompt_disk;
+const image_key = @import("lanes").image_key;
 const Key = pd.Key;
 const Model = model.Model;
 
@@ -104,6 +105,27 @@ pub const Parts = identity_mod.Parts;
 pub const identityText = identity_mod.identityText;
 pub const seedText = identity_mod.seedText;
 
+/// pd.chain with each block's pictures: H_j also hashes (at, len, whole digest) of every span that meets block j.
+pub fn chainKeys(h0: Key, ids: []const u8, spans: []const image_key.KeySpan, out: []Key) void {
+    if (spans.len == 0) return pd.chain(h0, ids, block_tokens * 4, out);
+    std.debug.assert(out.len * block_tokens * 4 <= ids.len);
+    var prev = h0;
+    for (out, 0..) |*o, i| {
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update(&prev);
+        h.update(ids[i * block_tokens * 4 ..][0 .. block_tokens * 4]);
+        for (spans) |sp| if (sp.at < (i + 1) * block_tokens and @as(usize, sp.at) + sp.len > i * block_tokens) {
+            var b: [8]u8 = undefined;
+            std.mem.writeInt(u32, b[0..4], sp.at, .little);
+            std.mem.writeInt(u32, b[4..8], sp.len, .little);
+            h.update(&b);
+            h.update(&sp.digest);
+        };
+        o.* = h.finalResult();
+        prev = o.*;
+    }
+}
+
 /// One rank's tier: the store, the planes, the current prompt pass's chain of keys, and buffers for a resume.
 pub const Disk = struct {
     gpa: std.mem.Allocator,
@@ -163,14 +185,14 @@ pub const Disk = struct {
         d.gpa.destroy(d);
     }
 
-    /// A prompt pass begins on `ids` (rank 1: its sequence as rank 0 sent it): the keys of its whole blocks.
-    pub fn beginPass(d: *Disk, ids: []const u8) void {
+    /// A prompt pass begins on key ids `ids` with pictures `spans` (rank 1: as rank 0 sent them): its blocks' keys.
+    pub fn beginPass(d: *Disk, ids: []const u8, spans: []const image_key.KeySpan) void {
         const n = ids.len / 4 / block_tokens;
         d.chain.resize(d.gpa, n) catch {
             d.chain.clearRetainingCapacity();
             return;
         };
-        pd.chain(d.h0, ids, block_tokens * 4, d.chain.items);
+        chainKeys(d.h0, ids, spans, d.chain.items);
         d.passing = true;
         d.streaming = false;
         d.streamed = 0;

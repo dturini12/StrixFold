@@ -14,11 +14,13 @@ pub const Tower = struct {
 
 const Job = struct {
     key: usize, // the request's images.ptr
-    payloads: [][]align(16) u8, // copies of the pictures' payloads (empty: an image whose rows came ready)
+    payloads: [][]align(16) u8, // copies of the pictures to encode (empty: rows came ready, skipped, or encoded)
     tokens: []usize, // each picture's span, as its encode returned it
-    ends: []usize, // where each image's rows end in `rows`
+    ranges: [][2]usize, // where each image's rows begin and end in `rows`
+    skipped: []bool, // a resume covers its span: encoded only when a prompt pass asks for it (take)
     rows: std.ArrayList(u8) = .empty,
     state: enum { queued, running, done } = .queued,
+    urgent: bool = false, // a prompt pass waits for it: the thread takes it first
     err: ?anyerror = null,
     gone: bool = false, // forgotten while it ran: the thread frees it
     wake: Wake,
@@ -31,6 +33,7 @@ pub const Encoder = struct {
     cap: usize, // a request's image rows at most (Model.image_rows_reserved): more fail at once, nothing encoded
     mutex: std.Io.Mutex = .init,
     cond: std.Io.Condition = .init,
+    done: std.Io.Condition = .init, // a job finished (a prompt pass waits in take)
     jobs: std.ArrayList(*Job) = .empty,
     closing: bool = false,
     thread: ?std.Thread = null,
@@ -48,6 +51,7 @@ pub const Encoder = struct {
         e.lock();
         e.closing = true;
         e.cond.broadcast(e.io);
+        e.done.broadcast(e.io);
         e.unlock();
         if (e.thread) |t| t.join();
         e.thread = null;
@@ -64,8 +68,8 @@ pub const Encoder = struct {
         return @ptrCast(@alignCast(ctx));
     }
 
-    fn startFn(ctx: *anyopaque, images: []const Image, wake: Wake) void {
-        of(ctx).submit(images, wake) catch |err| std.log.err("encoder: a request's pictures not queued ({s})", .{@errorName(err)});
+    fn startFn(ctx: *anyopaque, images: []const Image, from: u32, wake: Wake) void {
+        of(ctx).submit(images, from, wake) catch |err| std.log.err("encoder: a request's pictures not queued ({s})", .{@errorName(err)});
     }
 
     fn readyFn(ctx: *anyopaque, images: []const Image) bool {
@@ -84,24 +88,33 @@ pub const Encoder = struct {
         e.mutex.unlock(e.io);
     }
 
-    /// Queues a request's pictures, their payloads copied (the request may end before its encode does).
-    pub fn submit(e: *Encoder, images: []const Image, wake: Wake) !void {
+    /// Queues a request's pictures past `from` (a resume covers the rest), payloads copied (the request may end first).
+    pub fn submit(e: *Encoder, images: []const Image, from: u32, wake: Wake) !void {
         const j = try e.gpa.create(Job);
-        j.* = .{ .key = @intFromPtr(images.ptr), .payloads = &.{}, .tokens = &.{}, .ends = &.{}, .wake = wake };
+        j.* = .{ .key = @intFromPtr(images.ptr), .payloads = &.{}, .tokens = &.{}, .ranges = &.{}, .skipped = &.{}, .wake = wake };
         errdefer e.free(j);
         j.payloads = try e.gpa.alloc([]align(16) u8, images.len);
         for (j.payloads) |*p| p.* = &.{};
         j.tokens = try e.gpa.alloc(usize, images.len);
-        j.ends = try e.gpa.alloc(usize, images.len);
+        @memset(j.tokens, 0);
+        j.ranges = try e.gpa.alloc([2]usize, images.len);
+        @memset(j.ranges, .{ 0, 0 });
+        j.skipped = try e.gpa.alloc(bool, images.len);
+        @memset(j.skipped, false);
         var rows: usize = 0;
         for (images) |img| rows += img.tokens;
+        var any = false;
         if (rows > e.cap) {
             j.state = .done;
             j.err = error.TooManyImageRows;
-        } else for (images, j.payloads) |img, *p| if (!img.rows) {
+        } else for (images, j.payloads, j.skipped) |img, *p, *skip| {
+            skip.* = !img.rows and @as(usize, img.at) + img.tokens <= from;
+            if (img.rows or skip.*) continue;
             p.* = try e.gpa.alignedAlloc(u8, .@"16", img.bytes.len);
             @memcpy(p.*, img.bytes);
-        };
+            any = true;
+        }
+        if (!any and j.err == null) j.state = .done; // nothing to encode now
         e.lock();
         defer e.unlock();
         try e.jobs.append(e.gpa, j);
@@ -116,15 +129,32 @@ pub const Encoder = struct {
         return j.state == .done;
     }
 
-    /// Appends image `k`'s rows to `out` and returns its span; the encode's error when it failed.
+    /// Appends image `k`'s rows to `out` and returns its span (a skipped one encoded now, the caller waiting).
     pub fn take(e: *Encoder, images: []const Image, k: usize, gpa: Allocator, out: *std.ArrayList(u8)) !usize {
         e.lock();
         defer e.unlock();
         const j = e.find(images) orelse return error.NotEncoded;
         if (j.state != .done) return error.NotEncoded;
         if (j.err) |err| return err;
-        try out.appendSlice(gpa, j.rows.items[if (k == 0) 0 else j.ends[k - 1]..j.ends[k]]);
+        if (j.skipped[k]) try e.encodeNow(j, k, images[k].bytes);
+        try out.appendSlice(gpa, j.rows.items[j.ranges[k][0]..j.ranges[k][1]]);
         return j.tokens[k];
+    }
+
+    /// Picture `k` of a done job queued first and waited for (the lock held).
+    fn encodeNow(e: *Encoder, j: *Job, k: usize, bytes: []const u8) !void {
+        const p = try e.gpa.alignedAlloc(u8, .@"16", bytes.len);
+        @memcpy(p, bytes);
+        j.payloads[k] = p;
+        j.skipped[k] = false;
+        j.state = .queued;
+        j.urgent = true;
+        e.cond.signal(e.io);
+        while (j.state != .done) {
+            if (e.closing) return error.Closed;
+            e.done.waitUncancelable(e.io, &e.mutex);
+        }
+        if (j.err) |err| return err;
     }
 
     /// Drops a request's job; one being encoded is freed by the thread when its picture is done.
@@ -169,7 +199,8 @@ pub const Encoder = struct {
         e.freePayloads(j);
         e.gpa.free(j.payloads);
         e.gpa.free(j.tokens);
-        e.gpa.free(j.ends);
+        e.gpa.free(j.ranges);
+        e.gpa.free(j.skipped);
         j.rows.deinit(e.gpa);
         e.gpa.destroy(j);
     }
@@ -179,9 +210,7 @@ pub const Encoder = struct {
         e.lock();
         defer e.unlock();
         while (!e.closing) {
-            const j = for (e.jobs.items) |x| {
-                if (x.state == .queued) break x;
-            } else {
+            const j = e.next() orelse {
                 e.cond.waitUncancelable(e.io, &e.mutex);
                 continue;
             };
@@ -195,8 +224,10 @@ pub const Encoder = struct {
             } else |x| err = x;
             e.lock();
             j.state = .done;
+            j.urgent = false;
             j.err = err;
             e.freePayloads(j);
+            e.done.broadcast(e.io);
             if (j.gone) {
                 e.remove(j);
                 e.free(j);
@@ -209,12 +240,23 @@ pub const Encoder = struct {
         }
     }
 
+    /// The queued job a prompt pass waits for, else the first queued (the lock held).
+    fn next(e: *Encoder) ?*Job {
+        var first: ?*Job = null;
+        for (e.jobs.items) |x| if (x.state == .queued) {
+            if (x.urgent) return x;
+            if (first == null) first = x;
+        };
+        return first;
+    }
+
     fn encode(e: *Encoder, j: *Job) !void {
-        for (j.payloads, j.tokens, j.ends) |p, *t, *end| {
-            if (p.len > 0 and e.stopped(j)) return error.EncodeCancelled;
-            t.* = if (p.len > 0) try e.tower.rows(e.tower.ctx, p, e.gpa, &j.rows) else 0;
-            end.* = j.rows.items.len;
-        }
+        for (j.payloads, j.tokens, j.ranges) |p, *t, *r| if (p.len > 0) {
+            if (e.stopped(j)) return error.EncodeCancelled;
+            const begin = j.rows.items.len;
+            t.* = try e.tower.rows(e.tower.ctx, p, e.gpa, &j.rows);
+            r.* = .{ begin, j.rows.items.len };
+        };
     }
 };
 
@@ -267,7 +309,7 @@ test "an encoder hands each request its pictures' rows in order, the rows that c
     defer e.stop();
     var woken: Woken = .{};
     const a = [_]Image{ .{ .at = 0, .tokens = 2, .bytes = &.{ 2, 7 } }, .{ .at = 3, .tokens = 1, .bytes = "rows", .rows = true }, .{ .at = 5, .tokens = 3, .bytes = &.{ 3, 9 } } };
-    try e.submit(&a, woken.wake());
+    try e.submit(&a, 0, woken.wake());
     waitReady(&e, &a);
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
@@ -293,8 +335,8 @@ test "a request forgotten while its picture encodes is freed by the thread, unwo
     var woken: Woken = .{};
     const a = [_]Image{.{ .at = 0, .tokens = 1, .bytes = &.{ 1, 1 } }};
     const b = [_]Image{.{ .at = 0, .tokens = 1, .bytes = &.{ 1, 2 } }};
-    try e.submit(&a, woken.wake());
-    try e.submit(&b, woken.wake());
+    try e.submit(&a, 0, woken.wake());
+    try e.submit(&b, 0, woken.wake());
     while (true) { // the thread has taken a
         e.lock();
         const running = e.jobs.items[0].state == .running;
@@ -325,7 +367,7 @@ test "a failed encode is the request's error at its prompt pass" {
     defer e.stop();
     var woken: Woken = .{};
     const a = [_]Image{.{ .at = 0, .tokens = 1, .bytes = &.{ 1, 1 } }};
-    try e.submit(&a, woken.wake());
+    try e.submit(&a, 0, woken.wake());
     waitReady(&e, &a);
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
@@ -341,7 +383,7 @@ test "a request over the image row cap fails at once, its pictures never encoded
     defer e.stop();
     var woken: Woken = .{};
     const a = [_]Image{ .{ .at = 0, .tokens = 3, .bytes = &.{ 3, 1 } }, .{ .at = 4, .tokens = 2, .bytes = &.{ 2, 1 } } };
-    try e.submit(&a, woken.wake());
+    try e.submit(&a, 0, woken.wake());
     try std.testing.expect(e.ready(&a));
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
@@ -364,7 +406,7 @@ test "a request of four pictures forgotten during its first stops before the sec
     try e.start();
     defer e.stop();
     var woken: Woken = .{};
-    try e.submit(&four, woken.wake());
+    try e.submit(&four, 0, woken.wake());
     waitEntered(&fake);
     e.forget(&four);
     fake.hold.store(false, .release);
@@ -391,7 +433,7 @@ test "stopping the encoder during the first of four pictures waits for that pict
         e.stop();
     };
     var woken: Woken = .{};
-    try e.submit(&four, woken.wake());
+    try e.submit(&four, 0, woken.wake());
     waitEntered(&fake);
     const stopper = try std.Thread.spawn(.{}, Encoder.stop, .{&e});
     while (true) {
@@ -405,4 +447,35 @@ test "stopping the encoder during the first of four pictures waits for that pict
     stopper.join();
     joined = true;
     try std.testing.expectEqual(@as(u32, 1), fake.encodes.load(.acquire));
+}
+
+test "pictures a resume covers are not encoded at submit; one its pass still asks for is encoded then" {
+    const gpa = std.testing.allocator;
+    var fake: Fake = .{};
+    var e = Encoder.init(gpa, std.testing.io, fake.tower(), 16);
+    try e.start();
+    defer e.stop();
+    var woken: Woken = .{};
+    const a = [_]Image{ .{ .at = 0, .tokens = 2, .bytes = &.{ 2, 7 } }, .{ .at = 3, .tokens = 3, .bytes = &.{ 3, 8 } }, .{ .at = 8, .tokens = 1, .bytes = &.{ 1, 9 } } };
+    try e.submit(&a, 6, woken.wake()); // a resume at 6 covers the first two
+    waitReady(&e, &a);
+    try std.testing.expectEqual(@as(u32, 1), fake.encodes.load(.acquire));
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), try e.take(&a, 2, gpa, &out));
+    try std.testing.expectEqual(@as(u32, 1), fake.encodes.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 3), try e.take(&a, 1, gpa, &out)); // the resume fell short: encoded now
+    try std.testing.expectEqual(@as(u32, 2), fake.encodes.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 4 + 12), out.items.len);
+    try std.testing.expect(std.mem.allEqual(u8, out.items[0..4], 9) and std.mem.allEqual(u8, out.items[4..], 8));
+    out.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 3), try e.take(&a, 1, gpa, &out)); // again: its rows kept, no second encode
+    try std.testing.expectEqual(@as(usize, 12), out.items.len);
+    try std.testing.expectEqual(@as(u32, 2), fake.encodes.load(.acquire));
+    const b = [_]Image{.{ .at = 0, .tokens = 2, .bytes = &.{ 2, 5 } }};
+    try e.submit(&b, 2, woken.wake()); // every picture covered: ready at once, nothing encoded
+    try std.testing.expect(e.ready(&b));
+    try std.testing.expectEqual(@as(u32, 2), fake.encodes.load(.acquire));
+    e.forget(&a);
+    e.forget(&b);
 }

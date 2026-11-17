@@ -51,8 +51,8 @@ const HipKit = if (gpu.backend == .hip) *gpu.Kit else void;
 pub const chunk_rows = 2048;
 
 /// The version of lanes.zig's frames, rank 0 to rank 1 (the handshake compares it): 2 since fill_chunk carries rank 0's
-/// read-ahead plan; 3 since pass carries draft sampling keys; 5 since a pass may pause (4: the image-keyed cache's).
-pub const frame_protocol = 5;
+/// read-ahead plan; 3 since pass carries draft sampling keys; 5 since a pass may pause; 6 since fill_begin's pictures.
+pub const frame_protocol = 6;
 
 /// The prompt chunk buffers' rows: one of chunk_rows, or two halves when chunks split (TF_DS_PREFILL_SPLIT).
 pub fn chunkCaps(split_min: usize) [2]usize {

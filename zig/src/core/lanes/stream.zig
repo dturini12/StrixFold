@@ -2,6 +2,7 @@
 const std = @import("std");
 const shape = @import("shape.zig");
 const plan_lanes = @import("plan_lanes.zig");
+const image_key = @import("image_key.zig");
 const Allocator = std.mem.Allocator;
 const Proposer = @import("proposer.zig").Proposer;
 const Sampling = @import("sampling.zig").Sampling;
@@ -105,6 +106,7 @@ pub const Image = struct {
     tokens: u32,
     bytes: []const u8,
     rows: bool = false,
+    digest: ?image_key.Digest = null, // the picture's identity for the prompt caches (null: not taken yet)
 };
 
 /// A vision family's image input as a server renders it (engine_api.Info.vision): each image part becomes
@@ -131,7 +133,8 @@ pub const Vision = struct {
 /// Off-thread encodes: `start` at submit, `ready` before admission (false: it waits), `forget` once the rows are taken.
 pub const Encode = struct {
     ctx: *anyopaque,
-    start: *const fn (ctx: *anyopaque, images: []const Image, wake: Wake) void,
+    // spans that end by `from` (where the prompt cache would resume) are encoded only if the prompt pass asks for them
+    start: *const fn (ctx: *anyopaque, images: []const Image, from: u32, wake: Wake) void,
     ready: *const fn (ctx: *anyopaque, images: []const Image) bool,
     forget: *const fn (ctx: *anyopaque, images: []const Image) void,
 };
@@ -157,6 +160,8 @@ pub const Spec = struct {
     chunks: []const u32 = &.{}, // where prefill chunks start after 0 (Python's PrefillPlan); empty: the backend's step
     reuse: Reuse = .{},
     images: []const Image = &.{}, // in prompt order; the caller's until the stream is released
+    cache_key: []const u32 = &.{}, // with images: the ids the prompt caches key it by (empty: none kept or resumed)
+    cache_spans: []const image_key.KeySpan = &.{}, // with images: each picture's span and whole digest
     structure: ?Structure = null, // the grammar every reply token keeps to (a backend's draws enforce it)
 };
 
@@ -179,6 +184,8 @@ pub const Stream = struct {
     chunks: []const u32,
     reuse: Reuse = .{},
     images: []const Image = &.{},
+    cache_key: []const u32 = &.{},
+    cache_spans: []const image_key.KeySpan = &.{},
     structure: ?Structure = null,
     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
@@ -236,6 +243,8 @@ pub const Stream = struct {
             .chunks = spec.chunks,
             .reuse = spec.reuse,
             .images = spec.images,
+            .cache_key = spec.cache_key,
+            .cache_spans = spec.cache_spans,
             .structure = spec.structure,
         };
         try s.context.appendSlice(gpa, spec.prompt);

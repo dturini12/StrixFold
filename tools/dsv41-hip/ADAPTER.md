@@ -414,6 +414,8 @@ tower on rank 0. Everything above about `text` still holds: a text rank opens, l
   its rows are ready; queued requests without images go first meanwhile, in their order, and other streams keep
   decoding. The prompt pass then takes the ready rows (it never runs the tower). A cancelled request's job is dropped
   (one being encoded is freed when its picture is done); a failed encode is that request's error at its prompt pass.
+  Pictures whose spans end before the RAM prompt cache's resume point at submit are not encoded; if the pass resumes
+  earlier (the state was evicted, went stale, or a disk resume failed), it asks the thread for them and waits.
 - **A request's limits** (each refusal a 400 `invalid_request_error`, before the request queues):
   - **Count:** at most `--vision-max-images` image parts (32 unless set; serve.conf `MAX_IMAGES`), every message's
     included (earlier turns, tool results). They are counted before any part's base64 is read, on every image route
@@ -427,8 +429,9 @@ tower on rank 0. Everything above about `text` still holds: a text rank opens, l
     42,924:1 or taller) is refused, as Pillow refuses a resize to a zero side.
   - A picture's decode buffers (RGB, padded RGB, patches) are freed once it is prepared; the request keeps only its
     payload (the grid and bf16 patches, at most about 11 MB for a 1,024-token picture).
-- **Behaviour:** an image prompt skips the RAM prompt cache, sf-disk and the reuse hook (its tokens are
-  placeholders); a 1920x1080 picture encodes in about 2.9 s on gfx1151 (measured with the tower on the engine thread).
+- **Behaviour:** an image prompt is kept and resumed by the RAM and disk prompt caches, keyed by each picture's
+  BLAKE3-256 digest (span key ids, and the whole digests in a kept state's seal and in each disk block's chain key);
+  a 1920x1080 picture encodes in about 2.9 s on gfx1151 (measured with the tower on the engine thread).
   PNG decodes in Zig; other formats need Python 3 with Pillow (the runtime image's `rocm10.0-vision` tag).
 
 ## 9. Build

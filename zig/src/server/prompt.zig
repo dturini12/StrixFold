@@ -68,13 +68,58 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
         .ids => |ids| return .{ .ids = ids },
     };
     const schema = try schemaOf(srv, cx.a, input.fields.get("response_format"));
-    if (input.images.len > 0) return renderImages(srv, cx, input.messages, input.tools, thinking, effort, true, input.images, schema);
+    if (input.images.len > 0) {
+        const vision = srv.info.vision orelse return cx.refuse("image input: this engine has no vision hook");
+        const tagged = try imageIdentities(cx, input.messages, vision.placeholder, input.images.len);
+        const plain = if (schema) |v| try escapedSchema(cx, v, vision.placeholder) else null;
+        const raw = try renderNormalizedIds(srv, cx, tagged, input.tools, thinking, effort, true, plain);
+        const raw_history = try renderNormalizedIds(srv, cx, tagged, input.tools, thinking, effort, false, plain);
+        var r = try spans(srv, cx, raw, input.images);
+        r.history_len = expandedAt(raw, historyLen(raw, raw_history), vision.token, r.images);
+        return r;
+    }
     const prompt = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, true, schema);
     const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false, schema);
-    var history_len: usize = 0;
-    if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) history_len = history.len;
-    if (history_len == 0 and prompt.len > 1 and std.mem.eql(u32, history, prompt)) history_len = prompt.len - 1; // a template with no generation suffix
-    return .{ .ids = prompt, .history_len = history_len };
+    return .{ .ids = prompt, .history_len = historyLen(prompt, history) };
+}
+
+/// The prompt's history length: the generation-free rendering when it is the prompt's prefix (0: none).
+fn historyLen(prompt: []const u32, history: []const u32) usize {
+    if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) return history.len;
+    if (prompt.len > 1 and std.mem.eql(u32, history, prompt)) return prompt.len - 1; // a template with no generation suffix
+    return 0;
+}
+
+/// Where rendered position `at` (each image its delimited identity) lands among the spans `images`; 0 inside one.
+fn expandedAt(raw: []const u32, at: usize, token: u32, images: []const api.Image) usize {
+    var out: usize = 0;
+    var i: usize = 0;
+    var k: usize = 0;
+    while (i < at) {
+        if (raw[i] != token) {
+            out += 1;
+            i += 1;
+            continue;
+        }
+        const end = std.mem.indexOfScalarPos(u32, raw, i + 1, token) orelse return 0;
+        if (end >= at or k >= images.len) return 0;
+        out += images[k].tokens;
+        k += 1;
+        i = end + 1;
+    }
+    return out;
+}
+
+test "an image prompt's history length moves past the spans before it" {
+    const img = [_]api.Image{ .{ .at = 1, .tokens = 4, .bytes = "" }, .{ .at = 7, .tokens = 3, .bytes = "" } };
+    const raw = [_]u32{ 5, 99, 40, 99, 6, 99, 41, 99, 7, 8 }; // 5 [img0] 6 [img1] 7 | 8 (generation)
+    try std.testing.expectEqual(@as(usize, 1 + 4 + 1 + 3 + 1), expandedAt(&raw, 9, 99, &img));
+    try std.testing.expectEqual(@as(usize, 1), expandedAt(&raw, 1, 99, &img));
+    try std.testing.expectEqual(@as(usize, 1 + 4 + 1), expandedAt(&raw, 5, 99, &img));
+    try std.testing.expectEqual(@as(usize, 0), expandedAt(&raw, 3, 99, &img)); // inside a delimited identity
+    try std.testing.expectEqual(@as(usize, 0), expandedAt(&raw, 0, 99, &img));
+    try std.testing.expectEqual(@as(usize, 9), historyLen(&raw, raw[0..9]));
+    try std.testing.expectEqual(@as(usize, 0), historyLen(&raw, &.{ 5, 1 }));
 }
 
 /// Render authenticated image messages after normalizeImages has escaped literal placeholders.
@@ -161,7 +206,8 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8) er
             error.OutOfMemory => return error.OutOfMemory,
             error.BadImage => return cx.refuse(problem),
         };
-        try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = prep.tokens, .bytes = prep.payload });
+        // the digest once here: the prompt caches key the span by it on every turn that carries the picture
+        try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = prep.tokens, .bytes = prep.payload, .digest = api.prompt_cache.imageDigest(prep.payload) });
         try out.appendNTimes(cx.a, vision.token, prep.tokens);
         // the limits refuse at the picture that crosses them, before any later one is decoded
         pixels += prep.pixels;

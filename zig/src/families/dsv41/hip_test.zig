@@ -65,6 +65,7 @@ test {
     _ = @import("stop_marker.zig");
     _ = @import("disk.zig");
     _ = @import("disk_test.zig");
+    _ = @import("fill_spans.zig");
     _ = @import("native.zig");
     _ = @import("hipblas.zig");
     _ = @import("hip_load.zig");

@@ -33,6 +33,7 @@ test {
     _ = @import("listener.zig");
     _ = @import("hub.zig");
     _ = @import("chunk_plan.zig");
+    _ = @import("prompt.zig");
     _ = @import("status_routes.zig");
     _ = @import("log.zig");
     _ = @import("messages.zig");

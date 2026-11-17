@@ -18,7 +18,7 @@ const Tower = struct {
     forgets: std.atomic.Value(u32) = .init(0),
     wake: ?lanes.stream.Wake = null,
 
-    fn start(ctx: *anyopaque, _: []const Image, wake: lanes.stream.Wake) void {
+    fn start(ctx: *anyopaque, _: []const Image, _: u32, wake: lanes.stream.Wake) void {
         const t: *Tower = @ptrCast(@alignCast(ctx));
         t.wake = wake;
         _ = t.starts.fetchAdd(1, .acq_rel);
