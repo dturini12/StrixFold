@@ -498,7 +498,7 @@ pub const Snap = struct {
     stale: bool = false,
     wanted: u64 = 0, // when a request first waited for the live stream that holds these rows (placeKept; 0: none)
     end: usize = 0, // the extent end of the stream that kept it (placement holds [base, end) back while room allows)
-    path: u64 = 0, // its tokens [0, at) hashed (pathKey): keptOver tells this prompt's own longer states from others'
+    path: u64 = 0, // its key ids [0, at) hashed (pathKey): keptOver tells this prompt's own longer states from others'
 };
 
 /// Kept states this long or longer say so in the log when they go stale (their prompts then run again from 0).
@@ -508,9 +508,19 @@ fn noteStale(sn: *const Snap, why: []const u8) void {
     if (sn.at >= note_rows) std.log.info("dsv41: the kept state of {d} tokens at {d} goes stale: {s}", .{ sn.at, sn.base, why });
 }
 
-/// A kept state's tokens hashed: a longer state in a resume's extent is the prompt's own when its path matches.
-fn pathKey(ids: []const u32) u64 {
-    return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(ids));
+/// A kept state's key ids and its pictures' whole digests hashed: a longer state on a resume's path is its prompt's.
+fn pathKey(key: []const u32, spans: []const image_key.KeySpan) u64 {
+    var h = std.hash.Wyhash.init(0);
+    h.update(std.mem.sliceAsBytes(key));
+    const seal = image_key.sealOf(spans, key.len);
+    if (!std.mem.allEqual(u8, &seal, 0)) h.update(&seal);
+    return h.final();
+}
+
+/// The ids a stream's kept states are keyed by: its prompt's, or with images the host's key (null: none made).
+fn keyOf(s: *const lanes.Stream) ?[]const u32 {
+    if (s.images.len == 0) return s.prompt();
+    return if (s.cache_key.len == s.prompt_len and s.cache_spans.len == s.images.len) s.cache_key else null;
 }
 
 /// Why a kept state does not restore for a prompt (Lanes.refusal).
@@ -756,8 +766,8 @@ pub const Lanes = struct {
         // with the kept rows copied there when a live stream holds that extent (a burst's second request on a prompt)
         s.cached = 0;
         // kept states are keyed by the prompt's ids, or with images the host's key (none: nothing kept or resumed)
-        const keyed = s.images.len == 0 or (s.cache_key.len == len and s.cache_spans.len == s.images.len);
-        const key: []const u32 = if (s.images.len == 0) ids else s.cache_key;
+        const keyed = keyOf(s) != null;
+        const key: []const u32 = keyOf(s) orelse ids;
         var kept: ?*Snap = null;
         var moved = false;
         var why: []const u8 = "no kept state"; // (the pass line's reason for running from 0)
@@ -774,7 +784,7 @@ pub const Lanes = struct {
                 // in place unless the extent runs past the pool, a live stream holds it, or another kept state has
                 // rows past the kept ones (resuming there would stale it: the rows go to a free extent instead, as
                 // the Python lane's _place resumes "here" only in a free extent)
-                moved = sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size) or self.keptOver(sn.base + sn.at, sn.base + size, sn, ids);
+                moved = sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size) or self.keptOver(sn.base + sn.at, sn.base + size, sn, key, s.cache_spans);
             }
         }
         // sf-disk: a state on disk past the kept one in memory (after a restart, or when the kept rows went stale)
@@ -1277,10 +1287,10 @@ pub const Lanes = struct {
         self.snaps.appendAssumeCapacity(sn);
     }
 
-    /// Whether a kept state besides `except` has rows in [lo, hi): another extent's, or one off the path of `ids`.
-    fn keptOver(self: *const Lanes, lo: usize, hi: usize, except: *const Snap, ids: []const u32) bool {
+    /// Whether a kept state besides `except` has rows in [lo, hi): another extent's, or one off the path of `key`.
+    fn keptOver(self: *const Lanes, lo: usize, hi: usize, except: *const Snap, key: []const u32, spans: []const image_key.KeySpan) bool {
         for (self.snaps.items) |sn| if (sn != except and !sn.stale and sn.base < hi and lo < sn.base + sn.at) {
-            const own = sn.base == except.base and sn.at <= ids.len and sn.path == pathKey(ids[0..sn.at]);
+            const own = sn.base == except.base and sn.at <= key.len and sn.path == pathKey(key[0..sn.at], spans);
             if (!own) return true;
         };
         return false;
@@ -1320,9 +1330,10 @@ pub const Lanes = struct {
         const s: *const lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
         const l = self.streams.getPtr(s) orelse return error.UnknownStream;
         if (at == 0 or at % model.chunk_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
+        const key = keyOf(s) orelse return error.NoCacheKey; // (a prompt with images and no key keeps nothing)
         const sn = try self.gpa.create(Snap);
         errdefer self.gpa.destroy(sn);
-        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .path = pathKey(s.prompt()[0..at]), .buf = try gpu.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()) };
+        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .path = pathKey(key[0..at], s.cache_spans), .buf = try gpu.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()) };
         errdefer sn.buf.free();
         try self.snaps.append(self.gpa, sn);
         errdefer _ = self.snaps.pop(); // (the errdefers above free it: the list must not keep it)
@@ -2237,14 +2248,14 @@ test "retained histories preserve their replay and output reservations (PR #10: 
     }
     // All eight 100K histories can resume within their reservations without invalidating a neighbor.
     for (&snapshots) |*sn| {
-        try std.testing.expect(!ln.keptOver(sn.base + sn.at, sn.end, sn, &.{}));
+        try std.testing.expect(!ln.keptOver(sn.base + sn.at, sn.end, sn, &.{}, &.{}));
         ln.staleOver(sn.base + sn.at, sn.end, sn);
     }
     for (snapshots) |sn| try std.testing.expect(!sn.stale);
     // a larger continuation resumes in place within its room to grow
-    try std.testing.expect(!ln.keptOver(snapshots[0].at, 104448, &snapshots[0], &.{}));
+    try std.testing.expect(!ln.keptOver(snapshots[0].at, 104448, &snapshots[0], &.{}, &.{}));
     // past that room it would overwrite the next cached prefix, so it relocates
-    try std.testing.expect(ln.keptOver(snapshots[0].at, 102400 + growth_rows + 2048, &snapshots[0], &.{}));
+    try std.testing.expect(ln.keptOver(snapshots[0].at, 102400 + growth_rows + 2048, &snapshots[0], &.{}, &.{}));
     // At genuine capacity pressure, kept states may still be evicted; a live range never is.
     const live = [_][2]usize{.{ 0, 102400 }};
     try std.testing.expectEqual(@as(usize, 102400), try ln.placeKept(&live, 409600, null));
@@ -2267,17 +2278,60 @@ test "a resume from a shared cut moves when another conversation's longer state 
     const second = try std.testing.allocator.dupe(u32, first);
     defer std.testing.allocator.free(second);
     for (second[2 * c ..]) |*t| t.* +%= 7;
-    var cut: Snap = .{ .id = 1, .at = 2 * c, .base = 0, .end = 8 * c, .path = pathKey(first[0 .. 2 * c]), .buf = undefined };
-    var history: Snap = .{ .id = 2, .at = 5 * c, .base = 0, .end = 8 * c, .path = pathKey(first[0 .. 5 * c]), .buf = undefined };
+    var cut: Snap = .{ .id = 1, .at = 2 * c, .base = 0, .end = 8 * c, .path = pathKey(first[0 .. 2 * c], &.{}), .buf = undefined };
+    var history: Snap = .{ .id = 2, .at = 5 * c, .base = 0, .end = 8 * c, .path = pathKey(first[0 .. 5 * c], &.{}), .buf = undefined };
     try ln.snaps.append(std.testing.allocator, &cut);
     try ln.snaps.append(std.testing.allocator, &history);
     // the second conversation resuming the cut in place would overwrite the first one's history: it moves
-    try std.testing.expect(ln.keptOver(cut.base + cut.at, cut.base + 8 * c, &cut, second));
+    try std.testing.expect(ln.keptOver(cut.base + cut.at, cut.base + 8 * c, &cut, second, &.{}));
     // the first conversation's own next turn (its history extended) may resume the cut in place: the rows are its own
-    try std.testing.expect(!ln.keptOver(cut.base + cut.at, cut.base + 8 * c, &cut, first));
+    try std.testing.expect(!ln.keptOver(cut.base + cut.at, cut.base + 8 * c, &cut, first, &.{}));
     // a prompt shorter than the longer state is not on its path either
-    try std.testing.expect(ln.keptOver(cut.base + cut.at, cut.base + 8 * c, &cut, first[0 .. 4 * c]));
+    try std.testing.expect(ln.keptOver(cut.base + cut.at, cut.base + 8 * c, &cut, first[0 .. 4 * c], &.{}));
     // moved: the copy goes clear of both states' extents, and neither goes stale
+    try std.testing.expectEqual(@as(usize, 8 * c), try ln.placeKept(&.{}, 8 * c, &cut));
+    try std.testing.expect(!cut.stale and !history.stale);
+}
+
+test "two prompts alike but for a same-size picture are on different paths: neither resumes in place over the other's states" {
+    const c = model.chunk_rows;
+    const gpa = std.testing.allocator;
+    var m: Model = undefined;
+    m.pool_cap = 16 * c;
+    var ln: Lanes = .{ .gpa = gpa, .m = &m, .peer = null };
+    defer ln.snaps.deinit(gpa);
+    // the same ids for both: text, then a picture's span across the second chunk's end, then text
+    const ids = try gpa.alloc(u32, 6 * c);
+    defer gpa.free(ids);
+    for (ids, 0..) |*t, i| t.* = @intCast(i % 1000);
+    const at = 2 * c - 100;
+    @memset(ids[at..][0..300], 128815);
+    const sa = [_]image_key.KeySpan{.{ .at = at, .len = 300, .digest = image_key.imageDigest("picture A") }};
+    const sb = [_]image_key.KeySpan{.{ .at = at, .len = 300, .digest = image_key.imageDigest("picture B") }};
+    const ka = try image_key.keyIds(gpa, ids, &sa);
+    defer gpa.free(ka);
+    const kb = try image_key.keyIds(gpa, ids, &sb);
+    defer gpa.free(kb);
+    // a state before the picture is on both paths; one inside its span or past it is one picture's only
+    try std.testing.expectEqual(pathKey(ka[0..c], &sa), pathKey(kb[0..c], &sb));
+    try std.testing.expectEqual(pathKey(ids[0..c], &.{}), pathKey(ka[0..c], &sa));
+    for ([_]usize{ 2 * c, 3 * c, 5 * c }) |n| try std.testing.expect(pathKey(ka[0..n], &sa) != pathKey(kb[0..n], &sb));
+    // the whole digests decide, not the 31-bit key ids alone: A's key ids with B's picture are off A's path
+    try std.testing.expect(pathKey(ka[0 .. 3 * c], &sa) != pathKey(ka[0 .. 3 * c], &sb));
+    // conversation A kept the cut before the picture and its history past it, in one extent
+    var cut: Snap = .{ .id = 1, .at = c, .base = 0, .end = 8 * c, .path = pathKey(ka[0..c], &sa), .buf = undefined };
+    var history: Snap = .{ .id = 2, .at = 5 * c, .base = 0, .end = 8 * c, .path = pathKey(ka[0 .. 5 * c], &sa), .buf = undefined };
+    try ln.snaps.append(gpa, &cut);
+    try ln.snaps.append(gpa, &history);
+    // B resumes the cut (it holds no picture): in place it would write over A's history, so it moves
+    try std.testing.expect(ln.keptOver(cut.base + cut.at, cut.base + 8 * c, &cut, kb, &sb));
+    // A's own next turn resumes in place
+    try std.testing.expect(!ln.keptOver(cut.base + cut.at, cut.base + 8 * c, &cut, ka, &sa));
+    // and the other way round: B's history in the extent, A resuming the cut
+    history.path = pathKey(kb[0 .. 5 * c], &sb);
+    try std.testing.expect(ln.keptOver(cut.base + cut.at, cut.base + 8 * c, &cut, ka, &sa));
+    try std.testing.expect(!ln.keptOver(cut.base + cut.at, cut.base + 8 * c, &cut, kb, &sb));
+    // moved: the copy goes clear of both states, and neither goes stale
     try std.testing.expectEqual(@as(usize, 8 * c), try ln.placeKept(&.{}, 8 * c, &cut));
     try std.testing.expect(!cut.stale and !history.stale);
 }

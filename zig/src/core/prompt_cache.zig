@@ -213,7 +213,7 @@ pub const Store = struct {
         const marks_ = try s.fitting(a, try s.marks(a, prompt, if (e) |x| x.at else 0, history_len, shared, starts, if (e) |x| x.last else &.{}));
         for (shared) |w| { // the shared cuts this pass keeps: their states serve other conversations too
             const at = if (s.rules.planned) floorStart(starts, w) else w;
-            if (std.mem.indexOfScalar(u32, marks_, at) != null) s.noteShared(prompt[0 .. at + s.rules.lookahead]);
+            if (std.mem.indexOfScalar(u32, marks_, at) != null) s.noteShared(prompt[0 .. at + s.rules.lookahead], spans);
         }
         s.reserve(prompt, e, marks_);
         return .{ .entry = e, .marks = marks_ };
@@ -238,12 +238,16 @@ pub const Store = struct {
         };
     }
 
-    fn sharedKey(tokens: []const u32) u64 {
-        return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(tokens));
+    /// A shared cut's tokens hashed, with the seal of the pictures they hold (zero: none).
+    fn sharedKey(tokens: []const u32, seal: Digest) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.sliceAsBytes(tokens));
+        if (!std.mem.allEqual(u8, &seal, 0)) h.update(&seal);
+        return h.final();
     }
 
-    fn noteShared(s: *Store, tokens: []const u32) void {
-        const k = sharedKey(tokens);
+    fn noteShared(s: *Store, tokens: []const u32, spans: []const KeySpan) void {
+        const k = sharedKey(tokens, image_key.sealOf(spans, tokens.len));
         if (std.mem.indexOfScalar(u64, s.shared_keys.items, k) != null) return;
         if (s.shared_keys.items.len == SHARED_KEYS) _ = s.shared_keys.orderedRemove(0);
         s.shared_keys.append(s.gpa, k) catch {};
@@ -317,7 +321,7 @@ pub const Store = struct {
         if (at == 0 or n > prompt.len) return false;
         s.clock += 1;
         const seal = image_key.sealOf(spans, n);
-        const shared = std.mem.indexOfScalar(u64, s.shared_keys.items, sharedKey(prompt[0..n])) != null;
+        const shared = std.mem.indexOfScalar(u64, s.shared_keys.items, sharedKey(prompt[0..n], seal)) != null;
         for (s.entries.items) |e| if (e.at == at and std.mem.eql(u32, e.tokens, prompt[0..n]) and std.mem.eql(u8, &e.seal, &seal)) {
             e.used = s.clock; // the same state again: no copy
             e.shared = e.shared or shared;

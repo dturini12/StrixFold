@@ -635,3 +635,43 @@ test "a state with a picture resumes only on that picture's whole digest, even w
     const c = [_]pc.KeySpan{.{ .at = 2, .len = 3, .digest = pc.imageDigest("picture C") }};
     try std.testing.expectEqual(@as(u32, 2), s.findSealed(key, &c, &.{}).?.at);
 }
+
+test "a shared cut past a picture is that picture's: the same text with another picture neither resumes it nor shares its mark" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const img: u32 = 99;
+    const ids = [_]u32{ 1, 2, img, img, img, 3, 4, 5, 6, 7, 8, 9 }; // a shared cut at 7, past the span [2, 5)
+    const da, const db = twoPictures();
+    const sa = [_]pc.KeySpan{.{ .at = 2, .len = 3, .digest = da }};
+    const sb = [_]pc.KeySpan{.{ .at = 2, .len = 3, .digest = db }};
+    const ka = try pc.keyIds(a, &ids, &sa);
+    const kb = try pc.keyIds(a, &ids, &sb);
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0, .min_gap = 1 }, 1 << 20);
+    defer s.deinit();
+    const la = try s.lookup(a, ka, &sa, 11, &.{7}, &.{});
+    try std.testing.expect(std.mem.indexOfScalar(u32, la.marks, 7) != null);
+    standAt(&f, ka, 7);
+    try std.testing.expect(s.keepSealed(ka, &sa, 7, null, &.{}));
+    try std.testing.expect(s.entries.items[0].shared);
+    // the other picture, the same text and the same cut: nothing of A's resumes, and its own state there is its own
+    const lb = try s.lookup(a, kb, &sb, 11, &.{}, &.{});
+    try std.testing.expect(lb.entry == null);
+    standAt(&f, kb, 7);
+    try std.testing.expect(s.keepSealed(kb, &sb, 7, null, &.{}));
+    try std.testing.expectEqual(@as(usize, 2), s.entries.items.len);
+    try std.testing.expect(!s.entries.items[1].shared); // A's shared mark is not B's
+    // even with A's key ids (as if B's collided with them), B's digest keeps its state apart and unshared
+    try std.testing.expect((try s.lookup(a, ka, &sb, 11, &.{}, &.{})).entry == null);
+    try std.testing.expect(s.keepSealed(ka, &sb, 7, null, &.{}));
+    try std.testing.expectEqual(@as(usize, 3), s.entries.items.len);
+    try std.testing.expect(!s.entries.items[2].shared);
+    // a cut before the picture holds no picture: both conversations share it
+    const before = try s.lookup(a, ka, &sa, 11, &.{2}, &.{});
+    try std.testing.expectEqual(@as(u32, 7), before.entry.?.at);
+    standAt(&f, ka, 2);
+    try std.testing.expect(s.keepSealed(ka, &sa, 2, null, &.{}));
+    try std.testing.expectEqual(@as(u32, 2), s.findSealed(kb[0..6], &sb, &.{}).?.at);
+}
