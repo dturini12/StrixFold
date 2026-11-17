@@ -44,6 +44,8 @@ pub const Sink = struct {
     call: *const fn (ctx: *anyopaque, delta: Value) error{Closed}!void,
     /// Keeps an idle stream alive (an SSE comment), when Config.sse_keepalive_ms says so; null: never.
     keep: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
+    /// The sink's writes to the client so far: a call that wrote nothing leaves the keepalive's clock (null: each).
+    sent: ?*const u64 = null,
 };
 
 pub const Reply = struct {
@@ -455,11 +457,13 @@ const Generation = struct {
     }
 
     fn emit(g: *Generation, sink: Sink, delta: Value) Failure!void {
+        const before = if (sink.sent) |n| n.* else 0;
         sink.call(sink.ctx, delta) catch {
             g.cancel();
             return error.Cancelled;
         };
-        if (g.srv.config.sse_keepalive_ms > 0) g.sent_ns = nowNs(g.srv.io);
+        const wrote = if (sink.sent) |n| n.* != before else true;
+        if (g.srv.config.sse_keepalive_ms > 0 and wrote) g.sent_ns = nowNs(g.srv.io);
     }
 
     /// The sink's keepalive once the stream has sent nothing for Config.sse_keepalive_ms (a long prompt's prefill),

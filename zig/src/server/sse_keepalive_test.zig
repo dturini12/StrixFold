@@ -286,3 +286,66 @@ test "on the wire the comments sit between whole SSE frames on chat, completions
         try std.testing.expectEqualStrings(without, plain[0..k]);
     }
 }
+
+/// An engine that thinks for `steps` * 10 ms (one token each), then answers "hi" past its "</think>".
+const ThinkingEngine = struct {
+    steps: usize,
+    thread: ?std.Thread = null,
+
+    fn engine(e: *@This()) api.Engine {
+        return .{ .ctx = e, .vtable = &.{ .info = SlowEngine.info, .submit = submit, .cancel = SlowEngine.cancel, .status = SlowEngine.status, .memory = SlowEngine.memory } };
+    }
+
+    fn submit(ctx: *anyopaque, id: api.Id, _: *const api.Request, sink: api.Sink) api.SubmitError!void {
+        const e: *ThinkingEngine = @ptrCast(@alignCast(ctx));
+        e.thread = std.Thread.spawn(.{}, answer, .{ e.steps, id, sink }) catch return error.Closed;
+    }
+
+    fn answer(steps: usize, id: api.Id, sink: api.Sink) void {
+        sink.event(sink.ctx, id, &.{ .prefilled = 0 });
+        for (0..steps) |_| {
+            std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+            sink.event(sink.ctx, id, &.{ .tokens = &.{'a'} });
+        }
+        const rest = "</think>hi";
+        var ids: [rest.len]u32 = undefined;
+        for (rest, &ids) |byte, *t| t.* = byte;
+        sink.event(sink.ctx, id, &.{ .tokens = &ids });
+        sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .stop } });
+    }
+};
+
+/// A thinking reply of 400 ms streamed through the chat (`is_chat`) or completions route with a 100 ms keepalive.
+fn thinkingStream(is_chat: bool) !Seen {
+    var text: TestText = .{};
+    var backend: ThinkingEngine = .{ .steps = 40 };
+    var srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
+        .served_name = "test-model",
+        .model_ids = &.{"test-model"},
+        .enable_thinking = false,
+        .use_drafts = false,
+        .sse_keepalive_ms = 100,
+    }, null);
+    defer srv.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"stream\":true,\"max_tokens\":52," ++
+        "\"thinking\":{\"type\":\"enabled\"}}";
+    const raw = (try json.parse(a, body)).ok;
+    var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
+    var seen: Seen = .{};
+    openai.run(srv, a, seen.out(), .{ .conn = &conn }, is_chat, raw);
+    if (backend.thread) |t| t.join();
+    return seen;
+}
+
+test "a reasoning phase the completions route does not stream is silence: it gets keepalives, the chat route's none" {
+    // /v1/completions streams text only: its 400 ms of reasoning deltas (one every 10 ms) write nothing: comments
+    const completions = try thinkingStream(false);
+    try std.testing.expect(std.mem.count(u8, completions.seen(), "c") >= 2);
+    // the chat route writes each reasoning delta: never 100 ms of silence, so no comment
+    const chat = try thinkingStream(true);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, chat.seen(), "c"));
+    try std.testing.expect(std.mem.count(u8, chat.seen(), "e") >= 20);
+}

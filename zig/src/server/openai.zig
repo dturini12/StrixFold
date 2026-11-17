@@ -253,6 +253,7 @@ const Run = struct {
     created: i64,
     streamed_prose: bool = false,
     prose_sent: std.ArrayList(u8) = .empty, // the content a tool stream sent
+    sent: u64 = 0, // data events written to the client (the keepalive's clock moves with them, not with every delta)
 
     fn chunk(r: *Run, delta: ?Value, finish: ?[]const u8) Allocator.Error!Value {
         const a = r.a;
@@ -279,7 +280,8 @@ const Run = struct {
     }
 
     fn emit(r: *Run, payload: Value) error{Closed}!void {
-        return r.out.vt.event(r.out.ctx, payload);
+        try r.out.vt.event(r.out.ctx, payload);
+        r.sent += 1;
     }
 
     fn usage(r: *Run, reply: *const chat.Reply) Allocator.Error!Value {
@@ -489,7 +491,7 @@ const Run = struct {
         if (!tools and r.is_chat) r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
         var sink_state: StreamSink = .{ .run = r, .tools = tools };
         handed = true;
-        var reply = chat.generate(r.srv, &cx, prepared, .{ .ctx = &sink_state, .call = StreamSink.call, .keep = StreamSink.keep }, gone) catch |e| {
+        var reply = chat.generate(r.srv, &cx, prepared, .{ .ctx = &sink_state, .call = StreamSink.call, .keep = StreamSink.keep, .sent = &r.sent }, gone) catch |e| {
             switch (e) {
                 error.Cancelled => return,
                 error.Refused => if (cx.kind != .other and cx.kind != .server) {
