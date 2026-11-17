@@ -1713,6 +1713,68 @@ fn refused(m: anytype, err: anyerror) !void {
     if (gpuFailure(err) and m.contextFailed()) return error.GpuContextFailed;
 }
 
+/// A failure after which this rank's device runs nothing more: refused's GpuContextFailed or a sticky fault.
+fn deviceFatal(err: anyerror) bool {
+    return err == error.GpuContextFailed or err == error.DeviceFault;
+}
+
+/// What follow holds on this rank's GPU: rank 0's kept states (this rank's part) and the sf-disk tier (GPU scratch).
+fn Held(comptime Buffer: type, comptime Tier: type) type {
+    return struct {
+        kept: std.AutoHashMapUnmanaged(u64, Buffer) = .empty,
+        disk: ?*Tier = null,
+        device_failed: bool = false, // a GPU free or a tier close could wait on the failed device: they are skipped
+
+        /// Follow ends with `err`: a device failure, or a device that failed under any other error, frees nothing.
+        fn ended(h: *@This(), err: anyerror, failed: bool) void {
+            if (deviceFatal(err) or failed) h.device_failed = true;
+        }
+
+        /// The tier closed and the buffers freed, unless the device failed; the map's host memory either way.
+        fn release(h: *@This(), gpa: std.mem.Allocator) void {
+            if (!h.device_failed) {
+                if (h.disk) |d| d.close();
+                var ki = h.kept.valueIterator();
+                while (ki.next()) |b| b.free();
+            }
+            h.kept.deinit(gpa);
+        }
+    };
+}
+
+test "after a device failure the follower frees no kept state and leaves its disk tier open; else each once" {
+    const Buf = struct {
+        frees: *usize,
+        pub fn free(b: *@This()) void {
+            b.frees.* += 1;
+        }
+    };
+    const Tier = struct {
+        closes: usize = 0,
+        pub fn close(t: *@This()) void {
+            t.closes += 1;
+        }
+    };
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { err: anyerror, failed: bool, frees: bool }{
+        .{ .err = error.GpuContextFailed, .failed = false, .frees = false },
+        .{ .err = error.DeviceFault, .failed = false, .frees = false },
+        .{ .err = error.PeerDown, .failed = true, .frees = false }, // the device failed first
+        .{ .err = error.PeerDown, .failed = false, .frees = true }, // a stop: everything goes back
+    };
+    for (cases) |c| {
+        var frees: usize = 0;
+        var tier: Tier = .{};
+        var h: Held(Buf, Tier) = .{ .disk = &tier };
+        try h.kept.put(gpa, 1, .{ .frees = &frees });
+        try h.kept.put(gpa, 2, .{ .frees = &frees });
+        h.ended(c.err, c.failed);
+        h.release(gpa);
+        try std.testing.expectEqual(@as(usize, if (c.frees) 2 else 0), frees);
+        try std.testing.expectEqual(@as(usize, if (c.frees) 1 else 0), tier.closes);
+    }
+}
+
 /// A GPU runtime call's failure without a sticky fault's result (HIP's GpuFailed, CUDA's CudaFailed).
 fn gpuFailure(err: anyerror) bool {
     return err == error.GpuFailed or err == error.CudaFailed;
@@ -1775,6 +1837,19 @@ pub var follow_prof: struct { rounds: u64 = 0, enqueue: u64 = 0, forward: u64 = 
 
 /// Rank 1 (each of ranks 1-3 on the four-node split): the primitives rank 0 sends, run in order until it says done.
 pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+    // sf-disk: this rank's tier, opened at rank 0's first disk_sync (rank 0 waits then); writes finish before return
+    var disk_settings: ?disk_mod.Settings = if (m.world == 2 and gpu.backend == .hip) disk_mod.Settings.fromEnv(gpa) else null;
+    defer if (disk_settings) |s| gpa.free(s.dir);
+    var held: Held(gpu.DeviceBuffer, disk_mod.Disk) = .{};
+    defer held.release(gpa);
+    followHeld(gpa, m, &held, &disk_settings) catch |err| {
+        held.ended(err, m.contextFailed()); // (before release: a failed device's buffers are not freed)
+        return err;
+    };
+}
+
+/// follow's loop, with what it keeps on the GPU in `held`.
+fn followHeld(gpa: std.mem.Allocator, m: *Model, held: *Held(gpu.DeviceBuffer, disk_mod.Disk), disk_settings: *?disk_mod.Settings) !void {
     const peer = m.peer();
     const buf = try gpa.alloc(u8, (m.pool_cap + 1) * 4 + (1 << 16));
     defer gpa.free(buf);
@@ -1788,17 +1863,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     var plan_diffs: u64 = 0; // chunks whose read-ahead plan here differed from rank 0's (the warning: oftenEnough)
     var img_rows: std.ArrayList(u8) = .empty; // a prompt's image rows as their pieces come
     defer img_rows.deinit(gpa);
-    var kept: std.AutoHashMapUnmanaged(u64, gpu.DeviceBuffer) = .empty; // rank 0's kept states, this rank's part
-    defer {
-        var ki = kept.valueIterator();
-        while (ki.next()) |b| b.free();
-        kept.deinit(gpa);
-    }
-    // sf-disk: this rank's tier, opened at rank 0's first disk_sync (rank 0 waits then); writes finish before return
-    var disk_settings: ?disk_mod.Settings = if (m.world == 2 and gpu.backend == .hip) disk_mod.Settings.fromEnv(gpa) else null;
-    defer if (disk_settings) |s| gpa.free(s.dir);
-    var disk: ?*disk_mod.Disk = null;
-    defer if (disk) |d| d.close();
+    const kept = &held.kept;
     var sync_keys: std.ArrayList(pd.Key) = .empty;
     defer sync_keys.deinit(gpa);
     var paused = false; // the prompt pass paused (fill_pause) for the other streams' rounds
@@ -1832,7 +1897,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
         if (endsPass(kind, paused)) {
             m.joinAhead();
             m.fill_seq = &.{};
-            if (disk) |d| d.endPass();
+            if (held.disk) |d| d.endPass();
             paused = false;
         }
         switch (kind) {
@@ -1843,7 +1908,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 img_rows.clearRetainingCapacity();
                 try r.ids(gpa, &seqs[slot]);
                 try r.end();
-                if (disk) |d| d.beginPass(std.mem.sliceAsBytes(seqs[slot].items));
+                if (held.disk) |d| d.beginPass(std.mem.sliceAsBytes(seqs[slot].items));
                 notePass(m, step - 1, 1, seqs[slot].items.len, slot, @intCast(base), "");
                 m.fillBegin(slot, @intCast(base)) catch |err| try refused(m, err);
                 m.fill_seq = seqs[slot].items;
@@ -1921,8 +1986,8 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 if (s >= max_streams) return error.BadSlot;
                 var b = try gpu.DeviceBuffer.alloc(m.ctx.d, m.snapBytes());
                 m.snapCopy(s, b.ptr, true) catch |err| {
+                    try refused(m, err); // (a failed device's buffer is left: its free could wait on it)
                     b.free();
-                    try refused(m, err);
                     continue;
                 };
                 try kept.put(gpa, id, b);
@@ -1956,11 +2021,11 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 for (0..n) |_| try sync_keys.append(gpa, try r.key());
                 try r.end();
                 if (sync_keys.items.len == total) {
-                    if (disk == null) if (disk_settings) |ds| {
-                        disk_settings = null; // (the tier owns its dir now, or freed it)
-                        disk = disk_mod.Disk.open(gpa, m, ds);
+                    if (held.disk == null) if (disk_settings.*) |ds| {
+                        disk_settings.* = null; // (the tier owns its dir now, or freed it)
+                        held.disk = disk_mod.Disk.open(gpa, m, ds);
                     };
-                    try followSync(gpa, disk, sync_keys.items, peer);
+                    try followSync(gpa, held.disk, sync_keys.items, peer);
                     sync_keys.clearRetainingCapacity();
                 }
             },
@@ -1970,7 +2035,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 const j0 = try r.int(u32);
                 const j1 = try r.int(u32);
                 try r.end();
-                const d = disk orelse continue;
+                const d = held.disk orelse continue;
                 if (s != slot or j0 == 0 or j1 < j0 or j1 > d.chain.items.len or !d.passing) continue;
                 const keys = d.chain.items[j0 - 1 .. j1];
                 var p = d.tier.plan(keys, false, true) catch continue;
@@ -1984,7 +2049,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 const s: usize = try r.int(u32);
                 const base: usize = @intCast(try r.int(u64));
                 try r.end();
-                const d = disk orelse continue;
+                const d = held.disk orelse continue;
                 if (s != slot or k == 0 or k > d.chain.items.len or !std.mem.eql(u8, &d.chain.items[k - 1], &key)) {
                     d.line("event=save result=skipped reason=hash tokens={d} key={s}", .{ k * model.chunk_rows, &pd.short(key) });
                     continue;
@@ -2007,7 +2072,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 defer gpa.free(keys);
                 for (keys) |*k| k.* = try r.key();
                 try r.end();
-                if (disk) |d| d.tier.drop(keys);
+                if (held.disk) |d| d.tier.drop(keys);
             },
             .disk_load => {
                 const key = try r.key();
@@ -2018,8 +2083,8 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 if (s >= max_streams) return error.BadSlot;
                 const t0 = m.now();
                 var bytes: u64 = 0;
-                const st: pd.Load = if (disk) |d| d.load(s, base, key, k, &bytes) else .bad;
-                if (disk) |d| d.line("event=load result={s} tokens={d} bytes={d} ms={d} key={s}", .{ @tagName(st), k * model.chunk_rows, bytes, (m.now() - t0) / std.time.ns_per_ms, &pd.short(key) });
+                const st: pd.Load = if (held.disk) |d| d.load(s, base, key, k, &bytes) else .bad;
+                if (held.disk) |d| d.line("event=load result={s} tokens={d} bytes={d} ms={d} key={s}", .{ @tagName(st), k * model.chunk_rows, bytes, (m.now() - t0) / std.time.ns_per_ms, &pd.short(key) });
                 try peer.send(&.{@intFromEnum(st)}); // rank 0 waits for it, whatever happened here
             },
             .disk_outcome => {
@@ -2027,7 +2092,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 const v = try r.int(u8);
                 try r.end();
                 if (v > 2) return error.BadFrame;
-                if (disk) |d| d.finish(key, @enumFromInt(v));
+                if (held.disk) |d| d.finish(key, @enumFromInt(v));
             },
             .fill_pause => {
                 try r.end();
