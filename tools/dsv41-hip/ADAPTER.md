@@ -400,10 +400,14 @@ tower on rank 0. Everything above about `text` still holds: a text rank opens, l
   the spans its peer routes). Authenticate the source shards first (`verify_hf_cache.py`). serve_lib.sh checks both
   (`VISION_DIR`'s SHA256SUMS, `VISION_BIAS_SHA256`) before a text_image start.
 - **Memory:** rank 0 holds the weights (926 MiB) and a workspace for the largest picture (1021 cells, 9189 patches:
-  324 MiB), a 10 MiB span buffer, and both ranks 4096 image rows (40 MiB) from the open, so an image request allocates
-  nothing on the device. Those rows are a request's cap: rank 0 refuses a request whose pictures' spans add up to more
-  (`TooManyImageRows`, before its encode), `setImages` never reallocates on HIP, and rank 1 rejects a `fill_images`
-  frame past the cap as a bad frame.
+  324 MiB), a 10 MiB span buffer, and both ranks 4096 image rows (40 MiB; 10,240 B a row) from the open, so an image
+  request allocates nothing on the device. Those rows are a request's cap: rank 0 refuses a request whose pictures'
+  spans add up to more (`TooManyImageRows`, before its encode), `setImages` never reallocates on HIP, and rank 1 rejects
+  a `fill_images` frame past the cap as a bad frame. `TF_DS_IMAGE_TOKENS` (rank 1 `--image-tokens`, serve.conf
+  `MAX_IMAGE_TOKENS`, 1024 .. 65536) sets the rows; both ranks must agree, and the handshake's plan text says
+  ` image_tokens=N` when it is not 4096. A request that fills them holds about as much host RAM again on each rank
+  while its rows are read and sent (rank 1 frees a buffer past the default size after the request; rank 0's encoder
+  rows and payloads come on top).
 - **Pair:** rank 0 runs the tower before `fill_begin` and sends the span rows (`fill_images`, 32 KiB pieces); rank 1
   never runs it. A tower or decode error refuses the request before any frame; a rank-0 error between pieces leaves
   rank 1's partial rows to the next `fill_begin`; rank 1 failing to take the complete rows ends the follower (the pair
@@ -423,8 +427,8 @@ tower on rank 0. Everything above about `text` still holds: a text rank opens, l
   - **Pixels:** at most 134,217,728 decoded pixels in all, the same as one picture may have (picture.zig's PNG decoder
     and Pillow, at twice Pillow's `MAX_IMAGE_PIXELS`, both refuse a picture past it). The decoded sizes count, not the
     header's; the request is refused at the picture that crosses it, and no later picture is decoded.
-  - **Image tokens:** at most 4,096 (the rows both ranks reserve), summed as the pictures are prepared and refused at
-    the picture that crosses it.
+  - **Image tokens:** at most the rows both ranks reserve (4,096 unless `MAX_IMAGE_TOKENS` is set), summed as the
+    pictures are prepared and refused at the picture that crosses it.
   - **Thin pictures:** a picture too thin to keep one row or column once fitted to its grid (85,764:1 or wider, or
     42,924:1 or taller) is refused, as Pillow refuses a resize to a zero side.
   - A picture's decode buffers (RGB, padded RGB, patches) are freed once it is prepared; the request keeps only its

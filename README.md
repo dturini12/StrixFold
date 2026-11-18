@@ -97,7 +97,8 @@ power settings) is in [docs/TUNING.md](docs/TUNING.md). Most of it applies to an
 
 - Tested on this exact setup only. Other Strix Halo machines, ROCm versions and cables may behave differently.
 - Images are off unless `MODALITIES=text_image` is set. A request then takes at most 32 images (`MAX_IMAGES`),
-  134,217,728 decoded pixels and 4,096 image tokens in all; past any of them it is refused with a 400.
+  134,217,728 decoded pixels and 4,096 image tokens in all (`MAX_IMAGE_TOKENS` raises the last, up to 65,536); past
+  any of them it is refused with a 400.
 - Provided as-is. Issues are welcome; support is best effort.
 
 ## Community

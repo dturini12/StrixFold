@@ -48,10 +48,9 @@ pub fn spanRows(images: []const lanes.stream.Image) usize {
     return n;
 }
 
-/// Whether a request's image rows fit what both ranks reserved (model.Model.image_rows_cap; none: any).
-pub fn imageRowsFit(rows: usize) bool {
-    const cap = model.Model.image_rows_cap orelse return true;
-    return rows <= cap;
+/// Whether a request's image rows fit what both ranks reserved (`cap`: model.Model.imageRowsCap; none: any).
+pub fn imageRowsFit(cap: ?usize, rows: usize) bool {
+    return rows <= (cap orelse return true);
 }
 
 test "a request's image rows are capped at the rows both HIP ranks reserved" {
@@ -59,8 +58,29 @@ test "a request's image rows are capped at the rows both HIP ranks reserved" {
     const two = [_]Image{ .{ .at = 0, .tokens = 2048, .bytes = "" }, .{ .at = 4096, .tokens = 2048, .bytes = "" } };
     const over = [_]Image{ .{ .at = 0, .tokens = 2048, .bytes = "" }, .{ .at = 4096, .tokens = 2049, .bytes = "" } };
     try std.testing.expectEqual(@as(usize, 4096), spanRows(&two));
-    try std.testing.expect(imageRowsFit(spanRows(&two)) and imageRowsFit(0));
-    try std.testing.expectEqual(gpu.backend != .hip, imageRowsFit(spanRows(&over)));
+    try std.testing.expect(imageRowsFit(4096, spanRows(&two)) and imageRowsFit(4096, 0));
+    try std.testing.expect(!imageRowsFit(4096, spanRows(&over)));
+    try std.testing.expect(imageRowsFit(32768, 32768) and !imageRowsFit(32768, 32769));
+    try std.testing.expect(imageRowsFit(null, spanRows(&over)) and imageRowsFit(null, 1 << 20));
+}
+
+/// Empties rank 1's host copy of a prompt's image rows: kept up to `keep` bytes (the default cap's), freed past it.
+fn dropImageRows(gpa: std.mem.Allocator, rows: *std.ArrayList(u8), keep: usize) void {
+    if (rows.capacity > keep) rows.clearAndFree(gpa) else rows.clearRetainingCapacity();
+}
+
+test "rank 1 keeps a default-size image buffer and frees a larger one" {
+    const gpa = std.testing.allocator;
+    var rows: std.ArrayList(u8) = .empty;
+    defer rows.deinit(gpa);
+    try rows.ensureTotalCapacityPrecise(gpa, 8);
+    try rows.appendSlice(gpa, "abcdefgh");
+    dropImageRows(gpa, &rows, 8);
+    try std.testing.expect(rows.items.len == 0 and rows.capacity == 8);
+    try rows.ensureTotalCapacityPrecise(gpa, 9);
+    try rows.appendSlice(gpa, "abcdefghi");
+    dropImageRows(gpa, &rows, 8);
+    try std.testing.expect(rows.items.len == 0 and rows.capacity == 0);
 }
 
 /// A gate's diagnostic (the tools' --logits-sha 1): each prompt's logits' sha256 and rows on stderr.
@@ -759,7 +779,7 @@ pub const Lanes = struct {
         if (len == 0) return error.EmptyPrompt;
         // one stream's context (its extent goes anywhere in the pool by placement)
         if (len + s.max_new > usableContext(m.context_cap, m.eng.round_rows)) return error.PromptTooLong;
-        if (!imageRowsFit(spanRows(s.images))) return error.TooManyImageRows;
+        if (!imageRowsFit(m.imageRowsCap(), spanRows(s.images))) return error.TooManyImageRows;
         const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
         if (self.streams.fetchRemove(s)) |old| {
             self.used[old.value.slot] = false;
@@ -912,6 +932,9 @@ pub const Lanes = struct {
         if (s.images.len > 0) {
             const row_bytes = m.cfg.hidden * 2;
             try fill_spans.rowSpans(gpa, s.images, start, &spans);
+            var need: usize = 0;
+            for (spans.items) |sp| need += sp.len;
+            try rows.ensureTotalCapacityPrecise(gpa, need * row_bytes); // the pass's rows exactly, no doubling
             for (s.images, 0..) |img, k| {
                 if (!fill_spans.pastResume(img.at, img.tokens, start)) continue;
                 if (img.rows) {
@@ -2104,6 +2127,7 @@ fn followHeld(gpa: std.mem.Allocator, m: *Model, held: *Held(gpu.DeviceBuffer, d
     var plan_diffs: u64 = 0; // chunks whose read-ahead plan here differed from rank 0's (the warning: oftenEnough)
     var img_rows: std.ArrayList(u8) = .empty; // a prompt's image rows as their pieces come
     defer img_rows.deinit(gpa);
+    const img_keep = model.image_rows_default * m.cfg.hidden * 2; // the bytes img_rows keeps between prompts
     var pictures: FollowKey = .{}; // a prompt with images: its cache key (made from rank 0's spans)
     defer pictures.deinit(gpa);
     const kept = &held.kept;
@@ -2143,7 +2167,7 @@ fn followHeld(gpa: std.mem.Allocator, m: *Model, held: *Held(gpu.DeviceBuffer, d
             .fill_begin => {
                 const b = try followBegin(gpa, &r, &seqs, held.disk, &passes, &pictures);
                 slot = b.slot;
-                img_rows.clearRetainingCapacity();
+                dropImageRows(gpa, &img_rows, img_keep);
                 notePass(m, step - 1, 1, seqs[slot].items.len, slot, b.base, "");
                 try followView(m, &seqs, slot, b.base);
             },
@@ -2199,9 +2223,12 @@ fn followHeld(gpa: std.mem.Allocator, m: *Model, held: *Held(gpu.DeviceBuffer, d
                 const off: usize = @intCast(try r.int(u64));
                 const piece = r.rest();
                 try r.end();
-                if (!imageRowsFit(row)) return error.BadFrame; // rank 0 refuses such a request before any frame
+                // rank 0 refuses such a request before any frame
+                if (!imageRowsFit(m.imageRowsCap(), row)) return error.BadFrame;
                 const total = row * m.cfg.hidden * 2;
                 if (off != img_rows.items.len or off + piece.len > total or piece.len == 0) return error.BadFrame;
+                // the prompt's size exactly (no doubling): a default-size prompt stays within img_keep
+                if (off == 0) try img_rows.ensureTotalCapacityPrecise(gpa, total);
                 try img_rows.appendSlice(gpa, piece);
                 if (img_rows.items.len == total) {
                     // rank 0 sets these rows after sending them; refusing here would split the ranks: the follower ends
@@ -2210,7 +2237,7 @@ fn followHeld(gpa: std.mem.Allocator, m: *Model, held: *Held(gpu.DeviceBuffer, d
                         std.log.err("lanes: rank 1 could not take the prompt's image rows ({s}); the follower ends", .{@errorName(err)});
                         return err;
                     };
-                    img_rows.clearRetainingCapacity();
+                    dropImageRows(gpa, &img_rows, img_keep);
                 }
             },
             .snap_save => {

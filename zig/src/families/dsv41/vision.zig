@@ -108,7 +108,7 @@ pub const Vision = struct {
                 return x.rows(payload, gpa, out);
             }
         };
-        return .{ .ctx = v, .bind = T.bind, .rows = T.rows };
+        return .{ .ctx = v, .bind = T.bind, .rows = T.rows, .row_bytes = v.m.cfg.hidden * 2 };
     }
 
     /// The server's view: the placeholder the template renders for each image and the picture it prepares.
