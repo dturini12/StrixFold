@@ -1884,6 +1884,22 @@ fn Held(comptime Buffer: type, comptime Tier: type) type {
             if (deviceFatal(err) or failed) h.device_failed = true;
         }
 
+        /// A failed device ends follow here: asked after a step that swallows its own errors and before a GPU free.
+        fn healthy(h: *@This(), m: anytype) !void {
+            if (!h.device_failed and !m.contextFailed()) return;
+            h.device_failed = true;
+            return error.GpuContextFailed;
+        }
+
+        /// Rank 0 dropped kept state `id`: its buffer freed, on a healthy device only.
+        fn drop(h: *@This(), m: anytype, id: u64) !void {
+            try h.healthy(m);
+            if (h.kept.fetchRemove(id)) |kv| {
+                var b = kv.value;
+                b.free();
+            }
+        }
+
         /// The tier closed and the buffers freed, unless the device failed; the map's host memory either way.
         fn release(h: *@This(), gpa: std.mem.Allocator) void {
             if (!h.device_failed) {
@@ -1926,6 +1942,79 @@ test "after a device failure the follower frees no kept state and leaves its dis
         h.release(gpa);
         try std.testing.expectEqual(@as(usize, if (c.frees) 2 else 0), frees);
         try std.testing.expectEqual(@as(usize, if (c.frees) 1 else 0), tier.closes);
+    }
+}
+
+/// follow's end: an error marks a failed device; so does a clean end on a device that failed under a swallowed error.
+fn followDone(held: anytype, m: anytype, result: anyerror!void) !void {
+    result catch |err| {
+        held.ended(err, m.contextFailed()); // (before release: a failed device's buffers are not freed)
+        return err;
+    };
+    try held.healthy(m);
+}
+
+test "a device that failed under a swallowed disk error: the follower's end and a state's drop free nothing" {
+    const Buf = struct {
+        frees: *usize,
+        pub fn free(b: *@This()) void {
+            b.frees.* += 1;
+        }
+    };
+    const Tier = struct {
+        closes: usize = 0,
+        pub fn close(t: *@This()) void {
+            t.closes += 1;
+        }
+    };
+    const Device = struct {
+        failed: bool = false,
+        asked: usize = 0,
+        pub fn contextFailed(d: *@This()) bool {
+            d.asked += 1;
+            return d.failed;
+        }
+    };
+    const H = Held(Buf, Tier);
+    const gpa = std.testing.allocator;
+    const Case = enum { shutdown, drop, check, healthy };
+    for ([_]Case{ .shutdown, .drop, .check, .healthy }) |case| {
+        var frees: usize = 0;
+        var tier: Tier = .{};
+        var dev: Device = .{};
+        var h: H = .{ .disk = &tier };
+        try h.kept.put(gpa, 1, .{ .frees = &frees });
+        try h.kept.put(gpa, 2, .{ .frees = &frees });
+        try h.healthy(&dev); // a disk step on a healthy device: follow goes on
+        // the tier's write or load meets a device fault and reports it as its own result (false, .bad): no error here
+        dev.failed = case != .healthy;
+        switch (case) {
+            // rank 0's done arrives next: follow's loop returns without an error
+            .shutdown => try std.testing.expectError(error.GpuContextFailed, followDone(&h, &dev, {})),
+            // rank 0 drops a kept state next
+            .drop => {
+                try std.testing.expectError(error.GpuContextFailed, h.drop(&dev, 1));
+                try std.testing.expect(h.kept.contains(1));
+                try std.testing.expectError(error.GpuContextFailed, followDone(&h, &dev, error.GpuContextFailed));
+            },
+            // the check right after the disk step ends follow
+            .check => {
+                try std.testing.expectError(error.GpuContextFailed, h.healthy(&dev));
+                const asked = dev.asked;
+                try std.testing.expectError(error.GpuContextFailed, h.healthy(&dev)); // (sticky: not asked again)
+                try std.testing.expectEqual(asked, dev.asked);
+            },
+            .healthy => {
+                try h.drop(&dev, 1);
+                try std.testing.expectEqual(@as(usize, 1), frees);
+                try h.drop(&dev, 1); // (no such state now)
+                try followDone(&h, &dev, {});
+            },
+        }
+        try std.testing.expectEqual(case != .healthy, h.device_failed);
+        h.release(gpa);
+        try std.testing.expectEqual(@as(usize, if (case == .healthy) 2 else 0), frees);
+        try std.testing.expectEqual(@as(usize, if (case == .healthy) 1 else 0), tier.closes);
     }
 }
 
@@ -1996,10 +2085,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     defer if (disk_settings) |s| gpa.free(s.dir);
     var held: Held(gpu.DeviceBuffer, disk_mod.Disk) = .{};
     defer held.release(gpa);
-    followHeld(gpa, m, &held, &disk_settings) catch |err| {
-        held.ended(err, m.contextFailed()); // (before release: a failed device's buffers are not freed)
-        return err;
-    };
+    return followDone(&held, m, followHeld(gpa, m, &held, &disk_settings));
 }
 
 /// follow's loop, with what it keeps on the GPU in `held`.
@@ -2156,10 +2242,7 @@ fn followHeld(gpa: std.mem.Allocator, m: *Model, held: *Held(gpu.DeviceBuffer, d
             .snap_drop => {
                 const id = try r.int(u64);
                 try r.end();
-                if (kept.fetchRemove(id)) |kv| {
-                    var b = kv.value;
-                    b.free();
-                }
+                try held.drop(m, id);
             },
             .disk_sync => {
                 const total = try r.int(u32);
@@ -2172,6 +2255,7 @@ fn followHeld(gpa: std.mem.Allocator, m: *Model, held: *Held(gpu.DeviceBuffer, d
                     if (held.disk == null) if (disk_settings.*) |ds| {
                         disk_settings.* = null; // (the tier owns its dir now, or freed it)
                         held.disk = disk_mod.Disk.open(gpa, m, ds);
+                        try held.healthy(m); // (the tier's open, write and load swallow a GPU failure)
                     };
                     try followSync(gpa, held.disk, sync_keys.items, peer);
                     sync_keys.clearRetainingCapacity();
@@ -2189,6 +2273,7 @@ fn followHeld(gpa: std.mem.Allocator, m: *Model, held: *Held(gpu.DeviceBuffer, d
                 var p = d.tier.plan(keys, false, true) catch continue;
                 defer p.deinit(gpa);
                 if (p.result == .ok and p.runs.len > 0) _ = d.write(&p, keys, j0, base, null);
+                try held.healthy(m);
             },
             .disk_save => {
                 const key = try r.key();
@@ -2213,6 +2298,7 @@ fn followHeld(gpa: std.mem.Allocator, m: *Model, held: *Held(gpu.DeviceBuffer, d
                     .skip => |why| d.line("event=save result=skipped reason={s} tokens={d} key={s} skipped={d}", .{ @tagName(why), k * model.chunk_rows, &pd.short(key), d.tier.counts.skipped }),
                     .ok => _ = d.write(&p, keys, 1, base, b.ptr),
                 }
+                try held.healthy(m);
             },
             .disk_drop => {
                 const n = try r.int(u32);
@@ -2233,6 +2319,7 @@ fn followHeld(gpa: std.mem.Allocator, m: *Model, held: *Held(gpu.DeviceBuffer, d
                 var bytes: u64 = 0;
                 const st: pd.Load = if (held.disk) |d| d.load(s, base, key, k, &bytes) else .bad;
                 if (held.disk) |d| d.line("event=load result={s} tokens={d} bytes={d} ms={d} key={s}", .{ @tagName(st), k * model.chunk_rows, bytes, (m.now() - t0) / std.time.ns_per_ms, &pd.short(key) });
+                try held.healthy(m);
                 try peer.send(&.{@intFromEnum(st)}); // rank 0 waits for it, whatever happened here
             },
             .disk_outcome => {
