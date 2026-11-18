@@ -10,8 +10,10 @@ const clock = @import("clock.zig");
 const routes = @import("routes.zig");
 const Conn = @import("http_conn.zig").Conn;
 
-/// Bytes as tokens; every prompt renders as "prompt" (6 tokens).
+/// Bytes as tokens; every prompt renders as "prompt" (6 tokens). decode_ms: each decode takes that long.
 const TestText = struct {
+    decode_ms: i64 = 0,
+
     fn text(t: *@This()) model_text.Text {
         return .{ .ctx = t, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocabSize, .eos_ids = eosIds, .render = render, .template_source = templateSource } };
     }
@@ -22,7 +24,9 @@ const TestText = struct {
         return ids;
     }
 
-    fn decode(_: *anyopaque, a: std.mem.Allocator, ids: []const u32) std.mem.Allocator.Error![]u8 {
+    fn decode(ctx: *anyopaque, a: std.mem.Allocator, ids: []const u32) std.mem.Allocator.Error![]u8 {
+        const t: *TestText = @ptrCast(@alignCast(ctx));
+        if (t.decode_ms > 0) std.Io.sleep(std.testing.io, .fromMilliseconds(t.decode_ms), .awake) catch {};
         const decoded = try a.alloc(u8, ids.len);
         for (ids, decoded) |id, *byte| byte.* = @intCast(id);
         return decoded;
@@ -171,7 +175,7 @@ test "a stream silent past the keepalive sends comments after its role chunk unt
 }
 
 /// A streamed POST through the server's own routes over a socket pair: the body as the client reads it.
-fn wire(srv: *server.Server, backend: *SlowEngine, path: []const u8, body: []const u8) ![]u8 {
+fn wire(srv: *server.Server, backend: anytype, path: []const u8, body: []const u8) ![]u8 {
     var pair: [2]std.c.fd_t = undefined;
     if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &pair) != 0) return error.SocketPair;
     defer _ = std.c.close(pair[0]);
@@ -287,45 +291,52 @@ test "on the wire the comments sit between whole SSE frames on chat, completions
     }
 }
 
-/// An engine that thinks for `steps` * 10 ms (one token each), then answers "hi" past its "</think>".
-const ThinkingEngine = struct {
+/// An engine that sends `head` at once, then `steps` tokens 'a' (one every step_ms, or all at once), then `tail`.
+const ScriptEngine = struct {
+    head: []const u8 = "",
     steps: usize,
+    step_ms: i64 = 10,
+    tail: []const u8 = "",
     thread: ?std.Thread = null,
 
     fn engine(e: *@This()) api.Engine {
-        return .{ .ctx = e, .vtable = &.{ .info = SlowEngine.info, .submit = submit, .cancel = SlowEngine.cancel, .status = SlowEngine.status, .memory = SlowEngine.memory } };
+        return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = SlowEngine.cancel, .status = SlowEngine.status, .memory = SlowEngine.memory } };
+    }
+
+    fn info(_: *anyopaque) api.Info {
+        return .{ .context_window = 4096 };
     }
 
     fn submit(ctx: *anyopaque, id: api.Id, _: *const api.Request, sink: api.Sink) api.SubmitError!void {
-        const e: *ThinkingEngine = @ptrCast(@alignCast(ctx));
-        e.thread = std.Thread.spawn(.{}, answer, .{ e.steps, id, sink }) catch return error.Closed;
+        const e: *ScriptEngine = @ptrCast(@alignCast(ctx));
+        e.thread = std.Thread.spawn(.{}, answer, .{ e, id, sink }) catch return error.Closed;
     }
 
-    fn answer(steps: usize, id: api.Id, sink: api.Sink) void {
+    fn say(text: []const u8, id: api.Id, sink: api.Sink) void {
+        var ids: [128]u32 = undefined;
+        for (text, ids[0..text.len]) |byte, *t| t.* = byte;
+        if (text.len > 0) sink.event(sink.ctx, id, &.{ .tokens = ids[0..text.len] });
+    }
+
+    fn answer(e: *const ScriptEngine, id: api.Id, sink: api.Sink) void {
         sink.event(sink.ctx, id, &.{ .prefilled = 0 });
-        for (0..steps) |_| {
-            std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
-            sink.event(sink.ctx, id, &.{ .tokens = &.{'a'} });
+        say(e.head, id, sink);
+        for (0..e.steps) |_| {
+            if (e.step_ms > 0) std.Io.sleep(std.testing.io, .fromMilliseconds(e.step_ms), .awake) catch {};
+            say("a", id, sink);
         }
-        const rest = "</think>hi";
-        var ids: [rest.len]u32 = undefined;
-        for (rest, &ids) |byte, *t| t.* = byte;
-        sink.event(sink.ctx, id, &.{ .tokens = &ids });
+        say(e.tail, id, sink);
         sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .stop } });
     }
 };
 
-/// A thinking reply of 400 ms streamed through the chat (`is_chat`) or completions route with a 100 ms keepalive.
-fn thinkingStream(is_chat: bool) !Seen {
-    var text: TestText = .{};
-    var backend: ThinkingEngine = .{ .steps = 40 };
-    var srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
-        .served_name = "test-model",
-        .model_ids = &.{"test-model"},
-        .enable_thinking = false,
-        .use_drafts = false,
-        .sse_keepalive_ms = 100,
-    }, null);
+const quiet: server.Config = .{ .served_name = "test-model", .model_ids = &.{"test-model"}, .enable_thinking = false, .use_drafts = false, .sse_keepalive_ms = 100 };
+
+/// 40 reasoning tokens through the chat or completions route: one every 10 ms, or (queued) all at once, 10 ms a decode.
+fn thinkingStream(is_chat: bool, queued: bool) !Seen {
+    var text: TestText = .{ .decode_ms = if (queued) 10 else 0 };
+    var backend: ScriptEngine = .{ .steps = 40, .step_ms = if (queued) 0 else 10, .tail = "</think>hi" };
+    var srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), quiet, null);
     defer srv.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -342,10 +353,47 @@ fn thinkingStream(is_chat: bool) !Seen {
 
 test "a reasoning phase the completions route does not stream is silence: it gets keepalives, the chat route's none" {
     // /v1/completions streams text only: its 400 ms of reasoning deltas (one every 10 ms) write nothing: comments
-    const completions = try thinkingStream(false);
+    const completions = try thinkingStream(false, false);
     try std.testing.expect(std.mem.count(u8, completions.seen(), "c") >= 2);
     // the chat route writes each reasoning delta: never 100 ms of silence, so no comment
-    const chat = try thinkingStream(true);
+    const chat = try thinkingStream(true, false);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, chat.seen(), "c"));
     try std.testing.expect(std.mem.count(u8, chat.seen(), "e") >= 20);
+}
+
+test "reasoning chunks that wait in the queue while the stream is silent get keepalives too" {
+    // the engine is ahead: every chunk is queued at once and the request thread never waits, 10 ms a chunk for 400 ms
+    const completions = try thinkingStream(false, true);
+    try std.testing.expect(std.mem.count(u8, completions.seen(), "c") >= 2);
+    const chat = try thinkingStream(true, true);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, chat.seen(), "c"));
+}
+
+const tool_body = "{\"model\":\"test-model\",\"max_tokens\":200,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]," ++
+    "\"tools\":[{\"name\":\"f\",\"description\":\"d\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"string\"}}}}]}";
+
+/// A Messages stream's frames: a tool call (`call`), then 40 prose tokens, one every 10 ms, a 100 ms keepalive.
+fn toolThenProse(call: []const u8, out: []u8) ![]const u8 {
+    var text: TestText = .{};
+    var backend: ScriptEngine = .{ .head = call, .steps = 40 };
+    var srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), quiet, null);
+    defer srv.deinit();
+    const body = try wire(srv, &backend, "/v1/messages", tool_body);
+    defer std.testing.allocator.free(body);
+    errdefer std.debug.print("{s}\n", .{body});
+    // the held-back prose reaches the client at the end, whole or in its deltas
+    const prose = std.mem.indexOf(u8, body, "aaaa") != null or std.mem.count(u8, body, "\"a\"") >= 40;
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_use\"") != null and prose);
+    return frames(body, out);
+}
+
+test "Messages text held back behind an open tool block is silence: it gets keepalives; written text gets none" {
+    var buf: [2][192]u8 = undefined;
+    // the call's function is never closed: its tool block stays open and the prose after it waits for the reply's end
+    const held = try toolThenProse("<tool_call><function=f><parameter=x>v</parameter></tool_call>", &buf[0]);
+    try std.testing.expect(std.mem.count(u8, held, "c") >= 2);
+    // a whole call: its block closes and each prose delta is written as it comes, so the stream is never silent
+    const flowing = try toolThenProse("<tool_call><function=f><parameter=x>v</parameter></function></tool_call>", &buf[1]);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, flowing, "c"));
+    try std.testing.expect(std.mem.count(u8, flowing, "e") >= 40);
 }

@@ -111,7 +111,12 @@ const Wire = struct {
     payload: Value = .null,
 
     fn out(w: *Wire) openai.Out {
-        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole, .comment = comment } };
+        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole, .comment = comment, .written = written } };
+    }
+
+    fn written(ctx: *anyopaque) u64 {
+        const w: *Wire = @ptrCast(@alignCast(ctx));
+        return w.reply.sent;
     }
 
     fn comment(ctx: *anyopaque) error{Closed}!void {
@@ -157,6 +162,7 @@ const Reply = struct {
     kind: ?[]const u8 = null,
     calls: std.AutoArrayHashMapUnmanaged(i64, Call) = .empty,
     pending: std.ArrayList(Pending) = .empty,
+    sent: u64 = 0, // events written to the client (text held back behind an open tool block is none)
     active: ?i64 = null,
     finished: bool = false,
     finish: []const u8 = "end_turn",
@@ -181,7 +187,8 @@ const Reply = struct {
     }
 
     fn send(r: *Reply, kind: []const u8, payload: *json.Object) E!void {
-        return sse.event(r.conn, r.a, kind, .{ .object = payload });
+        try sse.event(r.conn, r.a, kind, .{ .object = payload });
+        r.sent += 1;
     }
 
     fn obj(r: *Reply, kind: []const u8) E!*json.Object {

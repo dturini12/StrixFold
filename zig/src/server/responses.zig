@@ -203,7 +203,12 @@ const Wire = struct {
     payload: Value = .null,
 
     fn out(w: *Wire) openai.Out {
-        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole, .comment = comment } };
+        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole, .comment = comment, .written = written } };
+    }
+
+    fn written(ctx: *anyopaque) u64 {
+        const w: *Wire = @ptrCast(@alignCast(ctx));
+        return w.reply.seq; // (one per streamed event: a chunk that adds no event writes nothing)
     }
 
     fn comment(ctx: *anyopaque) error{Closed}!void {

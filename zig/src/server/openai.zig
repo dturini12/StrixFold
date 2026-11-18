@@ -36,6 +36,8 @@ pub const Out = struct {
         reply: *const fn (ctx: *anyopaque, status: u16, payload: Value) void,
         /// An SSE comment on the open stream (``: keepalive``), which clients skip; null: this output sends none.
         comment: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
+        /// The events this output wrote to the client so far, when it may hold one back; null: every event is written.
+        written: ?*const fn (ctx: *anyopaque) u64 = null,
     };
 };
 
@@ -253,7 +255,7 @@ const Run = struct {
     created: i64,
     streamed_prose: bool = false,
     prose_sent: std.ArrayList(u8) = .empty, // the content a tool stream sent
-    sent: u64 = 0, // data events written to the client (the keepalive's clock moves with them, not with every delta)
+    sent: u64 = 0, // events the output wrote to the client (the keepalive's clock moves with them, not with every delta)
 
     fn chunk(r: *Run, delta: ?Value, finish: ?[]const u8) Allocator.Error!Value {
         const a = r.a;
@@ -281,7 +283,7 @@ const Run = struct {
 
     fn emit(r: *Run, payload: Value) error{Closed}!void {
         try r.out.vt.event(r.out.ctx, payload);
-        r.sent += 1;
+        r.sent = if (r.out.vt.written) |f| f(r.out.ctx) else r.sent + 1;
     }
 
     fn usage(r: *Run, reply: *const chat.Reply) Allocator.Error!Value {

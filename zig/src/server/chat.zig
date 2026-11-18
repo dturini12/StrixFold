@@ -527,11 +527,8 @@ const Generation = struct {
                 g.cancel();
                 return error.Cancelled;
             }
-            const tokens = chunk orelse {
-                try g.keepAlive();
-                continue;
-            };
-            if (g.reason == null) try g.commit(tokens);
+            if (chunk) |tokens| if (g.reason == null) try g.commit(tokens);
+            try g.keepAlive(); // also after a chunk: one that wrote nothing leaves the stream as silent as a wait
         }
     }
 
