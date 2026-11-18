@@ -2766,8 +2766,9 @@ fn testBegin(ln: *Lanes, slot: usize, base: usize) !void {
     try ln.wire.int(gpa, u32, @intCast(slot));
     try ln.wire.int(gpa, u64, base);
     try ln.wire.ids(gpa, ln.seqs[slot].items);
+    try fill_spans.write(&ln.wire, gpa, &.{}); // a text prompt: no pictures
     try ln.flush();
-    if (ln.passDisk()) |d| d.beginPass(std.mem.sliceAsBytes(ln.seqs[slot].items));
+    if (ln.passDisk()) |d| d.beginPass(std.mem.sliceAsBytes(ln.seqs[slot].items), &.{});
     try ln.m.fillBegin(slot, base);
     ln.m.fill_seq = ln.seqs[slot].items;
 }
