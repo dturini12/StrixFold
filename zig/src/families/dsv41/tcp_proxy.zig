@@ -13,7 +13,7 @@
 //! Failure: the proxy poisons the collective on any wire error and sets the slab's abort word, which ends every device
 //! wait at once; a device wait past its deadline (TF_COLL_GPU_WAIT_S) sets the abort word itself and the proxy then
 //! fails the collective. The host raises the word as 1 and the device as 2, neither over the other, so the proxy can tell (and
-//! log, one line) which side gave up; a failed exchange, and one past TF_COLL_GPU_WARN_S, logs a line too.
+//! log, one line) which side gave up, also mid-exchange; a failed exchange, and one past TF_COLL_GPU_WARN_S, too.
 //! Settings (environment, both ranks, in the handshake): TF_COLL_SLOTS (8), TF_COLL_SLOT_MIB (4.25: a 16-row head
 //! gather fits), TF_COLL_PROXY_CPU (6), TF_COLL_PROXY_STRIPE_KIB (0: every slot gather on the first cable; N: with
 //! TF_TP_STRIPE, a slot gather of at least N KiB is split, its second half moved over the second cable by a second
@@ -137,6 +137,7 @@ pub const Core = struct {
             const t0 = wire.monotonicNs();
             k.w.exchange(site, k.tx[base..][0..first], k.rx[base..][0..first]) catch |e| {
                 logExchange(k.w, k.rank, 1, q, site, first, t0, @errorName(e));
+                deviceGaveUp(k.shared, k.rank, q, k.nslot, "exchanging gather");
                 return k.fail(wireCode(e));
             };
             if (second) |s| {
@@ -185,11 +186,13 @@ pub fn deviceGaveUp(shared: *Shared, rank: u32, q: u64, nslot: u32, what: []cons
     });
 }
 
-/// One line about a proxy exchange: a failure (`outcome` the error) or one past the warn threshold.
+/// One line about a proxy exchange, a failure (`outcome` the error) or past the warn threshold, and the peer's arrival.
 fn logExchange(w: *const wire.Wire, rank: u32, cable: u8, q: u64, site: u32, bytes: usize, t0: u64, outcome: []const u8) void {
-    std.log.warn("collectives: rank {d} proxy cable {d} exchange of gather {d} ({s} layer {d}, {d} bytes) after {d} ms: {s}{s}{s}", .{
+    var buf: [48]u8 = undefined;
+    const arrival = if (w.peer_wait_ns == wire.never_arrived) "peer not arrived" else std.fmt.bufPrint(&buf, "peer arrived after {d} ms", .{w.peer_wait_ns / std.time.ns_per_ms}) catch "";
+    std.log.warn("collectives: rank {d} proxy cable {d} exchange of gather {d} ({s} layer {d}, {d} bytes) after {d} ms: {s}{s}{s}; {s}", .{
         rank, cable, q, phaseName(site), site & 0xffff, bytes, (wire.monotonicNs() -| t0) / std.time.ns_per_ms, outcome,
-        if (w.status() != null) " " else "", if (w.status() != null) std.mem.sliceTo(&w.why, 0) else "",
+        if (w.status() != null) " " else "", if (w.status() != null) std.mem.sliceTo(&w.why, 0) else "", arrival,
     });
 }
 
@@ -258,6 +261,7 @@ pub const Second = struct {
             const t0 = wire.monotonicNs();
             s.w.exchange(s.site, s.tx[s.off..][0..s.len], s.rx[s.off..][0..s.len]) catch |e| {
                 logExchange(s.w, s.rank, 2, q, s.site, s.len, t0, @errorName(e));
+                deviceGaveUp(s.shared, s.rank, q, s.nslot, "(second cable) exchanging gather");
                 return s.fail(wireCode(e));
             };
             if (s.warn_ns > 0 and wire.monotonicNs() -| t0 > s.warn_ns) logExchange(s.w, s.rank, 2, q, s.site, s.len, t0, "done");

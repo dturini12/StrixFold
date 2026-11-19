@@ -415,7 +415,8 @@ def main():
                 for lab, a0, a1, action, e0, e1 in cases:
                     port += 40
                     lab = f"{kind}_{lab}"
-                    env = f"{kenv} TF_TP_STRIPE=10.40.1.1 TF_COLL_PROGRESS_MS=2000"
+                    # TF_COLL_GPU_WAIT_S=2: a peer's arrival limit (GPU wait + progress) of 4 s, under the 5 s stall/stop
+                    env = f"{kenv} TF_TP_STRIPE=10.40.1.1 TF_COLL_PROGRESS_MS=2000 TF_COLL_GPU_WAIT_S=2"
                     c1 = rank_cmd(1, env, f"{a1} {kargs}", lab).replace("PORT", str(port))
                     c0 = rank_cmd(0, env, f"{a0} {kargs}", lab).replace("PORT", str(port))
                     b = {h: counters(h) for h in HOSTS}

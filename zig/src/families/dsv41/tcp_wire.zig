@@ -8,8 +8,8 @@
 //! The contract (coll.zig): both ranks call exchange with the same site and byte count in the same order; the headers
 //! carry the session epoch, a sequence number, the site and the size, and any difference fails the call with
 //! Mismatch. The first failure poisons the wire for good (later calls return it at once) and shuts the sockets down so
-//! the peer's call fails promptly too. Deadlines are progress-based: a call fails with Timeout when no byte has moved
-//! in either direction for `progress_ns`.
+//! the peer's call fails promptly too. Deadlines: a call waits up to `arrival_ns` for the peer's first byte, then fails
+//! with Timeout when no byte has moved in either direction for `progress_ns`; a closed peer fails it at once.
 const std = @import("std");
 const c = std.c;
 const linux = std.os.linux;
@@ -45,8 +45,10 @@ pub const Header = extern struct {
 pub const Error = error{ PeerLost, Timeout, Mismatch, Aborted, SocketFailed };
 
 pub const Options = struct {
-    /// no byte moved in either direction for this long: Timeout
+    /// once the peer's bytes of a call flow, no byte moved in either direction for this long: Timeout
     progress_ns: u64 = 2 * std.time.ns_per_s,
+    /// the peer's first byte of a call missing this long after the call began: Timeout (never less than progress_ns)
+    arrival_ns: u64 = 0,
     /// SO_BUSY_POLL microseconds; 50 is the most an unprivileged socket may set here (net.core.busy_read)
     busy_poll_us: c_int = 50,
     /// TCP_RTO_MIN_US per socket (the kernel default floor is 200 ms; HZ=250 makes 8 ms the smallest it takes); 0 keeps
@@ -81,6 +83,9 @@ fn errorState(e: Error) State {
     };
 }
 
+/// Wire.peer_wait_ns of a call that ended before the peer's first byte arrived.
+pub const never_arrived = std.math.maxInt(u64);
+
 pub fn monotonicNs() u64 {
     var ts: c.timespec = undefined;
     _ = c.clock_gettime(c.CLOCK.MONOTONIC, &ts);
@@ -99,6 +104,8 @@ pub const Wire = struct {
     busy: std.atomic.Value(u32) = .init(0),
     /// the first failure's description, for the log
     why: [96]u8 = @splat(0),
+    /// how long the last call waited for the peer's first byte (never_arrived: it did not come); caller's thread only
+    peer_wait_ns: u64 = 0,
 
     /// Rank 0: listen on each address (one per link, its USB4 address), take one connection on each, and check its
     /// hello (magic, version, rank, epoch, link index). Rank 1: connect to each, retrying while rank 0 starts.
@@ -179,6 +186,7 @@ pub const Wire = struct {
     /// Sends `out` and receives the peer's equally long payload into `in`, both at once. The payload is split over the
     /// links when it is at least opt.stripe_min bytes and there is more than one link.
     pub fn exchange(w: *Wire, site: u32, out: []const u8, in: []u8) Error!void {
+        w.peer_wait_ns = never_arrived;
         if (w.status()) |e| return e;
         if (out.len != in.len) return w.failed(error.Mismatch, "local send and receive sizes differ");
         _ = w.busy.fetchAdd(1, .acq_rel);
@@ -221,7 +229,8 @@ pub const Wire = struct {
     };
 
     fn run(w: *Wire, parts: []Part) Error!void {
-        var last = monotonicNs();
+        const t0 = monotonicNs();
+        var last = t0;
         var idle: u32 = 0;
         while (true) {
             var moved = false;
@@ -239,7 +248,11 @@ pub const Wire = struct {
                 if (p.got < p.total()) {
                     all = false;
                     switch (recvPart(p)) {
-                        .moved => moved = true,
+                        .moved => {
+                            moved = true;
+                            // marked here: a small call can end in the pass its first byte arrives
+                            if (w.peer_wait_ns == never_arrived) w.peer_wait_ns = monotonicNs() - t0;
+                        },
                         .again => {},
                         .closed => return w.failed(error.PeerLost, "peer closed while receiving"),
                         .err => return w.failed(error.SocketFailed, "receive failed"),
@@ -261,8 +274,15 @@ pub const Wire = struct {
                 continue;
             }
             idle +%= 1;
-            if (idle % 1024 == 0 and monotonicNs() - last > w.opt.progress_ns)
+            if (idle % 1024 != 0) continue;
+            const now = monotonicNs();
+            if (w.peer_wait_ns == never_arrived) {
+                // the peer has not entered this call: our stalled sends and empty receives are not judged yet
+                if (now - t0 > @max(w.opt.arrival_ns, w.opt.progress_ns))
+                    return w.failed(error.Timeout, "the peer did not arrive within the limit");
+            } else if (now - last > w.opt.progress_ns) {
                 return w.failed(error.Timeout, "no progress within the deadline");
+            }
         }
     }
 
