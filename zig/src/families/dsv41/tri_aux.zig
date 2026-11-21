@@ -56,6 +56,12 @@ pub const GateArgs = extern struct { x: u64, w: u64, out: u64, rows: i32, ne: i3
 /// tf_ds_aux_rope_heads_args: x bf16 [rows, h, hd] rotated in place on its last rd dims. flags: 1 inverse.
 pub const RopeHeadsArgs = extern struct { x: u64, cos: u64, sin: u64, pos: u64, rows: i32, h: i32, hd: i32, rd: i32, flags: i32, pad0: i32 = 0 };
 
+/// tf_ds_aux_route_args: picks [rows, slots] i32 and weights [rows, slots] fp32 from chunk sums s [rows, kc, 384] fp32.
+pub const RouteArgs = extern struct { s: u64, bias: u64, pick: u64, wts: u64, scale: f32, shared_id: i32, rows: i32, kc: i32, topk: i32, slots: i32 };
+
+/// tf_ds_aux_route_score_args (test only): out[i] = the router score of in[i], i < n.
+pub const RouteScoreArgs = extern struct { in: u64, out: u64, n: i32, pad0: i32 = 0 };
+
 /// tf_ds_markov_key: a row's sampling seed, its first draft's position and 1 / its draft temperature (0: greedy).
 pub const MarkovKey = extern struct { seed: u64 = 0, position: u64 = 0, inv_t: f32 = 0, pad0: u32 = 0 };
 
@@ -91,8 +97,14 @@ pub const gate32_rows_wg = 32;
 pub const gate32_block = 128;
 /// aux.rope_heads: pairs a thread (rd a multiple of 2 x this; 16-byte loads of x, cos and sin).
 pub const rope_pairs = 4;
+/// aux.route_pick (TF_DS_AUX route, _route_parts' bits): spec ne/kc, block, most picks/slots; aux.route_score's block.
+pub const route_ne = 384;
+pub const route_kc = 20;
+pub const route_block = route_ne;
+pub const route_max_k = 8;
+pub const route_score_block = 256;
 
-/// Which of them take their HIP kernel (the field names are TF_DS_AUX's list items).
+/// Which of them take their HIP kernel (the field names are TF_DS_AUX's list items); the default, hip, has route off.
 pub const Which = struct {
     attn: bool = true,
     index: bool = true,
@@ -100,10 +112,11 @@ pub const Which = struct {
     gate: bool = true,
     idxw: bool = true,
     rope: bool = true,
+    route: bool = false,
 
-    pub const triton: Which = .{ .attn = false, .index = false, .hc = false, .gate = false, .idxw = false, .rope = false };
+    pub const triton: Which = .{ .attn = false, .index = false, .hc = false, .gate = false, .idxw = false, .rope = false, .route = false };
 
-    /// TF_DS_AUX's value: hip (all), triton (none), or a comma list of attn, index, hc, gate, idxw, rope (those on HIP).
+    /// TF_DS_AUX: hip (all but route), triton (none), or a comma list of the fields and hip (hip,route: all of them).
     pub fn parse(spec: []const u8) error{BadSetting}!Which {
         if (std.mem.eql(u8, spec, "hip")) return .{};
         if (std.mem.eql(u8, spec, "triton")) return triton;
@@ -111,6 +124,11 @@ pub const Which = struct {
         var it = std.mem.splitScalar(u8, spec, ',');
         while (it.next()) |item| {
             var known = false;
+            if (std.mem.eql(u8, item, "hip")) {
+                const h: Which = .{};
+                inline for (@typeInfo(Which).@"struct".field_names) |f| @field(w, f) = @field(w, f) or @field(h, f);
+                known = true;
+            }
             inline for (@typeInfo(Which).@"struct".field_names) |f| if (std.mem.eql(u8, item, f)) {
                 @field(w, f) = true;
                 known = true;
@@ -126,12 +144,19 @@ pub const Which = struct {
         return parse(std.mem.span(v));
     }
 
-    /// The selection as the handshake's plan and the logs name it: hip, triton, or the HIP ones listed (buf: 32 bytes).
+    /// The selection as the plan and the logs name it: hip, triton, hip,route, or the HIP ones listed (buf: 32 bytes).
     pub fn name(w: Which, buf: []u8) []const u8 {
         if (std.meta.eql(w, Which{})) return "hip";
         if (std.meta.eql(w, triton)) return "triton";
+        const h: Which = .{};
+        var six = true;
+        inline for (@typeInfo(Which).@"struct".field_names) |f| six = six and (@field(w, f) or !@field(h, f));
         var n: usize = 0;
-        inline for (@typeInfo(Which).@"struct".field_names) |f| if (@field(w, f)) {
+        if (six) {
+            @memcpy(buf[0..3], "hip");
+            n = 3;
+        }
+        inline for (@typeInfo(Which).@"struct".field_names) |f| if (@field(w, f) and !(six and @field(h, f))) {
             if (n > 0) {
                 buf[n] = ',';
                 n += 1;
@@ -151,6 +176,8 @@ pub const Aux = struct {
     gate: ?gpu.Function = null, // aux.gate_logits, ne a multiple of 64 (the router)
     gate32: ?gpu.Function = null, // aux.gate_logits, ne = 32 (the indexer's head weights)
     rope: ?gpu.Function = null,
+    route: ?gpu.Function = null, // aux.route_pick (384 experts, kc 20)
+    route_score: ?gpu.Function = null, // aux.route_score: the score alone (the fusion check's exhaustive test)
     markov_race: ?gpu.Function = null, // the drafter's Markov step of a sampled pass (tri_markov.raceBest; no Triton form)
 };
 
@@ -192,6 +219,51 @@ test "TF_DS_AUX: hip, triton, or the kernels listed" {
     try std.testing.expectEqualStrings("triton", Which.triton.name(&b));
     // the longest list (all but one) fits the 32-byte buffers the logs and the handshake name it in
     try std.testing.expectEqualStrings("attn,index,hc,gate,idxw", (Which{ .rope = false }).name(&b));
+}
+
+test "TF_DS_AUX: route is a list item beside hip; hip alone keeps meaning the six" {
+    const six: Which = .{};
+    try std.testing.expect(!six.route);
+    try std.testing.expectEqual(six, try Which.parse("hip"));
+    var hr = six;
+    hr.route = true;
+    try std.testing.expectEqual(hr, try Which.parse("hip,route"));
+    try std.testing.expectEqual(hr, try Which.parse("route,hip"));
+    var r = Which.triton;
+    r.route = true;
+    try std.testing.expectEqual(r, try Which.parse("route"));
+    try std.testing.expectEqual(Which.triton, try Which.parse("triton"));
+    try std.testing.expect(!(try Which.parse("triton")).route);
+    var ar = r;
+    ar.attn = true;
+    try std.testing.expectEqual(ar, try Which.parse("attn,route"));
+    try std.testing.expectEqual(six, try Which.parse("hip,hip"));
+    try std.testing.expectError(error.BadSetting, Which.parse("hip,routes"));
+    try std.testing.expectError(error.BadSetting, Which.parse("hip,"));
+    try std.testing.expectError(error.BadSetting, Which.parse("triton,route"));
+    // the names (the handshake's plan string): hip unchanged; route on top of the six is hip,route
+    var b: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("hip", six.name(&b));
+    try std.testing.expectEqualStrings("hip,route", hr.name(&b));
+    try std.testing.expectEqualStrings("route", r.name(&b));
+    try std.testing.expectEqualStrings("attn,route", ar.name(&b));
+    try std.testing.expectEqualStrings("triton", Which.triton.name(&b));
+    // the longest names still fit the 32-byte buffers
+    var no_attn = hr;
+    no_attn.attn = false;
+    try std.testing.expectEqualStrings("index,hc,gate,idxw,rope,route", no_attn.name(&b));
+    var no_rope = hr;
+    no_rope.rope = false;
+    try std.testing.expectEqualStrings("attn,index,hc,gate,idxw,route", no_rope.name(&b));
+    // a name parses back to the same selection
+    for ([_]Which{ six, hr, r, ar, Which.triton, no_attn, no_rope }) |w| try std.testing.expectEqual(w, try Which.parse(w.name(&b)));
+}
+
+test "the route kernels' argument structs are abi.h's sizes" {
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(RouteArgs));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(RouteArgs, "scale"));
+    try std.testing.expectEqual(@as(usize, 52), @offsetOf(RouteArgs, "slots"));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(RouteScoreArgs));
 }
 
 test "the grids follow w-tri's launches" {

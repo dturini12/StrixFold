@@ -394,6 +394,35 @@ TF_DS_ASSERT(offsetof(tf_ds_aux_rope_heads_args, rd) == 44, "rd");
 TF_DS_ASSERT(offsetof(tf_ds_aux_rope_heads_args, flags) == 48, "flags");
 TF_DS_ASSERT(offsetof(tf_ds_aux_rope_heads_args, pad0) == 52, "pad0");
 
+// aux_route.hip tf_ds_aux_route_pick_ne384 (_route_parts' bits): s fp32 [rows, 20, 384] -> pick, wts [rows, slots]
+typedef struct {
+    uint64_t s, bias, pick, wts;
+    float scale;
+    int32_t shared_id, rows, kc, topk, slots;
+} tf_ds_aux_route_args;
+TF_DS_ASSERT(sizeof(tf_ds_aux_route_args) == 56, "tf_ds_aux_route_args size");
+TF_DS_ASSERT(offsetof(tf_ds_aux_route_args, s) == 0, "s");
+TF_DS_ASSERT(offsetof(tf_ds_aux_route_args, bias) == 8, "bias");
+TF_DS_ASSERT(offsetof(tf_ds_aux_route_args, pick) == 16, "pick");
+TF_DS_ASSERT(offsetof(tf_ds_aux_route_args, wts) == 24, "wts");
+TF_DS_ASSERT(offsetof(tf_ds_aux_route_args, scale) == 32, "scale");
+TF_DS_ASSERT(offsetof(tf_ds_aux_route_args, shared_id) == 36, "shared_id");
+TF_DS_ASSERT(offsetof(tf_ds_aux_route_args, rows) == 40, "rows");
+TF_DS_ASSERT(offsetof(tf_ds_aux_route_args, kc) == 44, "kc");
+TF_DS_ASSERT(offsetof(tf_ds_aux_route_args, topk) == 48, "topk");
+TF_DS_ASSERT(offsetof(tf_ds_aux_route_args, slots) == 52, "slots");
+
+// aux_route.hip tf_ds_aux_route_score (test only): out[i] = the pick kernel's score of in[i]; block 256, grid-stride
+typedef struct {
+    uint64_t in, out;
+    int32_t n, pad0;
+} tf_ds_aux_route_score_args;
+TF_DS_ASSERT(sizeof(tf_ds_aux_route_score_args) == 24, "tf_ds_aux_route_score_args size");
+TF_DS_ASSERT(offsetof(tf_ds_aux_route_score_args, in) == 0, "in");
+TF_DS_ASSERT(offsetof(tf_ds_aux_route_score_args, out) == 8, "out");
+TF_DS_ASSERT(offsetof(tf_ds_aux_route_score_args, n) == 16, "n");
+TF_DS_ASSERT(offsetof(tf_ds_aux_route_score_args, pad0) == 20, "pad0");
+
 /* exl3.l2_prefetch's first parameter (ops.zig Prefetch, the CUDA kernel's TfDsPrefetch): up to 16 device ranges, each
  * its first byte and length; the kernel's other two parameters are int64 delay_ns and wave_ns. */
 typedef struct {

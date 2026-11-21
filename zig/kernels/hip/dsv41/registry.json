@@ -230,6 +230,15 @@
    ]
   },
   {
+   "source": "aux_route.hip",
+   "owner": "w-tri",
+   "kit": "dsv41",
+   "kernels": [
+    {"id": "aux.route_pick", "symbol": "tf_ds_aux_route_pick_ne384", "spec": {"ne": 384, "kc": 20}, "block": [384, 1, 1], "numerics": "route_triton_bits"},
+    {"id": "aux.route_score", "symbol": "tf_ds_aux_route_score", "block": [256, 1, 1], "numerics": "route_triton_bits", "feature": "test"}
+   ]
+  },
+  {
    "source": "dense.hip",
    "owner": "p-par",
    "kit": "dsv41",

@@ -166,6 +166,13 @@ pub fn rowmmGate(t: Tri, x: u64, xs: usize, w: u64, out: u64, rows: usize, k: us
 
 /// route: picks [R, SLOTS] i32 and weights [R, SLOTS] fp32 (shared expert last) from logits [R, NE] (kc 0) or chunk sums [R, kc, NE].
 pub fn route(t: Tri, logits: u64, kc: usize, bias: u64, topk: usize, scale: f32, shared_id: usize, pick: u64, wts: u64, rows: usize, ne: usize, slots: usize) !void {
+    // aux.route_pick (TF_DS_AUX route): _route_parts' bits for 384 experts, kc 20, <= 8 picks and slots; else Triton
+    if (kc > 0) if (t.aux) |ax| if (ax.route) |f| if (kc == tri_aux.route_kc and ne == tri_aux.route_ne and topk <= tri_aux.route_max_k and slots <= tri_aux.route_max_k) {
+        return t.runHipBlock("aux.route_pick", f, .{ u(rows), 1, 1 }, tri_aux.route_block, tri_aux.RouteArgs{
+            .s = logits, .bias = bias, .pick = pick, .wts = wts, .scale = scale, .shared_id = @intCast(shared_id),
+            .rows = @intCast(rows), .kc = @intCast(kc), .topk = @intCast(topk), .slots = @intCast(slots),
+        });
+    };
     if (kc > 0) return t.run("_route_parts", .{ u(rows), 1, 1 }, &.{
         p("S", "*fp32", logits), p("BIAS", "*fp32", bias), p("PICK", "*i32", pick), p("WTS", "*fp32", wts), aot.float("scale", scale), aot.int("shared_id", @intCast(shared_id)),
     }, &.{ ci("NE", ne), ci("NB", tri.pow2(ne)), ci("TOPK", topk), ci("SLOTS", slots), ci("SP", tri.pow2(slots)), ci("KC", kc), t.pdlConst() });
@@ -357,4 +364,91 @@ test "route (logits) launches _route as recorded" {
 
 test "route (rowmm_gate's chunk sums) launches _route_parts as recorded" {
     try tri.conform("_route_parts", callRoute);
+}
+
+test "aux.route_pick takes the main model's routing at the round, a 16-row prompt chunk and an image span" {
+    var log: tri.Log = .{ .gpa = std.testing.allocator };
+    defer log.deinit();
+    const f: gpu.Function = undefined; // a logging Tri launches nothing
+    const aux: tri_aux.Aux = .{ .route = f };
+    const t: Tri = .{ .log = &log, .aux = &aux };
+    // round.moe and prompt.moe (a decode-sized chunk): the gate's chunk sums gl [R, 20, 384], every row count 1-16
+    for (1..17) |r| try route(t, 0x10000, 20, 0x2000, 6, 1.5, 384, 0x3000, 0x4000, r, 384, 7);
+    // prompt.routeSpans: an image span's rows of the chunk sums (a row offset), the image bias, its own pick buffers
+    const row = 20 * 384 * 4;
+    try route(t, 0x10000 + 3 * row, 20, 0x5000, 6, 1.5, 384, 0x6000, 0x7000, 5, 384, 7);
+    const it = log.items.items;
+    try std.testing.expectEqual(@as(usize, 17), it.len);
+    for (it, 0..) |k, i| {
+        try std.testing.expectEqualStrings("aux.route_pick", k.name);
+        try std.testing.expectEqual(@as(u32, tri_aux.route_block), k.block);
+        if (i < 16) {
+            try std.testing.expectEqual([3]u32{ @intCast(i + 1), 1, 1 }, k.grid);
+            try std.testing.expectEqual(tri_aux.RouteArgs{ .s = 0x10000, .bias = 0x2000, .pick = 0x3000, .wts = 0x4000, .scale = 1.5, .shared_id = 384, .rows = @intCast(i + 1), .kc = 20, .topk = 6, .slots = 7 }, log.hipArgs(tri_aux.RouteArgs, i));
+        }
+    }
+    try std.testing.expectEqual([3]u32{ 5, 1, 1 }, it[16].grid);
+    try std.testing.expectEqual(tri_aux.RouteArgs{ .s = 0x10000 + 3 * row, .bias = 0x5000, .pick = 0x6000, .wts = 0x7000, .scale = 1.5, .shared_id = 384, .rows = 5, .kc = 20, .topk = 6, .slots = 7 }, log.hipArgs(tri_aux.RouteArgs, 16));
+}
+
+test "route keeps Triton for the drafter's shape, plain logits, other shapes and when aux.route_pick is not bound" {
+    var log: tri.Log = .{ .gpa = std.testing.allocator };
+    defer log.deinit();
+    const f: gpu.Function = undefined;
+    const aux: tri_aux.Aux = .{ .route = f };
+    const t: Tri = .{ .log = &log, .aux = &aux };
+    try route(t, 0x10000, 20, 0x2000, 3, 1.5, 128, 0x3000, 0x4000, 10, 128, 4); // the drafter: 128 experts, top 3
+    try route(t, 0x10000, 0, 0x2000, 6, 1.5, 384, 0x3000, 0x4000, 2048, 384, 7); // a long chunk's plain logits
+    try route(t, 0x10000, 16, 0x2000, 6, 1.5, 384, 0x3000, 0x4000, 4, 384, 7); // another chunk count
+    try route(t, 0x10000, 20, 0x2000, 9, 1.5, 384, 0x3000, 0x4000, 4, 384, 10); // more picks than the kernel keeps
+    try route(t, 0x10000, 20, 0x2000, 6, 1.5, 384, 0x3000, 0x4000, 4, 384, 9); // more slots than it keeps
+    const none: tri_aux.Aux = .{};
+    try route(.{ .log = &log, .aux = &none }, 0x10000, 20, 0x2000, 6, 1.5, 384, 0x3000, 0x4000, 4, 384, 7);
+    try route(.{ .log = &log }, 0x10000, 20, 0x2000, 6, 1.5, 384, 0x3000, 0x4000, 4, 384, 7);
+    const want = [_][]const u8{ "_route_parts", "_route", "_route_parts", "_route_parts", "_route_parts", "_route_parts", "_route_parts" };
+    try std.testing.expectEqual(want.len, log.items.items.len);
+    for (want, log.items.items) |w, k| try std.testing.expectEqualStrings(w, k.name);
+}
+
+test "with route on, every recorded _route_parts launch of 384 experts takes aux.route_pick; the drafter's keep their variant" {
+    const a = std.testing.allocator;
+    const f: gpu.Function = undefined;
+    const aux: tri_aux.Aux = .{ .route = f };
+    var main_rows = std.StaticBitSet(17).initEmpty();
+    var drafter: usize = 0;
+    for ([_][]const u8{ tri.fixtures, tri.derived_fixtures }) |src| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, src, .{});
+        defer parsed.deinit();
+        const cases = (parsed.value.object.get("_route_parts") orelse continue).array.items;
+        for (cases) |cv| {
+            const c: Case = .{ .v = cv.object };
+            var log: tri.Log = .{ .gpa = a };
+            defer log.deinit();
+            try callRoute(.{ .log = &log, .aux = &aux, .pdl = true }, c);
+            try std.testing.expectEqual(@as(usize, 1), log.items.items.len);
+            const k = log.items.items[0];
+            const rows = c.dim("S", 0);
+            if (c.constInt("NE") == tri_aux.route_ne) {
+                try std.testing.expectEqualStrings("aux.route_pick", k.name);
+                try std.testing.expectEqual([3]u32{ @intCast(rows), 1, 1 }, k.grid);
+                try std.testing.expectEqual(tri_aux.RouteArgs{
+                    .s = c.ptr("S"), .bias = c.ptr("BIAS"), .pick = c.ptr("PICK"), .wts = c.ptr("WTS"), .scale = c.float("scale"),
+                    .shared_id = @intCast(c.int("shared_id")), .rows = @intCast(rows), .kc = @intCast(c.dim("S", 1)),
+                    .topk = @intCast(c.constInt("TOPK")), .slots = @intCast(c.dim("PICK", 1)),
+                }, log.hipArgs(tri_aux.RouteArgs, 0));
+                main_rows.set(rows);
+            } else {
+                try std.testing.expectEqualStrings("_route_parts", k.name);
+                try std.testing.expect(try tri.covered(a, k));
+                drafter += 1;
+            }
+        }
+    }
+    // recorded: the main model's routing at 1 row (forward) and 16 (a round), and the drafter's; rows are the grid
+    try std.testing.expect(main_rows.isSet(1) and main_rows.isSet(16));
+    try std.testing.expect(drafter > 0);
+}
+
+test {
+    _ = @import("route_select.zig"); // aux.route_pick's selection against _route_parts' loop (host equivalence test)
 }
