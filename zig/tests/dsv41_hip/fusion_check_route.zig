@@ -219,7 +219,10 @@ pub fn step(e: *const Env, r: *Report) !void {
     msg = .{};
     var bad: usize = 0;
     var launch_bad = false;
+    const before = try cm.entryCounts(e.gpa, e.kit);
+    defer e.gpa.free(before);
     for (all) |c| bad += try runCase(e, &b, c, &rng, host_s, &msg, &launch_bad);
+    try baseline(e, r, before);
     msg.put("{d} cases (rows 1-16, 4 regimes x 2 biases; ties, ±inf, NaN, degenerate rows, row offset): {d} words of PICK/WTS (and guard rows) differ", .{ all.len, bad });
     r.check("route.bits", bad == 0 and !launch_bad, msg.text());
 
@@ -233,6 +236,27 @@ pub fn step(e: *const Env, r: *Report) !void {
         const gain = (us[0] - us[1]) * launches / 1000.0;
         r.timing("\"timing\": \"route\", \"rows\": {d}, \"launches\": {d}, \"replays\": {d}, \"route_parts_us\": {d:.3}, \"route_pick_us\": {d:.3}", .{ rows, launches, e.o.replays, us[0], us[1] }, rows, gain);
     }
+}
+
+/// The off path's _route_parts launches all came from the deployed object (--route-object), and some did.
+fn baseline(e: *const Env, r: *Report, before: []const u64) !void {
+    var msg: Msg = .{};
+    const want = e.o.route_object.?;
+    var from_it: u64 = 0;
+    var elsewhere: u64 = 0;
+    for (e.kit.entries, before, 0..) |entry, b0, i| {
+        const tt = entry.k.triton orelse continue;
+        if (!std.mem.eql(u8, tt.@"fn", "_route_parts")) continue;
+        const n = e.kit.launches(@intCast(i)) - b0;
+        if (n == 0) continue;
+        const sha = cm.objectSha(e.kit.m, entry.k.object) orelse "?";
+        if (std.mem.eql(u8, sha, want)) from_it += n else {
+            if (elsewhere == 0) msg.put("_route_parts launched {d}x from {s} (sha256 {s}), not the deployed object; ", .{ n, entry.k.object, sha });
+            elsewhere += n;
+        }
+    }
+    msg.put("the off path launched _route_parts {d}x from the deployed object {s}, {d}x from another", .{ from_it, want, elsewhere });
+    r.check("route.baseline", from_it > 0 and elsewhere == 0, msg.text());
 }
 
 const Graph = struct {

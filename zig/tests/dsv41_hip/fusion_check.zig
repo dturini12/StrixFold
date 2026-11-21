@@ -15,7 +15,8 @@ const Opts = cm.Opts;
 
 const usage =
     \\usage: tf-dsv41-fusion-check --kit DIR [--steps score,route,hc] [--oracle FILE --oracle-sha HEX]
-    \\         [--aux-object SHA] [--score-batches N] [--replays N] [--seed N] [--receipt PATH] [--dry-run]
+    \\         [--aux-object SHA] [--route-object SHA] [--score-batches N] [--replays N] [--seed N]
+    \\         [--receipt PATH] [--dry-run]
     \\The launch-fusion window (out/fusion-20261121/PLAN.md 6.2) on one GPU, no peer, no model, through the family's
     \\own launch code and the candidate's own serve kit (Triton variants and native objects, as hip_load loads them).
     \\Old and new are compared bit for bit; any difference fails its step and names the first one:
@@ -38,6 +39,8 @@ const usage =
     \\  --oracle FILE      T2's _t_score code object (required by score); --oracle-sha its sha256 (required with it)
     \\  --aux-object SHA   the aux_route object T2-score-asm.md was made on: aux.route_pick and aux.route_score
     \\                     must both live in exactly that kit object
+    \\  --route-object SHA the deployed kit's _route_parts object (required by route): every _route_parts launch
+    \\                     of the off path must come from the kit object of this sha256 (production's baseline)
     \\  --score-batches N  batches of 2^24 inputs from pattern 0 (default 256 = all 2^32; fewer only for a smoke run)
     \\  --replays N        timed graph replays a row count (default 2000)
     \\  --seed N           the synthetic inputs' seed (default 1)
@@ -78,13 +81,15 @@ fn parseArgs(args: []const []const u8) !Opts {
         if (i + 1 >= args.len) return error.MissingValue;
         const v = args[i + 1];
         i += 1;
-        if (std.mem.eql(u8, a, "--kit")) kit = v else if (std.mem.eql(u8, a, "--steps")) o.steps = try parseSteps(v) else if (std.mem.eql(u8, a, "--oracle")) o.oracle = v else if (std.mem.eql(u8, a, "--oracle-sha")) o.oracle_sha = v else if (std.mem.eql(u8, a, "--aux-object")) o.aux_object = v else if (std.mem.eql(u8, a, "--score-batches")) o.score_batches = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, a, "--replays")) o.replays = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, a, "--seed")) o.seed = try std.fmt.parseInt(u64, v, 10) else if (std.mem.eql(u8, a, "--receipt")) o.receipt = v else return error.UnknownOption;
+        if (std.mem.eql(u8, a, "--kit")) kit = v else if (std.mem.eql(u8, a, "--steps")) o.steps = try parseSteps(v) else if (std.mem.eql(u8, a, "--oracle")) o.oracle = v else if (std.mem.eql(u8, a, "--oracle-sha")) o.oracle_sha = v else if (std.mem.eql(u8, a, "--aux-object")) o.aux_object = v else if (std.mem.eql(u8, a, "--route-object")) o.route_object = v else if (std.mem.eql(u8, a, "--score-batches")) o.score_batches = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, a, "--replays")) o.replays = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, a, "--seed")) o.seed = try std.fmt.parseInt(u64, v, 10) else if (std.mem.eql(u8, a, "--receipt")) o.receipt = v else return error.UnknownOption;
     }
     o.kit = kit orelse return error.NoKit;
     if (o.steps.score and (o.oracle == null or o.oracle_sha == null)) return error.ScoreNeedsOracle;
     if ((o.oracle == null) != (o.oracle_sha == null)) return error.OracleNeedsSha;
     if (o.oracle_sha) |s| if (!isHex64(s)) return error.BadSha;
     if (o.aux_object) |s| if (!isHex64(s)) return error.BadSha;
+    if (o.steps.route and o.route_object == null) return error.RouteNeedsObject;
+    if (o.route_object) |s| if (!isHex64(s)) return error.BadSha;
     if (o.score_batches == 0 or o.score_batches > cm.score_batches_all) return error.BadBatches;
     if (o.replays == 0) return error.BadReplays;
     return o;
@@ -242,6 +247,12 @@ fn dryRun(gpa: std.mem.Allocator, io: std.Io, o: *const Opts, r: *Report) !void 
         msg = .{};
         r.check("dry.aux_object", cm.auxObjectOk(m, &msg, o.aux_object), msg.text());
     }
+    if (o.route_object) |sha| {
+        const ok = cm.hasVariantIn(m, "_route_parts", sha);
+        msg = .{};
+        msg.put("a _route_parts variant in the object of sha256 {s}: {}", .{ sha, ok });
+        r.check("dry.route_object", ok, msg.text());
+    }
     // the Triton functions the steps launch (strict mode resolves each launch's exact variant on the GPU)
     msg = .{};
     var missing: usize = 0;
@@ -271,8 +282,8 @@ fn gpuRun(gpa: std.mem.Allocator, io: std.Io, o: *const Opts, r: *Report, id: *I
     var ctx = try gpu.Context.init(&d, 0);
     defer ctx.deinit();
     const caps = try ctx.caps();
-    id.arch = caps.archName();
-    const kit = try gpu.Kit.open(gpa, io, &d, o.kit, id.arch, .{ .vision = false });
+    id.setArch(caps.archName());
+    const kit = try gpu.Kit.open(gpa, io, &d, o.kit, id.archName(), .{ .vision = false });
     defer kit.deinit();
     id.kit_sha = kit.manifest_sha256;
     id.strict = kit.strict;
@@ -293,13 +304,28 @@ fn gpuRun(gpa: std.mem.Allocator, io: std.Io, o: *const Opts, r: *Report, id: *I
         .o = o,
     };
     std.debug.print("kit {s}: {d} objects, {d} kernels, manifest sha256 {s}, strict {}\n", .{ o.kit, kit.m.objects.len, kit.m.kernels.len, &kit.manifest_sha256, kit.strict });
-    if (o.steps.score) stepScore(&env, r, id.arch) catch |err| r.check("score.error", false, @errorName(err));
+    if (o.steps.score) stepScore(&env, r, id.archName()) catch |err| r.check("score.error", false, @errorName(err));
     if (o.steps.route) route.step(&env, r) catch |err| r.check("route.error", false, @errorName(err));
     if (o.steps.hc) hc.step(&env, r) catch |err| r.check("hc.error", false, @errorName(err));
 }
 
 /// What the receipt records of the run's device and kit.
-const Ident = struct { arch: []const u8 = "", kit_sha: [64]u8 = @splat('-'), strict: bool = false };
+const Ident = struct {
+    arch: [32]u8 = undefined,
+    arch_len: usize = 0,
+    kit_sha: [64]u8 = @splat('-'),
+    strict: bool = false,
+
+    /// A copy of the device's arch name (caps is gpuRun's local; the receipt is written after it returns).
+    fn setArch(id: *Ident, name: []const u8) void {
+        id.arch_len = @min(name.len, id.arch.len);
+        @memcpy(id.arch[0..id.arch_len], name[0..id.arch_len]);
+    }
+
+    fn archName(id: *const Ident) []const u8 {
+        return id.arch[0..id.arch_len];
+    }
+};
 
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.arena.allocator();
@@ -320,7 +346,7 @@ pub fn main(init: std.process.Init) !u8 {
     const rc: u8 = if (r.failed > 0) 1 else if (r.timing_short > 0) 4 else 0;
     std.debug.print("fusion-check: {d} passed, {d} failed, {d} timings short; exit {d}\n", .{ r.passed, r.failed, r.timing_short, rc });
     if (o.receipt) |p| {
-        const text = try std.fmt.allocPrint(gpa, "{{\n  \"receipt\": \"tf-dsv41-fusion-check\",\n  \"schema\": 1,\n  \"dry_run\": {},\n  \"arch\": \"{s}\",\n  \"kit\": \"{s}\",\n  \"kit_manifest_sha256\": \"{s}\",\n  \"strict\": {},\n  \"seed\": {d},\n  \"passed\": {d},\n  \"failed\": {d},\n  \"timing_short\": {d},\n  \"exit\": {d},\n  \"lines\": [\n{s}\n  ]\n}}\n", .{ o.dry_run, id.arch, o.kit, &id.kit_sha, id.strict, o.seed, r.passed, r.failed, r.timing_short, rc, r.json.items });
+        const text = try std.fmt.allocPrint(gpa, "{{\n  \"receipt\": \"tf-dsv41-fusion-check\",\n  \"schema\": 1,\n  \"dry_run\": {},\n  \"arch\": \"{s}\",\n  \"kit\": \"{s}\",\n  \"kit_manifest_sha256\": \"{s}\",\n  \"strict\": {},\n  \"seed\": {d},\n  \"passed\": {d},\n  \"failed\": {d},\n  \"timing_short\": {d},\n  \"exit\": {d},\n  \"lines\": [\n{s}\n  ]\n}}\n", .{ o.dry_run, id.archName(), o.kit, &id.kit_sha, id.strict, o.seed, r.passed, r.failed, r.timing_short, rc, r.json.items });
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = text });
     }
     return rc;

@@ -36,6 +36,8 @@ pub const Opts = struct {
     oracle: ?[]const u8 = null,
     oracle_sha: ?[]const u8 = null,
     aux_object: ?[]const u8 = null,
+    /// The deployed kit's _route_parts object (sha256): the only object the off path may launch it from.
+    route_object: ?[]const u8 = null,
     score_batches: usize = score_batches_all,
     replays: usize = 2000,
     seed: u64 = 1,
@@ -239,6 +241,27 @@ pub fn auxObjectOk(m: gpu.manifest.Manifest, msg: *Msg, want: ?[]const u8) bool 
         return false;
     };
     return true;
+}
+
+/// Every kit entry's launch count now (to diff around a run, entry by entry).
+pub fn entryCounts(a: std.mem.Allocator, kit: *const gpu.Kit) ![]u64 {
+    const c = try a.alloc(u64, kit.entries.len);
+    for (c, 0..) |*x, i| x.* = kit.launches(@intCast(i));
+    return c;
+}
+
+/// The manifest's sha256 of object file `file`, or null.
+pub fn objectSha(m: gpu.manifest.Manifest, file: []const u8) ?[]const u8 {
+    for (m.objects) |ob| if (std.mem.eql(u8, ob.file, file)) return ob.sha256;
+    return null;
+}
+
+/// Whether the kit holds a variant of Triton function `name` in the object of sha256 `sha`.
+pub fn hasVariantIn(m: gpu.manifest.Manifest, name: []const u8, sha: []const u8) bool {
+    for (m.kernels) |k| if (k.triton) |tt| if (std.mem.eql(u8, tt.@"fn", name)) {
+        if (objectSha(m, k.object)) |s| if (std.mem.eql(u8, s, sha)) return true;
+    };
+    return false;
 }
 
 /// `work.record()` captured as a graph, uploaded, 20 warm replays, then `replays` back to back: mean ms a replay.
