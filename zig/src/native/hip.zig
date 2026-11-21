@@ -198,6 +198,10 @@ const Host = struct {
         if (getenv("TF_FILL_SLICE_MS")) |v| served.fill_slice_ns = std.math.mul(u64, try std.fmt.parseInt(u64, v, 10), std.time.ns_per_ms) catch return error.Overflow;
         // TF_FILL_CUT_IN=T: between such a pass's slices a waiting prompt of at most T tokens reads whole (0: none)
         if (getenv("TF_FILL_CUT_IN")) |v| served.fill_cut_in = try std.fmt.parseInt(u32, v, 10);
+        // TF_DS_TOWER_SLICE_MS=N: while streams decode, the tower runs N ms between their rounds (empty, 0: free)
+        if (getenv("TF_DS_TOWER_SLICE_MS")) |v| if (v.len > 0) {
+            served.tower_slice_ns = std.math.mul(u64, try std.fmt.parseInt(u64, v, 10), std.time.ns_per_ms) catch return error.Overflow;
+        };
         h.host = api.LaneHost.init(h.gpa, io, &h.core, served);
         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
         h.host.explain = explain;

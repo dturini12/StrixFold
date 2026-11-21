@@ -608,6 +608,7 @@ pub const Lanes = struct {
     disk: ?*disk_mod.Disk = null,
     fill: ?Fill = null, // the prompt pass in progress across prefill_slice calls (one at a time)
     held: ?Fill = null, // the paused pass a cut-in set aside, the pass in progress again when the cut-in ends
+    fill_images: bool = false, // rank 0, TF_DS_FILL_IMAGES=1: a pass with images reads in slices too (false: whole)
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };

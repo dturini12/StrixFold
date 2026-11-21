@@ -37,6 +37,8 @@ pub const Config = struct {
     default_max_tokens: i64 = 4096,
     /// Image parts a request may carry, its earlier turns' included (--vision-max-images), counted before decoding.
     max_images: u32 = 32,
+    /// Pictures whose preparation is remembered by source bytes (--vision-image-memo); 0: none, prepared every request.
+    image_memo: u32 = 0,
     enable_thinking: bool = true,
     reasoning_effort: ?[]const u8 = null,
     thinking_budget: i64 = 0,

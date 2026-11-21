@@ -107,6 +107,7 @@ pub const Image = struct {
     bytes: []const u8,
     rows: bool = false,
     digest: ?image_key.Digest = null, // the picture's identity for the prompt caches (null: not taken yet)
+    source: []const u8 = &.{}, // with `bytes` empty: the source the encoder prepares (Vision.source_prepare)
 };
 
 /// A vision family's image input as a server renders it (engine_api.Info.vision): each image part becomes
@@ -124,6 +125,8 @@ pub const Vision = struct {
     max_tokens: u32 = 0,
     /// The most decoded pixels one request's images may hold together (Prepared.pixels summed); 0: no limit.
     max_pixels: u64 = 0,
+    /// The encoder prepares a picture from Image.source (HIP), so the server may send that; false: always the payload.
+    source_prepare: bool = false,
 
     /// A picture's span length, its payload, and the pixels its decode held (0: not counted).
     pub const Prepared = struct { tokens: u32, payload: []const u8, pixels: u64 = 0 };
@@ -137,6 +140,13 @@ pub const Encode = struct {
     start: *const fn (ctx: *anyopaque, images: []const Image, from: u32, wake: Wake) void,
     ready: *const fn (ctx: *anyopaque, images: []const Image) bool,
     forget: *const fn (ctx: *anyopaque, images: []const Image) void,
+    /// Tower pacing (Info.tower_slice_ns; null: free): from now it runs only in `slice`; returns with its stream idle.
+    hold: ?*const fn (ctx: *anyopaque) void = null,
+    /// Runs the held tower one block at least, then until `budget_ns` passed; returns with its stream idle.
+    slice: ?*const fn (ctx: *anyopaque, budget_ns: u64) void = null,
+    /// The tower runs free again. Each of the three returns at once when no picture is being encoded.
+    release: ?*const fn (ctx: *anyopaque) void = null,
+    // Contract: `hold` and `slice` return with the tower idle, also right after an urgent encode handed it back
 };
 
 /// Called on the encoder's thread once a request's rows are ready, with none of its own locks held.
