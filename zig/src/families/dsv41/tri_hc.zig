@@ -60,6 +60,20 @@ pub const Sink = struct { s: gpu.Stream, fork: gpu.Event, cnt: u64 = 0 };
 /// own code, the same bits), on this stream; nothing goes to the side stream.
 pub var fuse = false;
 
+/// TF_DS_HC_INLINE=1 (set by Model.open before its plan text): round mixes take hcPre2 without sink, 2 launches a site.
+pub var inline_mix = false;
+
+/// The engine's variable for inline_mix.
+pub const inline_env = "TF_DS_HC_INLINE";
+
+/// inline_mix's value from TF_DS_HC_INLINE: unset or "0" off, "1" on, anything else refused.
+pub fn inlineSetting(v: ?[]const u8) error{BadSetting}!bool {
+    const s = v orelse return false;
+    if (std.mem.eql(u8, s, "0")) return false;
+    if (std.mem.eql(u8, s, "1")) return true;
+    return error.BadSetting;
+}
+
 /// sink.wait_stream(current stream): a Tri on the side stream after the work queued so far; no PDL (no _pdl() there).
 fn sinkTri(t: Tri, sk: Sink) !Tri {
     if (t.log == null) {
@@ -401,4 +415,58 @@ test "aux.hc_mix_pf takes hc_mix_pf at every row count; Triton keeps another wid
     try std.testing.expectEqual(tri_aux.hcGrid(64), it[2].grid);
     try std.testing.expectEqualStrings("_hc_mix_pf", it[3].name);
     try std.testing.expectEqualStrings("_hc_mix_pf", it[4].name);
+}
+
+test "TF_DS_HC_INLINE: values 0 and 1 only, unset off" {
+    try std.testing.expect(!try inlineSetting(null));
+    try std.testing.expect(!try inlineSetting("0"));
+    try std.testing.expect(try inlineSetting("1"));
+    for ([_][]const u8{ "", "2", "true", "on", " 1", "01" }) |v| try std.testing.expectError(error.BadSetting, inlineSetting(v));
+}
+
+test "inline mixes (no sink): 2 launches a site at rows 1-16, posted or not, each its own kit variant" {
+    const a = std.testing.allocator;
+    var log: tri.Log = .{ .gpa = a };
+    defer log.deinit();
+    const t: Tri = .{ .log = &log, .pdl = true }; // served: PDL on
+    const d = 5120;
+    const h = stand(1);
+    const part = stand(2);
+    const ps: Posted = .{ .gathered = stand(3), .world = 2, .h_out = stand(4) };
+    for (1..17) |rows| {
+        for ([_]?Posted{ ps, null }) |posted| {
+            // as round.zig mix hands it with tri_hc.inline_mix: the same arguments, no sink
+            const src = try hcPre2(t, h, stand(5), stand(6), stand(7), stand(8), stand(9), 1e-20, 1e-6, 20, stand(10), stand(11), stand(12), stand(13), part, posted, null, rows, d);
+            try std.testing.expectEqual(if (posted) |q| q.h_out else h, src);
+            const it = log.items.items;
+            try std.testing.expectEqual(@as(usize, 2), it.len);
+            // strict: each launch resolves to a variant the kit holds (the fixtures t_cover checks the kit against)
+            for (it) |k| if (!try tri.covered(a, k)) {
+                std.debug.print("rows {d} posted {}: {s} has no variant\n", .{ rows, posted != null, k.name });
+                return error.TestUnexpectedResult;
+            };
+            const rb = hcRb(rows);
+            try std.testing.expectEqual([3]u32{ tri.cdiv(rows, rb), hc_blocks, 3 }, it[0].grid);
+            try std.testing.expectEqual([3]u32{ u(rows), 2, 1 }, it[1].grid);
+            const mix_consts = [_]struct { []const u8, i64 }{ .{ "POSTED", @intFromBool(posted != null) }, .{ "XPF", @intFromBool(posted != null) }, .{ "WORLD", if (posted != null) 2 else 1 }, .{ "RB", @intCast(rb) }, .{ "PDL", 1 } };
+            for (mix_consts) |mc| try expectConst(it[0], mc[0], mc[1]);
+            try expectConst(it[1], "SINK", 1);
+            try expectConst(it[1], "PDL", 1);
+            const x = src;
+            try expectLog(&log, &.{ "_hc_mix_part", "_hc_finish_s" }, &.{
+                .{ 0, "X", h },            .{ 0, "XO", x },           .{ 0, "G", if (posted) |q| q.gathered else h }, .{ 0, "FN", stand(5) },
+                .{ 0, "PART", part },      .{ 0, "POST", stand(12) }, .{ 0, "COMB", stand(13) },                      .{ 1, "X", x },
+                .{ 1, "PART", part },      .{ 1, "SCALE", stand(6) }, .{ 1, "BASE", stand(7) },                       .{ 1, "PRE_IN", stand(8) },
+                .{ 1, "NW", stand(9) },    .{ 1, "OUT", stand(10) },  .{ 1, "PRE_OUT", stand(11) },                   .{ 1, "POST", stand(12) },
+                .{ 1, "COMB", stand(13) },
+            });
+        }
+    }
+}
+
+/// Checks launch `k` passes constexpr `name` as `v`.
+fn expectConst(k: tri.Log.Kept, name: []const u8, v: i64) !void {
+    for (k.consts) |c| if (std.mem.eql(u8, c.name, name)) return std.testing.expectEqual(@as(?i64, v), c.int);
+    std.debug.print("{s}: constexpr {s} not passed\n", .{ k.name, name });
+    return error.TestUnexpectedResult;
 }
