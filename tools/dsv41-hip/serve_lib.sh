@@ -404,12 +404,15 @@ serve_stop() {
 
 # serve_lock_hold DIR [WAIT_S]: hold this box's GPU lock for the run (a holder process; its pid in DIR/lock.pid once
 # held), waiting at most WAIT_S (default LOCK_WAIT_S); a holder that did not get it in time is taken down, never left.
+# The holder (lock_watch.sh) lets the lock go when this box's rank (DIR/rank<R>.pid) ends, also when nothing stopped it.
 serve_lock_hold() {
   local dir=$1 wait=${2:-$LOCK_WAIT_S} i
   rm -f "$dir/lock.pid"
+  [ -n "$(serve_pid "$dir/rank$RANK.pid")" ] || rm -f "$dir/rank$RANK.pid"  # an earlier rank's, in a reused run dir
   if [ "$SPAWN_UNIT" = 1 ]; then  # the holder as a unit (tfp-lock<R>-<run id>): it must outlive this session too
     local unit; unit=$(serve_unit "lock$RANK" "$dir")
-    serve_unit_start "$unit" "$dir/lock.log" flock -w "$wait" /var/tmp/halo-gpu.lock "$SERVE_TOOLS/pidexec.sh" "$dir/lock.pid" sleep 86400
+    serve_unit_start "$unit" "$dir/lock.log" flock -w "$wait" /var/tmp/halo-gpu.lock "$SERVE_TOOLS/pidexec.sh" "$dir/lock.pid" \
+      "$SERVE_TOOLS/lock_watch.sh" "$dir/rank$RANK.pid"
     for i in $(seq 1 "$wait"); do
       [ -s "$dir/lock.pid" ] && return 0
       systemctl --user is-active --quiet "$unit" || break
@@ -419,7 +422,8 @@ serve_lock_hold() {
     systemctl --user stop "$unit" >/dev/null 2>&1 || true; rm -f "$dir/lock.pid"
     die "the GPU lock on $(hostname) was not free within ${wait}s"
   fi
-  nohup flock -w "$wait" /var/tmp/halo-gpu.lock sh -c "echo \$\$ > '$dir/lock.pid'; exec sleep 86400" </dev/null >/dev/null 2>&1 &
+  nohup flock -w "$wait" /var/tmp/halo-gpu.lock sh -c "echo \$\$ > '$dir/lock.pid'; exec '$SERVE_TOOLS/lock_watch.sh' '$dir/rank$RANK.pid'" \
+    </dev/null >/dev/null 2>&1 &
   local holder=$!
   for i in $(seq 1 "$wait"); do
     [ -s "$dir/lock.pid" ] && return 0
