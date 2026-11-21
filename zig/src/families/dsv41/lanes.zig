@@ -496,6 +496,13 @@ pub const Snap = struct {
     path: u64 = 0, // its key ids [0, at) hashed (pathKey): keptOver tells this prompt's own longer states from others'
 };
 
+/// Kept states this long or longer say so in the log when they go stale (their prompts then run again from 0).
+const note_rows = 32 * model.chunk_rows;
+
+fn noteStale(sn: *const Snap, why: []const u8) void {
+    if (sn.at >= note_rows) std.log.info("dsv41: the kept state of {d} tokens at {d} goes stale: {s}", .{ sn.at, sn.base, why });
+}
+
 /// A kept state's key ids and its pictures' whole digests hashed: a longer state on a resume's path is its prompt's.
 fn pathKey(key: []const u32, spans: []const image_key.KeySpan) u64 {
     var h = std.hash.Wyhash.init(0);
@@ -537,6 +544,20 @@ fn noteRefusal(sn: *const Snap, len: usize, why: Refusal, then: []const u8) void
     if (why == .dropped) return std.log.info("dsv41: a prompt of {d} tokens resumes no kept state: {s}; {s}", .{ len, why.says(), then });
     std.log.info("dsv41: a prompt of {d} tokens does not resume the kept state of {d} tokens at {d}: {s}; {s}", .{ len, sn.at, sn.base, why.says(), then });
 }
+
+/// sf-disk: chunks of the longest complete state on disk of the prompt (len tokens) past k_min it resumes (0: none).
+fn diskLongest(d: *disk_mod.Disk, len: usize, window: usize, k_min: u32) u32 {
+    const k_max: u32 = @intCast(@min(len - 1, len -| window) / model.chunk_rows);
+    return d.tier.longest(d.chain.items, k_min, k_max) orelse 0;
+}
+
+/// Where a pass goes (Lanes.placeResume): its extent's base, the kept state it resumes (null: it runs from 0, `why`).
+const Resume = struct {
+    base: usize,
+    kept: ?*Snap,
+    moved: bool = false, // the kept rows are copied to the extent at base
+    why: []const u8 = "",
+};
 
 /// How long a request waits for the live stream that holds the kept state it resumes from to end (then it resumes
 /// in place and every kept state stays) before other kept states give their room for a copy of it.
@@ -781,7 +802,6 @@ pub const Lanes = struct {
         const keyed = keyOf(s) != null;
         const key: []const u32 = keyOf(s) orelse ids;
         var kept: ?*Snap = null;
-        var moved = false;
         var why: []const u8 = "no kept state"; // (the pass line's reason for running from 0)
         if (s.reuse.saved) |p| {
             const sn: *Snap = @ptrCast(@alignCast(p));
@@ -791,41 +811,34 @@ pub const Lanes = struct {
                 noteRefusal(sn, len, r, if (self.disk != null) "it runs from 0 or from a state on disk" else "it runs from 0");
                 s.reuse_failed = true;
                 why = r.says();
-            } else {
-                kept = sn;
-                // in place unless the extent runs past the pool, a live stream holds it, or another kept state has
-                // rows past the kept ones (resuming there would stale it: the rows go to a free extent instead, as
-                // the Python lane's _place resumes "here" only in a free extent)
-                moved = sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size) or self.keptOver(sn.base + sn.at, sn.base + size, sn, key, s.cache_spans);
-            }
+            } else kept = sn;
         }
         // sf-disk: a state on disk past the kept one in memory (after a restart, or when the kept rows went stale)
         const cut = self.held != null; // (sf-disk's pass stays the paused prompt's: a cut-in reads and keeps in memory)
         var disk_k: u32 = 0;
         if (self.passDisk()) |d| if (!d.off and keyed) {
             d.beginPass(std.mem.sliceAsBytes(key), s.cache_spans);
-            const k_max: u32 = @intCast(@min(len - 1, len -| m.cfg.window) / model.chunk_rows);
             const k_min: u32 = if (kept) |sn| @intCast(sn.at / model.chunk_rows) else 0;
-            if (d.tier.longest(d.chain.items, k_min, k_max)) |k| {
-                disk_k = k;
-                kept = null; // (left kept in memory: not failed)
-                moved = false;
-            }
+            disk_k = diskLongest(d, len, m.cfg.window, k_min);
+            if (disk_k > 0) kept = null; // (left kept in memory: not failed)
         };
         errdefer if (self.passDisk()) |d| d.endPass(); // (the pass's end: closeFill)
-        const base = if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size, kept);
-        if (kept) |sn| {
-            sn.wanted = 0;
-            if (!moved) sn.end = @max(sn.end, base + size); // its extent now: the next resume in place finds it held
-        }
-        if (kept) |sn| if (moved and sn.stale) { // the placement needed the kept rows' room: the prompt runs from 0
-            kept = null;
-            s.reuse_failed = true;
-            why = "its kept rows went to this placement";
+        const placed: Resume = if (kept) |sn| try self.placeResume(taken[0..nt], size, sn, key, s.cache_spans) else blk: {
+            const b = try self.placeKept(taken[0..nt], size, null);
+            self.staleOver(b, b + size, null); // the rows this stream writes are no kept state's
+            break :blk .{ .base = b, .kept = null };
         };
-        if (kept) |sn| self.touch(sn);
-        // the rows this stream writes are no other kept state's
-        self.staleOver(if (kept != null and !moved) base + kept.?.at else base, base + size, kept);
+        const base = placed.base;
+        const moved = placed.moved;
+        if (kept != null and placed.kept == null) { // the kept state went stale: the prompt runs from 0
+            s.reuse_failed = true;
+            why = placed.why;
+            // or from sf-disk's state, as long as the kept one or shorter (the ask above wanted a longer one)
+            if (self.passDisk()) |d| if (!d.off and keyed) {
+                disk_k = diskLongest(d, len, m.cfg.window, 0);
+            };
+        }
+        kept = placed.kept;
         if (self.peer != null) {
             var rb: [192]u8 = undefined;
             const detail: []const u8 = (if (kept) |sn| (if (moved)
@@ -1314,6 +1327,52 @@ pub const Lanes = struct {
             } else if (source) |sn| (if (!sn.stale and !clashes(live, sn.base, sn.base + sn.at)) sn else return error.ContextFull) else return error.ContextFull;
             victim.stale = true;
         }
+    }
+
+    /// Where a prompt that resumes the kept state `sn` goes, decided before anything goes stale.
+    fn placeResume(self: *Lanes, live: []const [2]usize, size: usize, sn: *Snap, key: []const u32, spans: []const image_key.KeySpan) !Resume {
+        const gpa = self.gpa;
+        const past = sn.base + size > self.m.pool_cap;
+        const held = clashes(live, sn.base, sn.base + size);
+        // in place unless the extent leaves the pool, a live stream holds it, or another prompt's state is past it
+        const moved = past or held or self.keptOver(sn.base + sn.at, sn.base + size, sn, key, spans);
+        const movable = moved and blk: {
+            var used: std.ArrayList([2]usize) = .empty;
+            defer used.deinit(gpa);
+            try used.appendSlice(gpa, live);
+            try used.append(gpa, .{ sn.base, sn.base + sn.at });
+            // a move fits once every state that may give its room gave it (one in a live extent never does)
+            for (self.snaps.items) |o| if (o != sn and !o.stale and clashes(live, o.base, o.base + o.at)) try used.append(gpa, .{ o.base, o.base + o.at });
+            break :blk place(used.items, size, self.m.pool_cap) != null;
+        };
+        if (moved and !movable and !past) {
+            if (held and self.patient(sn)) return error.ContextFull; // the host tries again, in place once that stream ended
+            if (!held) return self.resumed(sn, sn.base, size, false); // only the sibling in the way: it goes stale, nothing else
+        }
+        if (moved and !movable) {
+            // the extent leaves the pool, or the wait ran out: the source goes stale first (before 0.1: it last)
+            noteStale(sn, "its prompt's extent fits neither in place nor beside it; the prompt runs from 0 or from a state on disk");
+            sn.stale = true;
+            sn.wanted = 0;
+            const base = try self.placeKept(live, size, null);
+            self.staleOver(base, base + size, null);
+            return .{ .base = base, .kept = null, .why = "its extent fits neither in place nor beside its kept rows" };
+        }
+        const base = if (!moved) sn.base else try self.placeKept(live, size, sn); // (a move: others give room, LRU first)
+        if (sn.stale) { // (not reached: a move that fits beside the source's rows never takes them)
+            self.staleOver(base, base + size, null);
+            return .{ .base = base, .kept = null, .why = "its kept rows went to this placement" };
+        }
+        return self.resumed(sn, base, size, moved);
+    }
+
+    /// A pass resumes `sn` at `base` (moved: its rows copied there): the state used last, the rows past it no other's.
+    fn resumed(self: *Lanes, sn: *Snap, base: usize, size: usize, moved: bool) Resume {
+        sn.wanted = 0;
+        if (!moved) sn.end = @max(sn.end, base + size); // its extent now: the next resume in place finds it held
+        self.touch(sn);
+        self.staleOver(if (!moved) base + sn.at else base, base + size, sn);
+        return .{ .base = base, .kept = sn, .moved = moved };
     }
 
     /// A kept state a pass resumes from goes last in placement's order (placeKept takes the first), so kept states give
@@ -2547,6 +2606,113 @@ test "two prompts alike but for a same-size picture are on different paths: neit
     // moved: the copy goes clear of both states, and neither goes stale
     try std.testing.expectEqual(@as(usize, 8 * c), try ln.placeKept(&.{}, 8 * c, &cut));
     try std.testing.expect(!cut.stale and !history.stale);
+}
+
+test "a resume whose move cannot fit beside its own rows runs in place and stales only the sibling past it (a near-1M layout)" {
+    const gpa = std.testing.allocator;
+    var m: Model = undefined;
+    m.pool_cap = 2_097_152;
+    var ln: Lanes = .{ .gpa = gpa, .m = &m, .peer = null };
+    defer ln.snaps.deinit(gpa);
+    // the prompt (extent 1,036,288 rows) resumes the source at 739,328; a sibling off its path is in that extent
+    const key = try gpa.alloc(u32, 1_030_144);
+    defer gpa.free(key);
+    for (key, 0..) |*t, i| t.* = @intCast(i % 1000);
+    const at: usize = 739_328;
+    // another conversation's two states before it, made earlier (placement's victims first, least recently used)
+    var other_cut: Snap = .{ .id = 1, .at = 360_448, .base = 0, .end = 739_328, .path = 7, .buf = undefined };
+    var other: Snap = .{ .id = 2, .at = 716_800, .base = 0, .end = 739_328, .path = 8, .buf = undefined };
+    var sibling: Snap = .{ .id = 3, .at = 1_028_096, .base = at, .end = at + 1_036_288, .path = 9, .buf = undefined };
+    var source: Snap = .{ .id = 4, .at = 1_026_048, .base = at, .end = at + 1_036_288, .path = pathKey(key[0..1_026_048], &.{}), .buf = undefined };
+    for ([_]*Snap{ &other_cut, &other, &sibling, &source }) |sn| try ln.snaps.append(gpa, sn);
+    const r = try ln.placeResume(&.{}, 1_036_288, &source, key, &.{});
+    try std.testing.expectEqual(at, r.base);
+    try std.testing.expectEqual(@as(?*Snap, &source), r.kept);
+    try std.testing.expect(!r.moved and !source.stale);
+    try std.testing.expect(sibling.stale);
+    try std.testing.expect(!other_cut.stale and !other.stale);
+    try std.testing.expectEqual(@as(usize, at + 1_036_288), source.end);
+}
+
+test "a resume from a shared cut with room after one eviction moves; the other conversation's history survives" {
+    const c = model.chunk_rows;
+    const gpa = std.testing.allocator;
+    var m: Model = undefined;
+    m.pool_cap = 16 * c;
+    var ln: Lanes = .{ .gpa = gpa, .m = &m, .peer = null };
+    defer ln.snaps.deinit(gpa);
+    const first = try gpa.alloc(u32, 6 * c);
+    defer gpa.free(first);
+    for (first, 0..) |*t, i| t.* = @intCast(i % 1000);
+    const second = try gpa.dupe(u32, first);
+    defer gpa.free(second);
+    for (second[2 * c ..]) |*t| t.* +%= 7;
+    // a third conversation's state, the least recently used; the first conversation's cut and history in one extent
+    var third: Snap = .{ .id = 1, .at = 6 * c, .base = 8 * c, .end = 14 * c, .path = 5, .buf = undefined };
+    var cut: Snap = .{ .id = 2, .at = 2 * c, .base = 0, .end = 8 * c, .path = pathKey(first[0 .. 2 * c], &.{}), .buf = undefined };
+    var history: Snap = .{ .id = 3, .at = 5 * c, .base = 0, .end = 8 * c, .path = pathKey(first[0 .. 5 * c], &.{}), .buf = undefined };
+    for ([_]*Snap{ &third, &cut, &history }) |sn| try ln.snaps.append(gpa, sn);
+    // the second conversation resumes the cut: in place would stale the history; a move fits once the third gives room
+    const r = try ln.placeResume(&.{}, 8 * c, &cut, second, &.{});
+    try std.testing.expectEqual(@as(usize, 8 * c), r.base);
+    try std.testing.expect(r.moved and r.kept == &cut);
+    try std.testing.expect(third.stale and !cut.stale and !history.stale);
+}
+
+test "a resume whose extent leaves the pool and cannot move: its source goes stale first, others stay, sf-disk asked from 0" {
+    const c = model.chunk_rows;
+    const gpa = std.testing.allocator;
+    var m: Model = undefined;
+    m.pool_cap = 16 * c;
+    var ln: Lanes = .{ .gpa = gpa, .m = &m, .peer = null };
+    defer ln.snaps.deinit(gpa);
+    const key = try gpa.alloc(u32, 10 * c);
+    defer gpa.free(key);
+    for (key, 0..) |*t, i| t.* = @intCast(i % 1000);
+    // the source's rows [6c, 10c): an extent of 11c fits on neither side of them, nor in place (17c > 16c)
+    var other: Snap = .{ .id = 1, .at = 2 * c, .base = 13 * c, .end = 15 * c, .path = 5, .buf = undefined };
+    var source: Snap = .{ .id = 2, .at = 4 * c, .base = 6 * c, .end = 12 * c, .path = pathKey(key[0 .. 4 * c], &.{}), .buf = undefined };
+    for ([_]*Snap{ &other, &source }) |sn| try ln.snaps.append(gpa, sn);
+    const r = try ln.placeResume(&.{}, 11 * c, &source, key, &.{});
+    try std.testing.expect(r.kept == null and source.stale);
+    try std.testing.expectEqual(@as(usize, 0), r.base); // placed as a new request, clear of the other state
+    try std.testing.expect(!other.stale);
+    // sf-disk: a state on disk as long as the source, which the first ask (past the source's chunks) skips
+    var root_buf: [96]u8 = undefined;
+    const root = try std.fmt.bufPrintSentinel(&root_buf, "/tmp/tf-resume-{d}", .{std.c.getpid()}, 0);
+    defer PassDisk.rmTree(root);
+    var d: disk_mod.Disk = undefined;
+    try PassDisk.open(&d, &m, root, 0);
+    defer PassDisk.close(&d);
+    d.beginPass(std.mem.sliceAsBytes(key), &.{});
+    try d.tier.states.put(gpa, d.chain.items[3], .{ .k = 4, .bytes = 0, .used = 0, .status = .complete, .keys = &.{} });
+    try std.testing.expectEqual(@as(u32, 0), diskLongest(&d, key.len, 128, 4));
+    try std.testing.expectEqual(@as(u32, 4), diskLongest(&d, key.len, 128, 0));
+}
+
+test "a resume whose extent a live stream holds waits for it (ContextFull), then its source goes stale and it runs as new" {
+    const c = model.chunk_rows;
+    const gpa = std.testing.allocator;
+    var m: Model = undefined;
+    m.pool_cap = 14 * c;
+    m.io = std.testing.io;
+    var ln: Lanes = .{ .gpa = gpa, .m = &m, .peer = null };
+    defer ln.snaps.deinit(gpa);
+    const key = try gpa.alloc(u32, 4 * c);
+    defer gpa.free(key);
+    for (key, 0..) |*t, i| t.* = @intCast(i % 1000);
+    // the source's rows [2c, 4c); a live stream in [6c, 9c) holds its extent [2c, 8c); no 6c fits beside both
+    var source: Snap = .{ .id = 1, .at = 2 * c, .base = 2 * c, .end = 8 * c, .path = pathKey(key[0 .. 2 * c], &.{}), .buf = undefined };
+    try ln.snaps.append(gpa, &source);
+    const live = [_][2]usize{.{ 6 * c, 9 * c }};
+    try std.testing.expectError(error.ContextFull, ln.placeResume(&live, 6 * c, &source, key, &.{}));
+    try std.testing.expectError(error.ContextFull, ln.placeResume(&live, 6 * c, &source, key, &.{}));
+    try std.testing.expect(!source.stale and source.wanted != 0);
+    // the wait ran out: the source goes stale, the request is placed as a new one
+    source.wanted = m.now() - held_wait_ns - 1;
+    const r = try ln.placeResume(&live, 6 * c, &source, key, &.{});
+    try std.testing.expect(r.kept == null and source.stale);
+    try std.testing.expectEqual(@as(usize, 0), r.base);
 }
 
 test "kept states give their room least recently used first: a resumed one goes last" {
