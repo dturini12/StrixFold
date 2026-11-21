@@ -34,6 +34,7 @@ test {
     _ = @import("tcp_wire.zig");
     _ = @import("tcp_coll.zig");
     _ = @import("tcp_proxy.zig");
+    _ = @import("coll_deadline_test.zig");
     _ = @import("rdma_proxy.zig");
     _ = @import("fan.zig");
     _ = @import("config.zig");

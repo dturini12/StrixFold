@@ -118,10 +118,17 @@ starts, pass tokens, snapshot ops) stays on the existing `Fan` control link (lan
   on gfx1151), after which the wait kernel sets the abort word and returns (ds4 pattern). The proxy thread then poisons
   the Coll, so the next eager call (and the host's check at every round boundary, before results are committed)
   returns the error.
-- Deadlines are progress-based, not per-operation absolutes: an exchange fails with `Timeout` when no byte has moved for
-  `T_progress` (default 2 s; a byte-scaled hard cap is planned, not built). Connect and handshake: 300 s (the
-  current link's retry window, prompt2d.zig:53). GPU waits: 10 s. Reason: a 200 MiB prefill Engram gather legitimately
-  takes ~60 ms on one cable, and one TCP retransmission timeout must not kill a decode gate (section 4).
+- Deadlines are progress-based, not per-operation absolutes: once the peer's first byte of an exchange has arrived, the
+  exchange fails with `Timeout` when no byte has moved for `T_progress` (default 2 s; a byte-scaled hard cap is
+  planned, not built). Connect and handshake: 300 s (the current link's retry window, prompt2d.zig:53). GPU waits:
+  10 s. Reason: a 200 MiB prefill Engram gather legitimately takes ~60 ms on one cable, and one TCP retransmission
+  timeout must not kill a decode gate (section 4).
+- A late peer is not a lost one: before the peer's first byte (it has not entered the exchange yet: its own GPU wait,
+  or the other stream's work ahead of it, e.g. a vision tower) the exchange waits up to `T_gpu_wait + T_progress`
+  (12 s by default) from its start, not `T_progress`. The peer's own GPU wait therefore expires first and names the
+  cause. A closed or reset peer still fails the exchange at once; the cost is that a peer hung with its connection
+  open, or a link gone without a FIN, between exchanges is found after 10-12 s instead of 2 s. Both limits come from
+  settings the handshake already compares (`progress_ms`, `gpu_wait_s`), so both ranks apply the same one.
 - Errors map: peer EOF/RST or an abort frame -> `PeerLost`; deadline -> `Timeout`; header/sequence/site/epoch mismatch
   -> `Mismatch`; local `abort` -> `Aborted`; anything else (HIP error, ENOMEM) -> `CollectiveFailed`.
 
@@ -560,10 +567,13 @@ counter wrap; fresh-session epochs; across startup, prefill, decode and verifica
 - Wire level (`zig build test-dsv41-hip-host`, tcp_wire.zig, loopback socketpairs): payload integrity one link and
   striped; Mismatch on a different site, size or order; Timeout when the peer stays silent (progress deadline); PeerLost
   when the peer closes; the failure sticks; abort from another thread ends a waiting call and the peer then loses its
-  link; a peer from another session epoch is refused.
+  link; a peer from another session epoch is refused. coll_deadline_test.zig: a late peer completes the exchange (small,
+  and large enough to stall the sender); a peer that stops mid-transfer fails at the progress deadline, one that never
+  arrives at the arrival limit, a closed one at once; tcp_proxy's Core keeps a pair whose peer stages a gather late.
 - Collective level, real GPU copies, both ranks on one box over loopback (no USB4 traffic, the box's GPU lock only):
   `tf-dsv41-coll-check --fault kill|stall|site|abort|close --at N` on one rank, `--peer-faults 1` on the other, eight
-  cases. Run on node1 2026-10-19 03:16 (logs/fault-matrix-1.log): 8/8 pass.
+  cases. Run on node1 2026-10-19 03:16 (logs/fault-matrix-1.log): 8/8 pass. These runs predate the arrival limit
+  (section 2.3); the script now sets `TF_COLL_GPU_WAIT_S=2`, so a 5 s stall or stop still outlasts the 4 s limit.
 
 | Case | Faulty rank | The other rank | Time to fail |
 |---|---|---|---|
@@ -602,6 +612,7 @@ loss; a 15-minute soak with the counters from section 4.
 Run 2026-10-19 07:49-07:51 (both GPU locks, both cables, MTU 1500, progress deadline 2 s; `--fault-calls prefill` runs
 2048-row prefill chunks so an external signal lands inside a 40 or 200 MiB striped gather; external signals by saved
 PID 1 s after the collective opened; reliab.log on the Mac): 14/14 pass, 7 cases each for tcp_host and tcp_proxy.
+These runs predate the arrival limit (section 2.3); reliab.py now sets `TF_COLL_GPU_WAIT_S=2` for the same reason.
 
 | Case | tcp_host: rank 0 / rank 1 | tcp_proxy: rank 0 / rank 1 |
 |---|---|---|

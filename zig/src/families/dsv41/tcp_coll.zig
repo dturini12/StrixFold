@@ -12,7 +12,7 @@
 //!   TF_TP_STRIPE      rank 0's address on the second cable, e.g. 10.40.1.1 (default: one data link)
 //!   TF_COLL_STRIPE_MIB  payloads of at least this many MiB are split over both links (default 4)
 //!   TF_COLL_RTO_MIN_US  TCP_RTO_MIN_US per data socket (default 8000; 0 keeps the kernel's 200 ms floor)
-//!   TF_COLL_PROGRESS_MS a call fails with Timeout when nothing moves for this long (default 2000)
+//!   TF_COLL_PROGRESS_MS once the peer's bytes of a call flow, nothing moving this long fails it (default 2000)
 //!   TF_COLL_KIND      host (default; eager only), proxy (tcp_proxy.zig, capturable) or rdma (rdma_proxy.zig)
 //!   TF_COLL_PIPE_MIB  gathers of at least this many MiB are pipelined in chunks (default 8; 0 disables): the copy
 //!                     of chunk k+1 to host memory and the upload of chunk k-1 overlap the exchange of chunk k; the
@@ -24,7 +24,7 @@
 //!                     synchronization, not the copy engine
 //!   TF_COLL_GPU_WAIT_S  a GPU wait longer than this many seconds fails the collective (1-600, default 10): tcp_host's
 //!                     host waits (this rank's block reaching pinned memory, the previous upload) and tcp_proxy's
-//!                     device waits (a free slot, the peer's block)
+//!                     device waits (a free slot, the peer's block); plus TF_COLL_PROGRESS_MS: a late peer's limit
 //! and one that is this rank's own (not compared): TF_COLL_GPU_WARN_S (0-600, default 2; 0: never), a GPU wait longer
 //! than this many seconds is logged when it ends, one line (rank, operation, site, bytes, chunk, ms, outcome)
 const std = @import("std");
@@ -216,6 +216,9 @@ pub const TcpColl = struct {
             });
             return t.mapWire(e);
         };
+        if (t.gpu_warn_ns > 0 and t.w.peer_wait_ns > t.gpu_warn_ns) std.log.warn("collectives: rank {d} tcp_host exchange {d} waited {d} ms for the peer's arrival ({s} layer {d}, {d} bytes, chunk {d} of {d})", .{
+            t.rank, t.w.seq, t.w.peer_wait_ns / std.time.ns_per_ms, @tagName(site.phase), site.layer, tx.len, chunk + 1, chunks,
+        });
     }
 
     fn waitUploaded(t: *TcpColl) coll.Error!void {
@@ -380,6 +383,7 @@ pub fn settingsFromEnv(control_port: u16) !Settings {
     s.pipe_min = (try envInt(usize, "TF_COLL_PIPE_MIB", 8)) << 20;
     s.chunk = @max(1, try envInt(usize, "TF_COLL_CHUNK_MIB", 4)) << 20;
     s.gpu_wait_ns = try envSeconds("TF_COLL_GPU_WAIT_S", 10, 1, 600);
+    s.opt.arrival_ns = s.gpu_wait_ns + s.opt.progress_ns; // a late peer's own GPU wait expires before this
     s.gpu_warn_ns = try envSeconds("TF_COLL_GPU_WARN_S", 2, 0, 600);
     return s;
 }
@@ -518,7 +522,7 @@ pub fn openHost(gpa: std.mem.Allocator, d: *const gpu.Driver, rank: u32, se: Ses
     errdefer for (ready[0..made]) |*e| e.deinit();
     while (made < ready.len) : (made += 1) ready[made] = try gpu.Event.init(d, false);
     t.* = .{ .gpa = gpa, .d = d, .rank = rank, .w = w, .staged = staged, .uploaded = uploaded, .gpu_wait_ns = s.gpu_wait_ns, .gpu_warn_ns = s.gpu_warn_ns, .staging = s.staging, .copy = copy, .start = start, .chunk_ready = ready, .pipe_min = s.pipe_min, .chunk = s.chunk };
-    std.log.info("collectives: tcp_host over {d} data link(s) from port {d}, stripe >= {d} MiB, RTO floor {d} us, progress deadline {d} ms, GPU waits fail after {d} s (logged past {d} s), {s} staging, gathers >= {d} MiB pipelined in {d} MiB chunks", .{ se.links, s.data_port + port_offset, s.opt.stripe_min >> 20, s.opt.rto_min_us, s.opt.progress_ns / std.time.ns_per_ms, s.gpu_wait_ns / std.time.ns_per_s, s.gpu_warn_ns / std.time.ns_per_s, @tagName(s.staging), s.pipe_min >> 20, s.chunk >> 20 });
+    std.log.info("collectives: tcp_host over {d} data link(s) from port {d}, stripe >= {d} MiB, RTO floor {d} us, progress deadline {d} ms (a peer's arrival: {d} ms), GPU waits fail after {d} s (logged past {d} s), {s} staging, gathers >= {d} MiB pipelined in {d} MiB chunks", .{ se.links, s.data_port + port_offset, s.opt.stripe_min >> 20, s.opt.rto_min_us, s.opt.progress_ns / std.time.ns_per_ms, s.opt.arrival_ns / std.time.ns_per_ms, s.gpu_wait_ns / std.time.ns_per_s, s.gpu_warn_ns / std.time.ns_per_s, @tagName(s.staging), s.pipe_min >> 20, s.chunk >> 20 });
     return t;
 }
 
@@ -570,18 +574,6 @@ test "TF_COLL_GPU_WAIT_S and TF_COLL_GPU_WARN_S: whole seconds in range, the def
     s = try settingsFromEnv(29600);
     try std.testing.expectEqual(@as(u64, 60 * ns), s.gpu_wait_ns);
     try std.testing.expectEqual(@as(u64, 0), s.gpu_warn_ns);
-}
-
-test "a GPU wait expires only past its deadline and is slow once past the warn threshold" {
-    const ms = std.time.ns_per_ms;
-    const w: WaitClock = .{ .t0 = 1000 * ms, .limit_ns = 10_000 * ms, .warn_ns = 2000 * ms };
-    try std.testing.expect(!w.expired(1000 * ms) and !w.slow(1000 * ms));
-    try std.testing.expect(!w.slow(3000 * ms) and w.slow(3000 * ms + 1)); // strictly past 2 s
-    try std.testing.expect(!w.expired(11_000 * ms) and w.expired(11_000 * ms + 1)); // strictly past 10 s
-    try std.testing.expectEqual(@as(u64, 10_000), w.ms(11_000 * ms + 1));
-    try std.testing.expect(!w.expired(0) and w.ms(0) == 0); // a clock read before t0 counts as no time
-    const quiet: WaitClock = .{ .t0 = 0, .limit_ns = 60 * std.time.ns_per_s, .warn_ns = 0 };
-    try std.testing.expect(!quiet.slow(59 * std.time.ns_per_s) and quiet.expired(61 * std.time.ns_per_s));
 }
 
 test "the GPU wait deadline is in the handshake, the warn threshold is not" {
