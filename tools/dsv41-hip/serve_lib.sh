@@ -23,6 +23,10 @@ serve_load() {
   # the image settings serve.conf describes and TEST_FAULT (TF_DS_TEST_FAULT, recovery tests); empty when not set
   VISION_DIR=${VISION_DIR:-} VISION_BIAS_SHA256=${VISION_BIAS_SHA256:-} TEST_FAULT=${TEST_FAULT:-} MAX_IMAGES=${MAX_IMAGES:-}
   [ -z "$MAX_IMAGES" ] || [[ $MAX_IMAGES =~ ^[1-9][0-9]*$ ]] || die "MAX_IMAGES must be an image count from 1 (empty: the server's 32), not $MAX_IMAGES"
+  MAX_IMAGE_TOKENS=${MAX_IMAGE_TOKENS:-}
+  [ -z "$MAX_IMAGE_TOKENS" ] ||
+    { [[ $MAX_IMAGE_TOKENS =~ ^[1-9][0-9]{3,4}$ ]] && [ "$MAX_IMAGE_TOKENS" -ge 1024 ] && [ "$MAX_IMAGE_TOKENS" -le 65536 ]; } ||
+    die "MAX_IMAGE_TOKENS must be an image token count from 1024 to 65536 (empty: the engine's 4096), not $MAX_IMAGE_TOKENS"
   [ -n "$VISION_DIR" ] && eval "VISION_DIR=\"$VISION_DIR\""
   EDIT=${EDIT:-} EDIT_SHA256=${EDIT_SHA256:-}
   [ -n "$EDIT" ] && eval "EDIT=\"$EDIT\""
@@ -229,6 +233,8 @@ serve_env() {
     [ -n "${PROMPT_DISK_RATE_MIB:-}" ] && SERVE_ENV+=(TF_DS_PROMPT_DISK_RATE_MIB="$PROMPT_DISK_RATE_MIB")
   fi
   [ "$MODALITIES" = text_image ] && [ "$RANK" = 0 ] && SERVE_ENV+=(TF_DS_VISION_DIR="$VISION_DIR")
+  # a request's image tokens at most (rank 1: --image-tokens, serve_lanes_cmd); empty: the engine's 4096
+  [ "$MODALITIES" = text_image ] && [ "$RANK" = 0 ] && [ -n "$MAX_IMAGE_TOKENS" ] && SERVE_ENV+=(TF_DS_IMAGE_TOKENS="$MAX_IMAGE_TOKENS")
   [ -n "$TEST_FAULT" ] && SERVE_ENV+=(TF_DS_TEST_FAULT="$TEST_FAULT")
   [ -n "$EDIT" ] && SERVE_ENV+=(TF_DS_EDIT="$EDIT")
   # the launch's identity in the peers' handshake (U46): the deployed commit, the bundle's and serve.conf's hashes
@@ -257,13 +263,14 @@ serve_lanes_cmd() {
     --arena-gib "$ARENA_GIB" --graphs "$GRAPHS" --side "$HC_SIDE" --aio "$ENGRAM_AIO" --prefetch "$L2_PREFETCH")
   [ -n "$ROUND_MS" ] && SERVE_CMD+=(--round-ms "$ROUND_MS")
   [ -n "$DRAFT_MS" ] && SERVE_CMD+=(--draft-ms "$DRAFT_MS")
+  if [ "$MODALITIES" = text_image ] && [ -n "$MAX_IMAGE_TOKENS" ]; then SERVE_CMD+=(--image-tokens "$MAX_IMAGE_TOKENS"); fi
   return 0
 }
 
 # serve_cmd: SERVE_CMD, the rank's argv. Rank 1's --pool, --context, --streams, --round-rows and --graphs are rank 0's
 # TF_DS_POOL, --context, TF_DS_STREAMS, TF_DS_ROUND_ROWS and TF_DS_GRAPHS (upstream #25), from the same variables
 # (tf-dsv41-lanes reads --graphs, --side, --aio and --prefetch, not TF_DS_GRAPHS, TF_DS_HC_SIDE, TF_DS_ENGRAM_AIO and
-# TF_DS_L2_PREFETCH).
+# TF_DS_L2_PREFETCH); rank 1's --image-tokens is rank 0's TF_DS_IMAGE_TOKENS (MAX_IMAGE_TOKENS, text_image only).
 serve_cmd() {
   if [ "$RANK" = 0 ]; then
     SERVE_CMD=("$BIN/tensorfold-native" serve "$MODEL_DIR" --host "$SERVE_HOST" --port "$SERVE_PORT" --name "$SERVE_NAME"

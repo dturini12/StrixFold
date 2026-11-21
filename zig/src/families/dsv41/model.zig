@@ -80,6 +80,31 @@ pub const max_streams = draft.max_streams;
 pub const max_streams_default = draft.default_streams;
 /// The RDMA ring's slot (the served 4.25 MiB: a 16-row round's logits half fits).
 pub const ring_bytes = 4456448;
+/// A request's image tokens at most when unset (four pictures of a whole span).
+pub const image_rows_default = 4096;
+/// The least cap: one picture of a whole span (picture.zig).
+pub const image_rows_min = 1024;
+/// The largest cap (vision.md's --vision-image-tokens ceiling): 640 MiB of device memory per rank.
+pub const image_rows_max = 65536;
+
+/// A request's image tokens at most, from TF_DS_IMAGE_TOKENS / --image-tokens (unset: image_rows_default); HIP only.
+pub fn imageRowsFrom(v: ?[]const u8, hip: bool) error{ BadImageTokens, ImageTokensNeedHip }!usize {
+    const t = v orelse return image_rows_default;
+    if (!hip) return error.ImageTokensNeedHip;
+    const n = std.fmt.parseInt(usize, t, 10) catch return error.BadImageTokens;
+    if (n < image_rows_min or n > image_rows_max) return error.BadImageTokens;
+    return n;
+}
+
+test "TF_DS_IMAGE_TOKENS: 4096 unless set, 1024 .. 65536, and only on HIP" {
+    try std.testing.expectEqual(@as(usize, 4096), try imageRowsFrom(null, true));
+    try std.testing.expectEqual(@as(usize, 4096), try imageRowsFrom(null, false));
+    try std.testing.expectEqual(@as(usize, 32768), try imageRowsFrom("32768", true));
+    try std.testing.expectEqual(@as(usize, 1024), try imageRowsFrom("1024", true));
+    try std.testing.expectEqual(@as(usize, 65536), try imageRowsFrom("65536", true));
+    for ([_][]const u8{ "1023", "65537", "0", "32k", "", "-4096" }) |v| try std.testing.expectError(error.BadImageTokens, imageRowsFrom(v, true));
+    try std.testing.expectError(error.ImageTokensNeedHip, imageRowsFrom("32768", false));
+}
 
 pub const Options = struct {
     model_dir: []const u8, // config.json
@@ -112,6 +137,7 @@ pub const Options = struct {
     draft_ms: f64 = draft.draft_ms, // a drafter pass's cost, measured with round_ms on the same backend (TF_DS_DRAFT_MS)
     vision_bias: ?[]const u8 = null, // gate_bias_vl.safetensors (null: the kit's vision/): the image-span routing bias
     modalities: Modalities = default_modalities, // .text: the image routing bias is never loaded (native.zig: the tower)
+    image_rows: usize = image_rows_default, // HIP: a request's image rows at most, img_buf's size (TF_DS_IMAGE_TOKENS)
     open_coll: ?coll.Open = null, // the collectives' transport (HIP: w-link's TCP; null on CUDA: NCCL over the links)
     hip_kit: ?[]const u8 = null, // HIP: the AMD kit (manifest.json); null: kit_dir/hip
     disk: bool = false, // sf-disk on (disk.zig): the handshake's plan says " disk=1", so both ranks must agree
@@ -204,6 +230,7 @@ pub const Model = struct {
     // the filling prompt's image spans and their rows (setImages; cleared by fillBegin)
     spans: std.ArrayList(prompt.Span) = .empty,
     img_buf: ?gpu.DeviceBuffer = null,
+    image_rows: usize = image_rows_default, // Options.image_rows (imageRowsCap)
     // profiling (lanes' --profile): the last round's forward and absorb, synchronized apart (ns)
     prof: bool = false,
     timer: ?*round.PhaseTimer = null, // a profile's GPU time by phase (eager rounds)
@@ -234,6 +261,7 @@ pub const Model = struct {
         if (o.rdma_devices != null and !gpu.features.verbs_rdma) return error.NoVerbsRdma;
         if (o.prefetch and gpu.backend != .hip and !gpu.features.l2_prefetch) return error.NoL2Prefetch;
         if (o.modalities == .text_image and !gpu.features.vision) return error.VisionUnsupported;
+        if (o.image_rows < image_rows_min or o.image_rows > image_rows_max) return error.BadImageTokens;
         const m = try gpa.create(Model);
         errdefer gpa.destroy(m);
         m.* = undefined;
@@ -293,6 +321,7 @@ pub const Model = struct {
         m.split_zip = if (std.c.getenv("TF_DS_PREFILL_SPLIT_ZIP")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         m.engram_rows = if (std.c.getenv("TF_DS_ENGRAM_ROWS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         m.phase_timer = o.phase_timer;
+        m.image_rows = o.image_rows;
         m.window_dir = if (std.c.getenv("TF_DS_WINDOW_LOGITS")) |v| std.mem.span(v) else null;
         m.window_l = null;
         m.window_g = null;
@@ -532,8 +561,8 @@ pub const Model = struct {
             const path = o.vision_bias orelse try std.fs.path.join(a, &.{ o.kit_dir, "vision", "gate_bias_vl.safetensors" });
             // HIP: both ranks need it (a rank without it would refuse the spans its peer routes): none starts without
             m.loadVisionBias(path) catch |err| if (gpu.backend == .hip or o.vision_bias != null or err != error.FileNotFound) return if (err == error.FileNotFound) error.NoVisionKit else err;
-            // HIP: a request's image rows at most, from the start: an image prompt allocates nothing on either rank
-            if (gpu.backend == .hip) m.img_buf = try gpu.DeviceBuffer.alloc(m.ctx.d, image_rows_reserved * c.hidden * 2);
+            // HIP: a request's image rows at most (Options.image_rows), at open: an image prompt allocates nothing
+            if (gpu.backend == .hip) m.img_buf = try gpu.DeviceBuffer.alloc(m.ctx.d, m.image_rows * c.hidden * 2);
         }
 
         // fillSplit's Engram rows exchange: the peer's projection of this rank's columns (both ranks alike)
@@ -637,6 +666,7 @@ pub const Model = struct {
             .strict = strict,
             .disk = o.disk,
             .edit = m.edit_id,
+            .image_rows = o.image_rows,
         });
         return id;
     }
@@ -659,16 +689,20 @@ pub const Model = struct {
         strict: bool,
         disk: bool, // sf-disk: " disk=1" at the end, only when on (the text is the stock one when off)
         edit: []const u8 = "", // TF_DS_EDIT's file by its hash: " edit=<16 hex>" at the end, only when set
+        image_rows: usize = image_rows_default, // " image_tokens=N" last, only when not the default
     };
 
     /// The handshake's plan text (identity), in `buf`.
     pub fn planText(buf: []u8, p: PlanParts) ![]u8 {
         var cb: [32]u8 = undefined;
         const ctx = if (p.context != 0 and p.context != p.pool) try std.fmt.bufPrint(&cb, " context={d}", .{p.context}) else "";
-        return std.fmt.bufPrint(buf, "drafts={} engram={} graphs={} pool={d}{s} streams={d} round_rows={d} chunk_rows={d} replay_floor={} aux={s} {s} engram_rows={} deploy={s} bundle={s} conf={s} kv={s} strict={}{s}{s}{s}", .{
+        var ib: [32]u8 = undefined;
+        const img = if (p.image_rows != image_rows_default) try std.fmt.bufPrint(&ib, " image_tokens={d}", .{p.image_rows}) else "";
+        return std.fmt.bufPrint(buf, "drafts={} engram={} graphs={} pool={d}{s} streams={d} round_rows={d} chunk_rows={d} replay_floor={} aux={s} {s} engram_rows={} deploy={s} bundle={s} conf={s} kv={s} strict={}{s}{s}{s}{s}", .{
             p.drafts,       p.engram, p.graphs,  p.pool,  ctx, p.streams,  p.round_rows, chunk_rows,
             p.replay_floor, p.aux,    p.gather,  p.engram_rows, p.deploy, p.bundle, p.conf,
             kv_format,      p.strict, if (p.disk) " disk=1" else "", if (p.edit.len > 0) " edit=" else "", p.edit,
+            img,
         });
     }
 
@@ -842,17 +876,17 @@ pub const Model = struct {
         }
     }
 
-    /// The image rows a text_image rank keeps on the device from its open (four pictures of a whole span).
-    pub const image_rows_reserved = 4096;
-    /// A request's image rows at most (HIP: what its open reserved; CUDA grows its buffer instead).
-    pub const image_rows_cap: ?usize = if (gpu.backend == .hip) image_rows_reserved else null;
+    /// A request's image rows at most (HIP: what its open reserved, Options.image_rows; CUDA grows its buffer instead).
+    pub fn imageRowsCap(m: *const Model) ?usize {
+        return if (gpu.backend == .hip) m.image_rows else null;
+    }
 
     /// The filling prompt's image spans (absolute positions, in order) and their rows bf16 [tokens, hidden] from the
     /// host, after fillBegin and before its chunks.
     pub fn setImages(m: *Model, spans: []const prompt.Span, rows: []const u8) !void {
         if (rows.len > 0) {
             if (m.img_buf == null or m.img_buf.?.len < rows.len) {
-                if (image_rows_cap != null) return error.TooManyImageRows; // HIP never reallocates (both ranks alike)
+                if (m.imageRowsCap() != null) return error.TooManyImageRows; // HIP never reallocates (both ranks alike)
                 if (m.img_buf) |*b| b.free();
                 m.img_buf = null;
                 m.img_buf = try gpu.DeviceBuffer.alloc(m.ctx.d, rows.len);
@@ -1408,7 +1442,7 @@ test "the handshake names what orders a prompt chunk's gathers: split, zip, chun
     try std.testing.expectEqualStrings("prefill_split=0 prefill_zip=true chunk_caps=2048/0 phase_timer=true frames=" ++ frames, try Model.gatherOrder(&b, 0, true, true));
 }
 
-test "the handshake's plan text is the stock one with sf-disk off, and says disk=1 and edit= only when on" {
+test "the handshake's plan text is the stock one with sf-disk off, and says disk=1, edit= and image_tokens= only when set" {
     var gb: [128]u8 = undefined;
     const gather = try Model.gatherOrder(&gb, 256, true, false);
     // the stock format, byte for byte (frames= is the protocol number: the disk frames do not change it)
@@ -1432,5 +1466,13 @@ test "the handshake's plan text is the stock one with sf-disk off, and says disk
     p.disk = true;
     p.edit = "0123456789abcdef";
     try std.testing.expectEqualStrings(stock ++ " disk=1 edit=0123456789abcdef", try Model.planText(&buf, p));
+    // a cap other than the default comes last, so peers that reserved different image rows refuse each other at start
+    p.image_rows = image_rows_default;
+    try std.testing.expectEqualStrings(stock ++ " disk=1 edit=0123456789abcdef", try Model.planText(&buf, p));
+    p.image_rows = 32768;
+    try std.testing.expectEqualStrings(stock ++ " disk=1 edit=0123456789abcdef image_tokens=32768", try Model.planText(&buf, p));
+    p.disk = false;
+    p.edit = "";
+    try std.testing.expectEqualStrings(stock ++ " image_tokens=32768", try Model.planText(&buf, p));
     try std.testing.expect(!@hasField(Options, "disk") or (Options{ .model_dir = "", .cache_dir = "", .kit_dir = "", .rank = 0, .world = 2, .master = .{ 0, 0, 0, 0 }, .port = 0 }).disk == false);
 }

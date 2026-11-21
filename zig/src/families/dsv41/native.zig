@@ -181,6 +181,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []
     defer if (round_costs) |v| gpa.free(v);
     const draft_cost = if (getenv("TF_DS_DRAFT_MS")) |v| draft_mod.scheduler_costs.parseDraft(v) catch return error.BadDraftMs else draft_mod.draft_ms;
     const mods = try modalities(o);
+    const image_rows = try model.imageRowsFrom(nonEmpty(getenv("TF_DS_IMAGE_TOKENS")), gpu.backend == .hip);
     const st = try gpa.create(State);
     errdefer gpa.destroy(st);
     st.gpa = gpa;
@@ -211,6 +212,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []
         .draft_ms = draft_cost,
         .streams = if (getenv("TF_DS_STREAMS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadStreams else model.max_streams_default,
         .modalities = mods,
+        .image_rows = image_rows,
         .hip_kit = getenv("TF_DS_HIP_KIT") orelse if (gpu.backend == .hip) kernels else null, // HIP: the host's kit
         .open_coll = if (gpu.backend == .hip) @import("tcp_coll.zig").open else null,
         .disk = @import("disk.zig").wanted(world), // TF_DS_PROMPT_DISK_*: kept prompt states on disk (disk.zig)
@@ -241,7 +243,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []
     st.encoder = null;
     if (gpu.features.vision and gpu.backend == .hip) if (st.vision) |v| {
         const enc = try gpa.create(encoder_mod.Encoder);
-        enc.* = .init(gpa, io, v.encoderTower(), model.Model.image_rows_reserved);
+        enc.* = .init(gpa, io, v.encoderTower(), st.m.image_rows);
         enc.start() catch |err| {
             gpa.destroy(enc);
             return err;
@@ -251,7 +253,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []
     errdefer if (st.encoder) |enc| stopEncoder(gpa, enc);
     st.lanes.encoder = st.encoder;
     var hook: ?lanes.stream.Vision = if (gpu.features.vision) (if (st.vision) |v| v.hook() else null) else null;
-    if (hook) |*x| x.max_tokens = if (model.Model.image_rows_cap) |cap| @intCast(cap) else 0;
+    if (hook) |*x| x.max_tokens = if (st.m.imageRowsCap()) |cap| @intCast(cap) else 0;
     if (hook) |*x| if (st.encoder) |enc| {
         x.encode = enc.hook();
     };
@@ -300,7 +302,9 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.NoVisionKernels => "text_image on HIP needs the AMD kit's vision.* kernels (vision.hip): a kit built before them",
         error.NoVisionWeights => "text_image on HIP needs the vision tower's weights: TF_DS_VISION_DIR (a sidecar made by tools/dsv41-zig/kit/make_vision_sidecar.py) with model.safetensors.index.json",
         error.MissingVisionTensor, error.BadVisionTensor => "the vision weights (TF_DS_VISION_DIR) lack a tower tensor or hold one of another dtype or shape",
-        error.TooManyImageRows => std.fmt.comptimePrint("a request's images take at most {d} image tokens on this engine (four pictures at the largest size): send fewer or smaller images", .{model.Model.image_rows_reserved}),
+        error.TooManyImageRows => "a request's images take more image tokens than this engine reserved (TF_DS_IMAGE_TOKENS, 4096 unless set; serve.conf MAX_IMAGE_TOKENS): send fewer or smaller images",
+        error.BadImageTokens => "TF_DS_IMAGE_TOKENS (rank 1: --image-tokens): a request's image tokens at most, 1024 .. 65536 (unset: 4096)",
+        error.ImageTokensNeedHip => "TF_DS_IMAGE_TOKENS is HIP only: CUDA grows its image buffer as a request needs, so unset it",
         error.VisionUnsupported => "image input is not implemented on this backend: serve text only (TF_DS_MODALITIES=text)",
         error.BadModalities => "TF_DS_MODALITIES: text or text_image",
         error.NoCollective => "this build has no collectives transport for the ranks yet (HIP: w-link's TCP transport, model.Options.open_coll)",

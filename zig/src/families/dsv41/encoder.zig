@@ -10,6 +10,7 @@ pub const Tower = struct {
     ctx: *anyopaque,
     bind: *const fn (ctx: *anyopaque) anyerror!void,
     rows: *const fn (ctx: *anyopaque, payload: []const u8, gpa: Allocator, out: *std.ArrayList(u8)) anyerror!usize,
+    row_bytes: usize, // a span row's bytes: a job reserves its pictures' rows exactly before their encode
 };
 
 const Job = struct {
@@ -19,6 +20,7 @@ const Job = struct {
     ranges: [][2]usize, // where each image's rows begin and end in `rows`
     skipped: []bool, // a resume covers its span: encoded only when a prompt pass asks for it (take)
     rows: std.ArrayList(u8) = .empty,
+    need: usize = 0, // the span rows of the pictures it encodes (their tokens): `rows` is reserved to them exactly
     state: enum { queued, running, done } = .queued,
     urgent: bool = false, // a prompt pass waits for it: the thread takes it first
     err: ?anyerror = null,
@@ -30,7 +32,7 @@ pub const Encoder = struct {
     gpa: Allocator,
     io: std.Io,
     tower: Tower,
-    cap: usize, // a request's image rows at most (Model.image_rows_reserved): more fail at once, nothing encoded
+    cap: usize, // a request's image rows at most (Model.image_rows): more fail at once, nothing encoded
     mutex: std.Io.Mutex = .init,
     cond: std.Io.Condition = .init,
     done: std.Io.Condition = .init, // a job finished (a prompt pass waits in take)
@@ -112,6 +114,7 @@ pub const Encoder = struct {
             if (img.rows or skip.*) continue;
             p.* = try e.gpa.alignedAlloc(u8, .@"16", img.bytes.len);
             @memcpy(p.*, img.bytes);
+            j.need += img.tokens;
             any = true;
         }
         if (!any and j.err == null) j.state = .done; // nothing to encode now
@@ -136,7 +139,10 @@ pub const Encoder = struct {
         const j = e.find(images) orelse return error.NotEncoded;
         if (j.state != .done) return error.NotEncoded;
         if (j.err) |err| return err;
-        if (j.skipped[k]) try e.encodeNow(j, k, images[k].bytes);
+        if (j.skipped[k]) {
+            j.need += images[k].tokens; // its rows reserved too, with those encoded before
+            try e.encodeNow(j, k, images[k].bytes);
+        }
         try out.appendSlice(gpa, j.rows.items[j.ranges[k][0]..j.ranges[k][1]]);
         return j.tokens[k];
     }
@@ -253,6 +259,7 @@ pub const Encoder = struct {
     fn encode(e: *Encoder, j: *Job) !void {
         for (j.payloads, j.tokens, j.ranges) |p, *t, *r| if (p.len > 0) {
             if (e.stopped(j)) return error.EncodeCancelled;
+            try j.rows.ensureTotalCapacityPrecise(e.gpa, j.need * e.tower.row_bytes); // exactly, once a run
             const begin = j.rows.items.len;
             t.* = try e.tower.rows(e.tower.ctx, p, e.gpa, &j.rows);
             r.* = .{ begin, j.rows.items.len };
@@ -268,7 +275,7 @@ const Fake = struct {
     fail: bool = false,
 
     fn tower(f: *Fake) Tower {
-        return .{ .ctx = f, .bind = bind, .rows = rows };
+        return .{ .ctx = f, .bind = bind, .rows = rows, .row_bytes = 4 };
     }
 
     fn bind(_: *anyopaque) anyerror!void {}
@@ -297,6 +304,13 @@ const Woken = struct {
     }
 };
 
+/// The capacity of a request's job rows (the exact reserve's tests).
+fn jobRowsCapacity(e: *Encoder, images: []const Image) usize {
+    e.lock();
+    defer e.unlock();
+    return e.find(images).?.rows.capacity;
+}
+
 fn waitReady(e: *Encoder, images: []const Image) void {
     while (!e.ready(images)) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
 }
@@ -311,6 +325,7 @@ test "an encoder hands each request its pictures' rows in order, the rows that c
     const a = [_]Image{ .{ .at = 0, .tokens = 2, .bytes = &.{ 2, 7 } }, .{ .at = 3, .tokens = 1, .bytes = "rows", .rows = true }, .{ .at = 5, .tokens = 3, .bytes = &.{ 3, 9 } } };
     try e.submit(&a, 0, woken.wake());
     waitReady(&e, &a);
+    try std.testing.expectEqual(@as(usize, 20), jobRowsCapacity(&e, &a)); // the encoded pictures' 5 rows exactly
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 3), try e.take(&a, 2, gpa, &out));
@@ -460,12 +475,14 @@ test "pictures a resume covers are not encoded at submit; one its pass still ask
     try e.submit(&a, 6, woken.wake()); // a resume at 6 covers the first two
     waitReady(&e, &a);
     try std.testing.expectEqual(@as(u32, 1), fake.encodes.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 4), jobRowsCapacity(&e, &a)); // the one encoded picture's row exactly
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 1), try e.take(&a, 2, gpa, &out));
     try std.testing.expectEqual(@as(u32, 1), fake.encodes.load(.acquire));
     try std.testing.expectEqual(@as(usize, 3), try e.take(&a, 1, gpa, &out)); // the resume fell short: encoded now
     try std.testing.expectEqual(@as(u32, 2), fake.encodes.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 16), jobRowsCapacity(&e, &a)); // and the late one's 3 rows, exactly
     try std.testing.expectEqual(@as(usize, 4 + 12), out.items.len);
     try std.testing.expect(std.mem.allEqual(u8, out.items[0..4], 9) and std.mem.allEqual(u8, out.items[4..], 8));
     out.clearRetainingCapacity();

@@ -23,7 +23,9 @@ test "the text capability stays a HIP rank's default; text_image is asked for" {
     try std.testing.expectEqual(model.Modalities.text_image, try native.modalities(.{ .context = 8192, .drafts = true, .modalities = .text_image }));
     try std.testing.expect(std.mem.indexOf(u8, native.explain(null, error.NoVisionWeights).?, "TF_DS_VISION_DIR") != null);
     try std.testing.expect(std.mem.indexOf(u8, native.explain(null, error.NoVisionKit).?, "gate_bias_vl") != null);
-    try std.testing.expect(std.mem.indexOf(u8, native.explain(null, error.TooManyImageRows).?, "4096") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native.explain(null, error.TooManyImageRows).?, "TF_DS_IMAGE_TOKENS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native.explain(null, error.BadImageTokens).?, "--image-tokens") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native.explain(null, error.ImageTokensNeedHip).?, "HIP") != null);
     try std.testing.expect(std.mem.indexOf(u8, native.explain(null, error.NoCollective).?, "w-link") != null);
 }
 
