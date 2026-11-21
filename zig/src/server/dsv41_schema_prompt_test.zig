@@ -1,10 +1,4 @@
-//! DeepSeek-V4.1's ``## Response Format`` block (TF_DSV41_SCHEMA_PROMPT): the deployed chat template renders it as the
-//! reference encoder (encoding/encoding.py, render_message of a system message with a response_format) does, and with
-//! the switch off the prompt ids are byte for byte what they were before the block existed.
-//!
-//! fixtures/dsv41_response_format: cases.json is the response_format records (no images) of DeepSeek's recorded encoder
-//! outputs (TensorFold's zig/src/server/fixtures/deepseek_v41_encoder/cases.jsonl.gz, MIT, LICENSE beside it), their
-//! fields unchanged; chat_template_c282975e.jinja is the deployed template before the block (sha256 c282975e...).
+//! The ``## Response Format`` block as encoding.py renders it, and with it off the ids as before (c282975e template).
 const std = @import("std");
 const api = @import("engine_api");
 const template = @import("template");
@@ -19,12 +13,11 @@ const deepseek_schema = @import("deepseek_schema.zig");
 const errors = @import("errors.zig");
 const Value = json.Value;
 
-const cases_json = @embedFile("fixtures/dsv41_response_format/cases.json");
+const cases_json = @embedFile("fixtures/dsv41_response_format/cases.json"); // from TensorFold, MIT (LICENSE)
 const template_before = @embedFile("fixtures/dsv41_response_format/chat_template_c282975e.jinja");
 const block_head = "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n";
 
-/// An HfText that holds only a compiled template: its own render (the server's Jinja context), bytes for tokens and
-/// the image placeholder as the one id `image_id`.
+/// An HfText holding only a compiled template: its own render, bytes for tokens, the image placeholder as `image_id`.
 pub const Rig = struct {
     hf: HfText,
     vt: model_text.Text.VTable,
@@ -129,10 +122,7 @@ fn cases(a: std.mem.Allocator) ![]Value {
     return (try json.parse(a, cases_json)).ok.array;
 }
 
-/// The records whose whole recorded prompt the deployed template reproduces. The others differ elsewhere, where the
-/// server normalizes a request before rendering (tool-call arguments as JSON text, content parts the chat route turns
-/// into text, a tool's missing description, drop_thinking=False, a budget the recording did not apply); their block is
-/// checked on its own.
+/// The records whose whole prompt the template reproduces (the others differ where the server normalizes a request).
 const whole = [_]i64{ 41, 47, 78, 119, 190, 210, 217, 230, 235, 261, 275 };
 
 /// The text after the block's head up to the next special token: the schema as the encoder wrote it.
@@ -155,8 +145,7 @@ test "the deployed template renders the encoder's ## Response Format block on De
         const schema = schemaText(recorded) orelse return error.NoRecordedBlock;
         const with = render(a, &rig, c, try jsonSchema(a, c.get("response_format").?)) orelse return error.Render;
         const without = render(a, &rig, c, null) orelse return error.Render;
-        // the block is all the response_format adds: "\n\n" + the head + the encoder's schema text at the end of the
-        // first system message, which is the empty one the encoder's caller adds when the conversation has none
+        // all it adds: "\n\n", the head and the schema text, ending the first system message (an empty one if none)
         const block = try std.mem.concat(a, u8, &.{ "\n\n", block_head, schema });
         const at = std.mem.indexOf(u8, with, block) orelse {
             std.debug.print("case {d}: no block like the recording's\n", .{id});

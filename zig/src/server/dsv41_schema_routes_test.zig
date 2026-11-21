@@ -1,9 +1,4 @@
-//! The ``## Response Format`` block (TF_DSV41_SCHEMA_PROMPT) through the server's own routes over the deployed template:
-//! Chat, Messages and Responses requests through their real translation submit the prompt that /tokenize and
-//! count_tokens report, on and off; with it on that prompt is byte for byte what DeepSeek's encoding.py makes of the
-//! same conversation (fixtures/dsv41_response_format/encoder_unicode.json, made by its encode_messages and to_json: a
-//! nested schema with non-ASCII text and escapes), off it is the encoder's prompt without the block. A system prompt
-//! over 512 tokens exercises chat.prepare's system-prefix probe, and an image request the image render.
+//! The ``## Response Format`` block through the server's routes: prompts equal encoding.py's (encoder_unicode.json).
 const std = @import("std");
 const api = @import("engine_api");
 const assets = @import("dsv41_assets");

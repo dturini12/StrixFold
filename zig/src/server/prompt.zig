@@ -15,15 +15,13 @@ pub const Rendered = struct { ids: []const u32, history_len: usize = 0, images: 
 
 pub const isTitle = messages_mod.isTitleRequest;
 
-/// The schema a request's ``response_format`` shows in a DeepSeek-V4.1 prompt (its ``## Response Format`` block), or null:
-/// always null unless TF_DSV41_SCHEMA_PROMPT=1 (Config.dsv41_schema_prompt) and the template reads the V4.1 dialect.
+/// A ``response_format``'s schema for a V4.1 prompt; null unless Config.dsv41_schema_prompt and the V4.1 dialect.
 pub fn schemaOf(srv: *const Server, a: std.mem.Allocator, response_format: ?Value) std.mem.Allocator.Error!?Value {
     if (!srv.config.dsv41_schema_prompt or srv.dialect != .deepseek_v41) return null;
     return deepseek_schema.schemaFor(a, response_format orelse return null);
 }
 
-/// ``render_prompt_ids``: messages normalized for this template, rendered, and a dangling ``<think>`` closed. `schema`:
-/// schemaOf's, or null.
+/// ``render_prompt_ids``: messages normalized, rendered (with schemaOf's `schema`), a dangling ``<think>`` closed.
 pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool, schema: ?Value) errors.Refused![]const u32 {
     const normalized = try messages_mod.normalize(cx, messages, srv.late_system, srv.needs_user_after_tool, srv.dialect);
     return renderNormalizedIds(srv, cx, normalized, tools, thinking, effort, generation, schema);
@@ -174,8 +172,7 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8) er
     return .{ .ids = out.items, .images = placed.items };
 }
 
-/// A reusable system prefix, found with a probe in place of the first user message; zero below 512 tokens. `schema`: the
-/// prompt's own (schemaOf), so the probe's system block is the prompt's.
+/// A reusable system prefix (a probe for the first user message, with the prompt's `schema`); zero below 512 tokens.
 pub fn systemPrefixLen(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, prompt_ids: []const u32, thinking: bool, effort: ?[]const u8, schema: ?Value) usize {
     if (messages != .array) return 0;
     const first_user = for (messages.array, 0..) |m, i| {
