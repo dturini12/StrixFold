@@ -31,6 +31,7 @@ const fan_mod = @import("fan.zig");
 /// HIP builds: kernel sets from the AMD kit (CUDA builds never reference it).
 const hip_load = @import("hip_load.zig");
 const tri_aux = @import("tri_aux.zig");
+const tri_hc = @import("tri_hc.zig");
 const link = @import("link.zig");
 const ring2d = @import("ring2d.zig");
 const rdma = @import("rdma.zig");
@@ -292,6 +293,8 @@ pub const Model = struct {
         m.split_min = if (std.c.getenv("TF_DS_PREFILL_SPLIT")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch return error.BadSetting else 0;
         m.split_zip = if (std.c.getenv("TF_DS_PREFILL_SPLIT_ZIP")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         m.engram_rows = if (std.c.getenv("TF_DS_ENGRAM_ROWS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+        // TF_DS_HC_INLINE, before identity builds the plan text that carries it: the value the rounds run with
+        _ = try resolveHcInline();
         m.phase_timer = o.phase_timer;
         m.window_dir = if (std.c.getenv("TF_DS_WINDOW_LOGITS")) |v| std.mem.span(v) else null;
         m.window_l = null;
@@ -637,8 +640,15 @@ pub const Model = struct {
             .strict = strict,
             .disk = o.disk,
             .edit = m.edit_id,
+            .hc_inline = tri_hc.inline_mix,
         });
         return id;
+    }
+
+    /// TF_DS_HC_INLINE into tri_hc.inline_mix, before identity puts it in the plan text: the one value the rounds run.
+    fn resolveHcInline() error{BadSetting}!bool {
+        tri_hc.inline_mix = try tri_hc.inlineSetting(if (std.c.getenv(tri_hc.inline_env)) |v| std.mem.span(v) else null);
+        return tri_hc.inline_mix;
     }
 
     pub const PlanParts = struct {
@@ -659,16 +669,18 @@ pub const Model = struct {
         strict: bool,
         disk: bool, // sf-disk: " disk=1" at the end, only when on (the text is the stock one when off)
         edit: []const u8 = "", // TF_DS_EDIT's file by its hash: " edit=<16 hex>" at the end, only when set
+        hc_inline: bool = false, // TF_DS_HC_INLINE (tri_hc.inline_mix): " hc_inline=1" last, only when on
     };
 
     /// The handshake's plan text (identity), in `buf`.
     pub fn planText(buf: []u8, p: PlanParts) ![]u8 {
         var cb: [32]u8 = undefined;
         const ctx = if (p.context != 0 and p.context != p.pool) try std.fmt.bufPrint(&cb, " context={d}", .{p.context}) else "";
-        return std.fmt.bufPrint(buf, "drafts={} engram={} graphs={} pool={d}{s} streams={d} round_rows={d} chunk_rows={d} replay_floor={} aux={s} {s} engram_rows={} deploy={s} bundle={s} conf={s} kv={s} strict={}{s}{s}{s}", .{
+        return std.fmt.bufPrint(buf, "drafts={} engram={} graphs={} pool={d}{s} streams={d} round_rows={d} chunk_rows={d} replay_floor={} aux={s} {s} engram_rows={} deploy={s} bundle={s} conf={s} kv={s} strict={}{s}{s}{s}{s}", .{
             p.drafts,       p.engram, p.graphs,  p.pool,  ctx, p.streams,  p.round_rows, chunk_rows,
             p.replay_floor, p.aux,    p.gather,  p.engram_rows, p.deploy, p.bundle, p.conf,
             kv_format,      p.strict, if (p.disk) " disk=1" else "", if (p.edit.len > 0) " edit=" else "", p.edit,
+            if (p.hc_inline) " hc_inline=1" else "",
         });
     }
 
@@ -1433,4 +1445,64 @@ test "the handshake's plan text is the stock one with sf-disk off, and says disk
     p.edit = "0123456789abcdef";
     try std.testing.expectEqualStrings(stock ++ " disk=1 edit=0123456789abcdef", try Model.planText(&buf, p));
     try std.testing.expect(!@hasField(Options, "disk") or (Options{ .model_dir = "", .cache_dir = "", .kit_dir = "", .rank = 0, .world = 2, .master = .{ 0, 0, 0, 0 }, .port = 0 }).disk == false);
+}
+
+test "TF_DS_HC_INLINE is resolved before any Round: off keeps the stock plan and namespace, on changes both" {
+    const env = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    defer _ = env.unsetenv(tri_hc.inline_env);
+    defer tri_hc.inline_mix = false;
+    const di = @import("disk_identity.zig");
+    var gb: [128]u8 = undefined;
+    const gather = try Model.gatherOrder(&gb, 256, true, false);
+    const stock = "drafts=true engram=true graphs=true pool=8192 streams=4 round_rows=16 chunk_rows=2048 replay_floor=false aux=hip prefill_split=256 prefill_zip=true chunk_caps=1024/1024 phase_timer=false frames=" ++
+        std.fmt.comptimePrint("{d}", .{frame_protocol}) ++
+        " engram_rows=true deploy=70cfb8c bundle=c178a012 conf=abcd kv=win-fp8qd,cmp-fp4,idx-fp4 strict=false disk=1";
+    var p: Model.PlanParts = .{ .drafts = true, .engram = true, .graphs = true, .pool = 8192, .streams = 4, .round_rows = 16, .replay_floor = false, .aux = "hip", .gather = gather, .engram_rows = true, .deploy = "70cfb8c", .bundle = "c178a012", .conf = "abcd", .strict = false, .disk = true };
+    // what Model.open does before identity (no Round), then the plan text identity builds from that same variable
+    var ob: [512]u8 = undefined;
+    var nb: [512]u8 = undefined;
+    _ = env.unsetenv(tri_hc.inline_env);
+    tri_hc.inline_mix = true; // (a stale value: the resolution overwrites it)
+    try std.testing.expect(!try Model.resolveHcInline());
+    try std.testing.expect(!tri_hc.inline_mix);
+    p.hc_inline = tri_hc.inline_mix;
+    const off = try Model.planText(&ob, p);
+    try std.testing.expectEqualStrings(stock, off); // off: today's text, byte for byte
+    _ = env.setenv(tri_hc.inline_env, "0", 1);
+    try std.testing.expect(!try Model.resolveHcInline());
+    _ = env.setenv(tri_hc.inline_env, "1", 1);
+    try std.testing.expect(try Model.resolveHcInline());
+    try std.testing.expect(tri_hc.inline_mix);
+    p.hc_inline = tri_hc.inline_mix;
+    const on = try Model.planText(&nb, p);
+    try std.testing.expectEqualStrings(stock ++ " hc_inline=1", on);
+    // a value other than 0 or 1 is refused, and leaves the variable as it was
+    _ = env.setenv(tri_hc.inline_env, "yes", 1);
+    try std.testing.expectError(error.BadSetting, Model.resolveHcInline());
+    _ = env.setenv(tri_hc.inline_env, "", 1);
+    try std.testing.expectError(error.BadSetting, Model.resolveHcInline());
+    try std.testing.expect(tri_hc.inline_mix);
+    // sf-disk's namespace and chain seed (conf= dropped from both): the two settings never share a directory or a chain
+    const a = std.testing.allocator;
+    var parts: di.Parts = .{ .rank = 0, .world = 2, .deploy = "70cfb8c", .bundle = "c178a012", .kit_sha256 = "k", .hip_runtime = 1, .arch = "gfx1151", .plan = off, .engram = "none", .token_map = "none", .ds_kit = "d", .window = 128, .snap_bytes = 1, .planes = "" };
+    const id_off = try di.identityText(a, parts);
+    defer a.free(id_off);
+    const seed_off = try di.seedText(a, parts);
+    defer a.free(seed_off);
+    try std.testing.expect(std.mem.indexOf(u8, id_off, "hc_inline") == null);
+    parts.plan = on;
+    const id_on = try di.identityText(a, parts);
+    defer a.free(id_on);
+    const seed_on = try di.seedText(a, parts);
+    defer a.free(seed_on);
+    try std.testing.expect(!std.mem.eql(u8, id_off, id_on));
+    try std.testing.expect(!std.mem.eql(u8, seed_off, seed_on));
+    try std.testing.expect(std.mem.indexOf(u8, id_on, "\nplan.hc_inline=1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seed_on, "\nplan.hc_inline=1\n") != null);
+    // the namespace's directory name (pd.namespaceOf) differs too
+    const pd = @import("core").prompt_disk;
+    try std.testing.expect(!std.mem.eql(u8, &pd.namespaceOf(id_off), &pd.namespaceOf(id_on)));
 }
