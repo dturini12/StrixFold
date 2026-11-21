@@ -892,3 +892,4 @@ test { _ = @import("lane_host_test.zig"); }
 test { _ = @import("lane_host_end_test.zig"); }
 test { _ = @import("lane_host_cut_test.zig"); }
 test { _ = @import("lane_host_gate_test.zig"); }
+test { _ = @import("lane_host_hint_test.zig"); }
