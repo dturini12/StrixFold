@@ -911,6 +911,11 @@ pub const Model = struct {
             try m.stream.synchronize();
             try gpu.copyH2D(m.ctx.d, m.img_buf.?.ptr, rows);
         }
+        try m.setSpans(spans);
+    }
+
+    /// The filling prompt's image spans over the rows already in img_buf (a pass resumed after a cut-in; setImages).
+    pub fn setSpans(m: *Model, spans: []const prompt.Span) !void {
         m.spans.clearRetainingCapacity();
         try m.spans.appendSlice(m.gpa, spans);
         m.ch.spans = m.spans.items;
