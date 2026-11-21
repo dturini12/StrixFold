@@ -408,6 +408,7 @@ pub const Round = struct {
     /// build runs it: forked behind each mix's finish, joined before the next mix reads what it wrote. Its kernels and
     /// their inputs are the same, so the bytes are.
     pub fn useSide(rd: *Round, e: *const Engine) !void {
+        if (tri_hc.inline_mix) return error.HcInlineHasNoSide; // (TF_DS_HC_INLINE: no side work is left)
         if (rd.side != null) return;
         var s = try gpu.Stream.init(e.d, true);
         errdefer s.deinit();
@@ -1154,13 +1155,19 @@ fn mix(e: *const Engine, rd: *Round, h: u64, spare: *u64, pending: *?u64, params
     defer if (rd.side) |s| if (rd.join.?.record(s)) {
         rd.side_out = true;
     } else |_| {};
+    const sink = mixSink(rd.sink); // TF_DS_HC_INLINE: none, so the mixes then _hc_finish_s with its Sinkhorn half
     if (pending.*) |gp| {
-        const out = try tri_hc.hcPre2(e.t, h, params[0], params[1], params[2], pre_in, norm, c.eps, c.hc_eps, c.hc_iters, rd.x, pre_out, rd.post, rd.comb, rd.part, .{ .gathered = gp, .world = e.world, .h_out = spare.* }, rd.sink, R, c.hidden);
+        const out = try tri_hc.hcPre2(e.t, h, params[0], params[1], params[2], pre_in, norm, c.eps, c.hc_eps, c.hc_iters, rd.x, pre_out, rd.post, rd.comb, rd.part, .{ .gathered = gp, .world = e.world, .h_out = spare.* }, sink, R, c.hidden);
         pending.* = null;
         spare.* = h;
         return out;
     }
-    return tri_hc.hcPre2(e.t, h, params[0], params[1], params[2], pre_in, norm, c.eps, c.hc_eps, c.hc_iters, rd.x, pre_out, rd.post, rd.comb, rd.part, null, rd.sink, R, c.hidden);
+    return tri_hc.hcPre2(e.t, h, params[0], params[1], params[2], pre_in, norm, c.eps, c.hc_eps, c.hc_iters, rd.x, pre_out, rd.post, rd.comb, rd.part, null, sink, R, c.hidden);
+}
+
+/// The `sink` a round's mixes hand hcPre2: the round's, or none with tri_hc.inline_mix (TF_DS_HC_INLINE).
+fn mixSink(sink: tri_hc.Sink) ?tri_hc.Sink {
+    return if (tri_hc.inline_mix) null else sink;
 }
 
 /// A round's Engram reads, ahead of the stretches that use them: every window's n-grams hashed once (all the Engram
@@ -1246,4 +1253,15 @@ test "context buckets as graph.py makes them" {
 fn notPorted(src: std.builtin.SourceLocation) error{NotPortedYet} {
     std.debug.print("{{\"not_ported\": \"{s}:{d}\"}}\n", .{ src.file, src.line });
     return error.NotPortedYet;
+}
+
+test "TF_DS_HC_INLINE: a round's mixes hand hcPre2 no sink, and the side stream is refused" {
+    const sk: tri_hc.Sink = .{ .s = undefined, .fork = undefined, .cnt = 0x40 };
+    try std.testing.expectEqual(@as(u64, 0x40), mixSink(sk).?.cnt); // off: the round's sink, as before
+    tri_hc.inline_mix = true;
+    defer tri_hc.inline_mix = false;
+    try std.testing.expect(mixSink(sk) == null);
+    // refused before it reads the round or the engine
+    var rd: Round = undefined;
+    try std.testing.expectError(error.HcInlineHasNoSide, rd.useSide(undefined));
 }

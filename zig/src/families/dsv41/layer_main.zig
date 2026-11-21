@@ -72,7 +72,7 @@ const HipKit = if (gpu.backend == .hip) *gpu.Kit else void;
 const Two = if (gpu.features.world4) dsv41.prompt2d.Two else void;
 const Rings2d = if (gpu.features.world4 and gpu.features.verbs_rdma) dsv41.ring2d.Rings else void;
 
-const usage = "usage: tf-dsv41-layer MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT REC_DIR [--layers N] [--chunks C] [--check-from F] [--rounds K] [--drafts B] [--engram DIR --token-map FILE] [--dump DIR] [--anchor 0|1] [--keep-going 0|1] [--replay-gather 0|1] [--no-replay-cut 0|1] [--hip-kit DIR] [--kit-dir DIR]\n";
+const usage = "usage: tf-dsv41-layer MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT REC_DIR [--layers N] [--chunks C] [--check-from F] [--rounds K] [--drafts B] [--engram DIR --token-map FILE] [--dump DIR] [--anchor 0|1] [--keep-going 0|1] [--replay-gather 0|1] [--no-replay-cut 0|1] [--hip-kit DIR] [--kit-dir DIR] [--hc-inline 0|1]\n";
 const chunk_rows = 2048;
 const cache_tokens = 4096; // the compressed caches' positions at least (the recorded prompt's)
 /// The served pool's window (--context): the bucket rule's cap (graph.py bucket_for).
@@ -512,6 +512,7 @@ pub fn main(init: std.process.Init) !u8 {
     var no_replay_cut = false;
     var hip_kit: ?[]const u8 = null;
     var kit_dir: ?[]const u8 = null; // the RoPE tables and engram.json (a fixture set without them: the inputs' kit)
+    var hc_inline: ?[]const u8 = if (std.c.getenv(dsv41.tri_hc.inline_env)) |v| std.mem.span(v) else null; // --hc-inline
     var ai: usize = 8;
     while (ai + 1 < args.len) : (ai += 2) {
         const key = args[ai];
@@ -546,6 +547,8 @@ pub fn main(init: std.process.Init) !u8 {
             prefetch_on = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--side")) {
             side_on = !std.mem.eql(u8, val, "0");
+        } else if (std.mem.eql(u8, key, "--hc-inline")) {
+            hc_inline = val;
         } else if (std.mem.eql(u8, key, "--graphs")) {
             use_graphs = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--light")) {
@@ -635,6 +638,8 @@ pub fn main(init: std.process.Init) !u8 {
     const aux_which: dsv41.tri_aux.Which = if (gpu.backend == .hip) try dsv41.tri_aux.Which.fromEnv() else .triton;
     var aux_name: [32]u8 = undefined;
     var aux: dsv41.tri_aux.Aux = .{};
+    // the rounds' mixes without the side work (TF_DS_HC_INLINE or --hc-inline, as the server: Round.useSide refuses it)
+    dsv41.tri_hc.inline_mix = try dsv41.tri_hc.inlineSetting(hc_inline);
 
     // the weights (the DSpark blocks with --drafts) from the lane's rank cache
     const t0 = std.Io.Timestamp.now(io, .awake);
@@ -673,7 +678,7 @@ pub fn main(init: std.process.Init) !u8 {
             .kit_abi = gpu.kit.abi_version,
             .kit_sha256 = kit.manifest_sha256,
             .modalities = 0, // text: the gate runs no vision tower
-            .plan = try std.fmt.bufPrint(&plan, "gate=tf-dsv41-layer layers={d} chunks={d} check_from={d} rounds={d} drafts={d} anchor={} light={} replay_cut={} aux={s}", .{ layers, chunks, check_from, rounds, budgets.len, anchor, light, !no_replay_cut, aux_which.name(&aux_name) }),
+            .plan = try std.fmt.bufPrint(&plan, "gate=tf-dsv41-layer layers={d} chunks={d} check_from={d} rounds={d} drafts={d} anchor={} light={} replay_cut={} aux={s}{s}", .{ layers, chunks, check_from, rounds, budgets.len, anchor, light, !no_replay_cut, aux_which.name(&aux_name), if (dsv41.tri_hc.inline_mix) " hc_inline=1" else "" }),
         };
         coll_ = try dsv41.tcp_coll.open(gpa, io, &ctx, kit, &fan.?, &id);
     }
