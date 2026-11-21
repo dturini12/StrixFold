@@ -777,8 +777,7 @@ pub const Lanes = struct {
         if (!f.paused or self.held != null or s.images.len > 0) return error.FillBusy;
         var lb: [256]u8 = undefined;
         std.log.info("{s}", .{cutInLine(&lb, self.step, s.prompt_len, f)});
-        self.held = f;
-        self.held.?.away = true;
+        self.held = f; // (away once the cut-in's fill_begin went out: beginPass; a refusal before it changes nothing)
         self.fill = null;
     }
 
@@ -912,14 +911,8 @@ pub const Lanes = struct {
                 }
             }
         }
-        if (try self.begin(.fill_begin)) {
-            try self.wire.int(gpa, u32, @intCast(slot));
-            try self.wire.int(gpa, u64, base);
-            try self.wire.ids(gpa, seq.items);
-            // the pictures (spans, digests): rank 1 keys its disk states as rank 0 does (its sequence holds -1 there)
-            try fill_spans.write(&self.wire, gpa, if (keyed) s.cache_spans else &.{});
-            try self.flush();
-        }
+        // the pictures (spans, digests): rank 1 keys its disk states as rank 0 does (its sequence holds -1 there)
+        try self.beginPass(slot, base, seq.items, if (keyed) s.cache_spans else &.{});
         try m.fillBegin(slot, base);
         const replay = len -| m.cfg.window;
         var start: usize = 0;
@@ -978,6 +971,19 @@ pub const Lanes = struct {
         m.fill_seq = seq.items;
         const own: []Span = if (spans.items.len > 0) try gpa.dupe(Span, spans.items) else &.{};
         self.fill = .{ .s = s, .slot = slot, .base = base, .len = len, .replay = replay, .last_end = last_end, .start = start, .keyed = keyed, .cut = cut, .spans = own };
+    }
+
+    /// A pass's fill_begin to rank 1; from then on a paused pass set aside is away (its next chunk resumes it).
+    fn beginPass(self: *Lanes, slot: usize, base: usize, ids: []const i32, spans: []const image_key.KeySpan) !void {
+        const gpa = self.gpa;
+        if (try self.begin(.fill_begin)) {
+            try self.wire.int(gpa, u32, @intCast(slot));
+            try self.wire.int(gpa, u64, base);
+            try self.wire.ids(gpa, ids);
+            try fill_spans.write(&self.wire, gpa, spans);
+            try self.flush();
+        }
+        if (self.held) |*h| h.away = true; // (before this frame a cut-in changed neither rank's model: no resume)
     }
 
     /// The spans and their rows to rank 1, image_piece bytes of rows a frame (a follower's frame buffer: 64 KiB + ids).
@@ -2978,13 +2984,9 @@ const PassDisk = struct {
 
 /// Rank 0's fill_begin for the prompt in `slot`, as fillStart sends it, and its own model on that pass.
 fn testBegin(ln: *Lanes, slot: usize, base: usize) !void {
-    const gpa = std.testing.allocator;
-    try std.testing.expect(try ln.begin(.fill_begin));
-    try ln.wire.int(gpa, u32, @intCast(slot));
-    try ln.wire.int(gpa, u64, base);
-    try ln.wire.ids(gpa, ln.seqs[slot].items);
-    try fill_spans.write(&ln.wire, gpa, &.{}); // a text prompt: no pictures
-    try ln.flush();
+    const step = ln.step;
+    try ln.beginPass(slot, base, ln.seqs[slot].items, &.{}); // (a text prompt: no pictures)
+    try std.testing.expectEqual(step + 1, ln.step);
     if (ln.passDisk()) |d| d.beginPass(std.mem.sliceAsBytes(ln.seqs[slot].items), &.{});
     try ln.m.fillBegin(slot, base);
     ln.m.fill_seq = ln.seqs[slot].items;
@@ -3134,6 +3136,7 @@ const ImageRig = struct {
     buf: []u8,
     long: lanes.Stream,
     short: lanes.Stream,
+    refusing: lanes.Stream, // a text prompt whose cut-in fillStart refuses for room (pool_cap 0) before any frame
     imgs: [1]lanes.stream.Image,
 
     fn init(t: *ImageRig) !void {
@@ -3157,6 +3160,12 @@ const ImageRig = struct {
         for (spans) |sp| @memset(t.ln.seqs[1].items[sp.at..][0..sp.len], -1);
         try t.ln.seqs[0].resize(gpa, c / 2);
         for (t.ln.seqs[0].items, 0..) |*q, i| q.* = @intCast((i * 7) % 1000);
+        t.m0.pool_cap = 0;
+        t.m0.context_cap = 1 << 20;
+        t.m0.eng.round_rows = 16;
+        t.m0.io = std.testing.io;
+        const ids: [64]u32 = @splat(5);
+        t.refusing = try lanes.Stream.init(gpa, .{ .id = "refused", .prompt = &ids, .max_new = 8 });
     }
 
     fn deinit(t: *ImageRig) void {
@@ -3168,6 +3177,7 @@ const ImageRig = struct {
         gpa.free(t.buf);
         t.m0.spans.deinit(gpa);
         t.m1.spans.deinit(gpa);
+        t.refusing.deinit(gpa);
         for (t.sv) |fd| _ = std.c.close(fd);
     }
 
@@ -3228,8 +3238,16 @@ const ImageRig = struct {
     /// A run's picture rows by chunk and rank, and whether both ranks held the pass's spans and rows at every chunk.
     const Got = struct { rows: [5][2][2]usize, held: bool };
 
-    /// The whole pass: `cuts[k]` cut-ins at the pause after chunk k (sliced: a pause after every chunk but the last).
-    fn run(cuts: [4]u8, sliced: bool) !Got {
+    /// A cut-in that fillStart refuses (ContextFull, from placement) before its fill_begin: no frame goes out.
+    fn refuse(t: *ImageRig) !void {
+        const step = t.ln.step;
+        try std.testing.expectError(error.ContextFull, t.ln.prefillSlice(&t.refusing, std.math.maxInt(u64)));
+        try std.testing.expectEqual(step, t.ln.step);
+        try std.testing.expect(t.ln.fill.?.s == &t.long and t.ln.held == null);
+    }
+
+    /// The whole pass: at each pause, `refusals[k]` cut-ins refused before their first frame, then `cuts[k]` that read.
+    fn run(cuts: [4]u8, refusals: [4]u8, sliced: bool) !Got {
         var t: ImageRig = undefined;
         try t.init();
         defer t.deinit();
@@ -3245,6 +3263,7 @@ const ImageRig = struct {
             }
             if (k == 4 or !sliced) continue;
             try t.pause();
+            for (0..refusals[k]) |_| try t.refuse();
             for (0..cuts[k]) |_| try t.cutIn(k);
         }
         t.ln.closeFill();
@@ -3258,14 +3277,19 @@ const ImageRig = struct {
 
 /// A sliced run with these cut-ins against the pass read whole: each chunk's picture rows on each rank, then the spans.
 fn sameAsWhole(cuts: [4]u8) !void {
-    const whole = try ImageRig.run(.{ 0, 0, 0, 0 }, false);
-    const got = try ImageRig.run(cuts, true);
+    return sameAsWholeRefused(cuts, .{ 0, 0, 0, 0 });
+}
+
+/// sameAsWhole with cut-ins refused before their first frame at the pauses too (before the ones that read).
+fn sameAsWholeRefused(cuts: [4]u8, refusals: [4]u8) !void {
+    const whole = try ImageRig.run(.{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 }, false);
+    const got = try ImageRig.run(cuts, refusals, true);
     try std.testing.expectEqual(whole.rows, got.rows);
     try std.testing.expect(whole.held and got.held);
 }
 
 test "after a cut-in inside a picture both ranks embed each chunk's picture rows as the pass read whole does" {
-    const whole = try ImageRig.run(.{ 0, 0, 0, 0 }, false);
+    const whole = try ImageRig.run(.{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 }, false);
     // read whole: each chunk's overlap with the pictures, on both ranks alike
     const want = [5][2]usize{ .{ 1048, 0 }, .{ 452 + 596, 1048 + 1500 }, .{ 404 + 1144, 2096 + 2500 }, .{ 356, 3644 }, .{ 300, 4000 } };
     for (whole.rows, want) |g, w| try std.testing.expectEqual([2][2]usize{ w, w }, g);
@@ -3281,6 +3305,12 @@ test "repeated cut-ins on an image pass: at three pauses in a row, and two at on
 test "a cut-in at an image pass's last pause, a picture still ahead: its last chunk embeds that picture's rows" {
     try sameAsWhole(.{ 0, 0, 0, 1 });
     try sameAsWhole(.{ 1, 1, 1, 1 });
+}
+
+test "a cut-in refused before its first frame (ContextFull) leaves both ranks on the image pass: each chunk as read whole" {
+    try sameAsWholeRefused(.{ 0, 0, 0, 0 }, .{ 1, 0, 0, 0 }); // inside a picture, nothing reads after it
+    try sameAsWholeRefused(.{ 1, 0, 0, 0 }, .{ 1, 0, 0, 0 }); // then one that reads at the same pause
+    try sameAsWholeRefused(.{ 0, 1, 0, 1 }, .{ 2, 0, 1, 1 }); // after a cut-in that read, and at the last pause
 }
 
 test "an image pass reads whole unless TF_DS_FILL_IMAGES; a cut-in always; a text pass in slices" {
