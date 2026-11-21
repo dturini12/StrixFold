@@ -7,6 +7,7 @@ const model_text = @import("model_text.zig");
 const chat = @import("chat.zig");
 const Server = @import("server.zig").Server;
 const api = @import("engine_api");
+const image_memo = @import("image_memo.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 
@@ -170,23 +171,55 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8) er
         if (k >= images.len or used[k]) return cx.refuse("image input: unknown or repeated image identity");
         used[k] = true;
         cursor = end + 1;
-        var problem: []const u8 = "";
-        const prep = vision.prepare(vision.ctx, cx.a, images[k], &problem) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.BadImage => return cx.refuse(problem),
-        };
-        // the digest once here: the prompt caches key the span by it on every turn that carries the picture
-        try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = prep.tokens, .bytes = prep.payload, .digest = api.prompt_cache.imageDigest(prep.payload) });
-        try out.appendNTimes(cx.a, vision.token, prep.tokens);
+        const pic = if (srv.memo) |memo| try memoized(srv.io, srv.gpa, memo, vision, cx, images[k]) else try prepared(vision, cx, images[k]);
+        try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = pic.tokens, .bytes = pic.bytes, .source = pic.source, .digest = pic.digest });
+        try out.appendNTimes(cx.a, vision.token, pic.tokens);
         // the limits refuse at the picture that crosses them, before any later one is decoded
-        pixels += prep.pixels;
-        tokens += prep.tokens;
+        pixels += pic.pixels;
+        tokens += pic.tokens;
         const n = placed.items.len;
         if (vision.max_pixels > 0 and pixels > vision.max_pixels) return cx.fail(.request, "image input: the images decode to {d} pixels by image {d} of {d}, more than the {d} this engine takes per request; send fewer or smaller images", .{ pixels, n, images.len, vision.max_pixels });
         if (vision.max_tokens > 0 and tokens > vision.max_tokens) return cx.fail(.request, "image input: the images take {d} image tokens by image {d} of {d}, more than the {d} this engine holds per request; send fewer or smaller images", .{ tokens, n, images.len, vision.max_tokens });
     }
     if (placed.items.len != images.len) return cx.refuse("image input: the prompt holds fewer image placeholders than images");
     return .{ .ids = out.items, .images = placed.items };
+}
+
+/// A picture as its span carries it: the payload (`bytes`), or with the memo `source` for the encoder to prepare.
+const Picture = struct { tokens: u32, pixels: u64, bytes: []const u8, source: []const u8 = &.{}, digest: api.prompt_cache.Digest };
+
+/// The picture prepared here, its payload in the request's arena (the path without the memo).
+fn prepared(vision: api.Vision, cx: *Cx, source: []const u8) errors.Refused!Picture {
+    var problem: []const u8 = "";
+    const prep = vision.prepare(vision.ctx, cx.a, source, &problem) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.BadImage => return cx.refuse(problem),
+    };
+    // the digest once here: the prompt caches key the span by it on every turn that carries the picture
+    return .{ .tokens = prep.tokens, .pixels = prep.pixels, .bytes = prep.payload, .digest = api.prompt_cache.imageDigest(prep.payload) };
+}
+
+/// By the memo: a new picture is prepared into a scratch freed here, a known one not at all; the span holds the source.
+fn memoized(io: std.Io, gpa: std.mem.Allocator, memo: *image_memo.Memo, vision: api.Vision, cx: *Cx, source: []const u8) errors.Refused!Picture {
+    const k = image_memo.Memo.key(source);
+    const e = memo.get(io, k) orelse fresh: {
+        var scratch: std.heap.ArenaAllocator = .init(gpa);
+        defer scratch.deinit();
+        var problem: []const u8 = "";
+        const prep = vision.prepare(vision.ctx, scratch.allocator(), source, &problem) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.BadImage => return cx.refuse(try cx.a.dupe(u8, problem)), // the problem may live in the scratch
+        };
+        const made: image_memo.Entry = .{ .tokens = prep.tokens, .pixels = prep.pixels, .digest = api.prompt_cache.imageDigest(prep.payload) };
+        memo.put(io, k, made);
+        break :fresh made;
+    };
+    return .{ .tokens = e.tokens, .pixels = e.pixels, .bytes = &.{}, .source = source, .digest = e.digest };
+}
+
+test {
+    _ = @import("image_memo.zig");
+    _ = @import("image_memo_test.zig");
 }
 
 /// A reusable system prefix, found with a probe in place of the first user message; zero below 512 tokens.
