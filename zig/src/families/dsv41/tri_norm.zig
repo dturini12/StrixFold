@@ -414,7 +414,7 @@ test "with route on, every recorded _route_parts launch of 384 experts takes aux
     const a = std.testing.allocator;
     const f: gpu.Function = undefined;
     const aux: tri_aux.Aux = .{ .route = f };
-    var main_rows = std.StaticBitSet(17).initEmpty();
+    var main_rows: [17]bool = @splat(false);
     var drafter: usize = 0;
     for ([_][]const u8{ tri.fixtures, tri.derived_fixtures }) |src| {
         var parsed = try std.json.parseFromSlice(std.json.Value, a, src, .{});
@@ -436,7 +436,7 @@ test "with route on, every recorded _route_parts launch of 384 experts takes aux
                     .shared_id = @intCast(c.int("shared_id")), .rows = @intCast(rows), .kc = @intCast(c.dim("S", 1)),
                     .topk = @intCast(c.constInt("TOPK")), .slots = @intCast(c.dim("PICK", 1)),
                 }, log.hipArgs(tri_aux.RouteArgs, 0));
-                main_rows.set(rows);
+                main_rows[rows] = true;
             } else {
                 try std.testing.expectEqualStrings("_route_parts", k.name);
                 try std.testing.expect(try tri.covered(a, k));
@@ -445,7 +445,7 @@ test "with route on, every recorded _route_parts launch of 384 experts takes aux
         }
     }
     // recorded: the main model's routing at 1 row (forward) and 16 (a round), and the drafter's; rows are the grid
-    try std.testing.expect(main_rows.isSet(1) and main_rows.isSet(16));
+    try std.testing.expect(main_rows[1] and main_rows[16]);
     try std.testing.expect(drafter > 0);
 }
 
