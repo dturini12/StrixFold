@@ -53,7 +53,8 @@ pub const LaneHost = struct {
     // and frees its extent (its kept state then resumes in place) instead of waiting out every queued pass, as the
     // Python lane's fills leave decoding its share
     finish_until: ?i96 = null,
-    filling: ?*Job = null, // the one request whose prompt pass paused for the other streams' rounds
+    filling: ?*Job = null, // the one request whose prompt pass paused for the other streams' rounds (and a cut-in)
+    arrivals: u64 = 0, // requests submitted so far (the lock held): a job's place among its queue class
 
     const Mark = struct { at: i96, tokens: u64 };
     const full_retry_ns: i96 = std.time.ns_per_s;
@@ -67,6 +68,7 @@ pub const LaneHost = struct {
         id: Id,
         request: *const Request,
         sink: Sink,
+        arrival: u64 = 0,
         stream: lanes.Stream = undefined,
         proposer: lanes.SuffixLookup = undefined,
         delivered: usize = 0,
@@ -191,6 +193,8 @@ pub const LaneHost = struct {
             return error.Closed;
         }
         // foreground before background, each in arrival order (the Python job queue's priority)
+        h.arrivals += 1;
+        job.arrival = h.arrivals;
         var at = h.queued.items.len;
         if (!request.background) {
             while (at > 0 and h.queued.items[at - 1].request.background) at -= 1;
@@ -387,13 +391,9 @@ pub const LaneHost = struct {
             h.unlock();
             return false;
         }
-        if (h.full_wait) |n| {
-            const active = h.core.activeCount();
-            if (active > 0 and active >= n and std.Io.Clock.awake.now(h.io).toNanoseconds() < h.full_retry) {
-                h.unlock();
-                return false;
-            }
-            h.full_wait = null;
+        if (h.waitsForRoom()) {
+            h.unlock();
+            return false;
         }
         if (h.finish_until) |t| {
             if (std.Io.Clock.awake.now(h.io).toNanoseconds() < t and h.nearEnd()) {
@@ -412,6 +412,39 @@ pub const LaneHost = struct {
             return true;
         };
         h.unlock();
+        return h.admit(job, h.sliceNs());
+    }
+
+    /// Whether the request refused for room still waits (the lock held): until a stream ends, or full_retry.
+    fn waitsForRoom(h: *LaneHost) bool {
+        const n = h.full_wait orelse return false;
+        const active = h.core.activeCount();
+        if (active > 0 and active >= n and std.Io.Clock.awake.now(h.io).toNanoseconds() < h.full_retry) return true;
+        h.full_wait = null;
+        return false;
+    }
+
+    /// Between two slices of the paused pass, the first queued prompt of at most fill_cut_in tokens reads whole.
+    fn cutIn(h: *LaneHost) void {
+        const most = h.info_.fill_cut_in;
+        if (most == 0) return;
+        h.lock();
+        const at = for (h.queued.items, 0..) |job, i| {
+            if (job.request.images.len == 0 and job.request.prompt.len <= most) break i;
+        } else h.queued.items.len;
+        if (at == h.queued.items.len or h.admitted.items.len >= h.info_.lanes or h.waitsForRoom()) return h.unlock();
+        const job = h.queued.orderedRemove(at);
+        h.admitted.append(h.gpa, job) catch {
+            h.unlock();
+            return h.finish(job, .failed, "out of memory");
+        };
+        h.unlock();
+        h.filling.?.reported(); // the paused pass restored at its start: this lookup or its keeps may evict that entry
+        _ = h.admit(job, std.math.maxInt(u64));
+    }
+
+    /// An admitted job's stream and its prompt pass for budget_ns (a whole pass for a cut-in).
+    fn admit(h: *LaneHost, job: *Job, budget_ns: u64) bool {
         const r = job.request;
         var reuse: lanes.stream.Reuse = .{};
         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
@@ -449,18 +482,21 @@ pub const LaneHost = struct {
         job.started = true;
         const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
         job.began = began;
-        if (h.loneFits(job)) return h.runLone(job, began);
-        const done = h.core.fillStream(&job.stream, h.sliceNs(), true) catch |e| return h.failedPass(job, e);
+        const cut = h.filling != null;
+        if (!cut and h.loneFits(job)) return h.runLone(job, began);
+        const done = h.core.fillStream(&job.stream, budget_ns, true) catch |e| return h.failedPass(job, e);
         if (!done) {
+            if (cut) return h.drop(job, "a cut-in's prompt pass paused");
             h.filling = job;
             return false;
         }
-        return h.entered(job, true); // in at its first call: no round ran during it
+        return h.entered(job, !cut); // in at its first call: no round ran during it
     }
 
-    /// How long a prompt pass reads before the other streams' next round: a whole pass when none decodes.
+    /// How long a prompt pass reads before the next round: a whole pass when no stream decodes and none may cut in.
     fn sliceNs(h: *LaneHost) u64 {
-        if (h.info_.fill_slice_ns == 0 or h.core.activeCount() == 0) return std.math.maxInt(u64);
+        const alone = h.core.activeCount() == 0 and h.info_.fill_cut_in == 0;
+        if (h.info_.fill_slice_ns == 0 or alone) return std.math.maxInt(u64);
         return h.info_.fill_slice_ns;
     }
 
@@ -478,7 +514,7 @@ pub const LaneHost = struct {
 
     fn failedPass(h: *LaneHost, job: *Job, e: anyerror) bool {
         if (e == error.Cancelled) return h.cancel(job);
-        if (e == error.ContextFull and h.core.activeCount() > 0) return h.requeue(job);
+        if (e == error.ContextFull and (h.core.activeCount() > 0 or h.filling != null)) return h.requeue(job);
         return h.drop(job, h.words(e));
     }
 
@@ -581,7 +617,7 @@ pub const LaneHost = struct {
     /// A request whose prompt pass the backend's pool cannot hold while other streams run (error.ContextFull, before
     /// anything of it was placed) goes back to the queue's front and waits until one of them ends, as the Python
     /// lane's window waits, instead of failing, or a second at most (the backend may place it by then). Returns
-    /// false: nothing more is admitted now.
+    /// false: nothing more is admitted now. A cut-in goes back to its place by class and arrival, not to the front.
     fn requeue(h: *LaneHost, job: *Job) bool {
         h.remove(job);
         h.core.discard(&job.stream);
@@ -596,7 +632,7 @@ pub const LaneHost = struct {
         job.delivered = 0;
         job.prefill_sent = false;
         h.lock();
-        h.queued.insert(h.gpa, 0, job) catch {
+        h.queued.insert(h.gpa, if (h.filling != null) h.placeOf(job) else 0, job) catch {
             h.unlock();
             h.finish(job, .failed, "out of memory");
             return true;
@@ -605,6 +641,16 @@ pub const LaneHost = struct {
         h.full_retry = std.Io.Clock.awake.now(h.io).toNanoseconds() + full_retry_ns;
         h.unlock();
         return false;
+    }
+
+    /// Where a job waits among the queued (the lock held): foreground before background, each in arrival order.
+    fn placeOf(h: *const LaneHost, job: *const Job) usize {
+        for (h.queued.items, 0..) |q, i| {
+            if (q.request.background != job.request.background) {
+                if (q.request.background) return i;
+            } else if (q.arrival > job.arrival) return i;
+        }
+        return h.queued.items.len;
     }
 
     /// A job cancelled in its prompt pass, its lane already released.
@@ -639,7 +685,7 @@ pub const LaneHost = struct {
             h.takeCancels();
             if (h.filling == null) {
                 while (h.admitOne()) {}
-            }
+            } else h.cutIn(); // one a pause: the paused pass reads its next slice after this round
             h.noteLive();
             h.lock();
             if (h.closing) {
@@ -815,3 +861,4 @@ test "a lane host serves the core's own tokens, in order, and cancels between ro
 
 test { _ = @import("lane_host_test.zig"); }
 test { _ = @import("lane_host_end_test.zig"); }
+test { _ = @import("lane_host_cut_test.zig"); }

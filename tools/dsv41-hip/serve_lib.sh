@@ -70,6 +70,10 @@ serve_load() {
   [[ $DRAFT_BYPASS_AT =~ ^(0|[2-8])$ ]] || die "DRAFT_BYPASS_AT must be 0 or 2..8"
   FILL_SLICE_MS=${FILL_SLICE_MS:-0}
   [[ $FILL_SLICE_MS =~ ^[0-9]{1,6}$ ]] || die "FILL_SLICE_MS must be a whole number of ms up to 999999 (0: whole prompt passes)"
+  FILL_CUT_IN=${FILL_CUT_IN:-0}
+  [[ $FILL_CUT_IN =~ ^[0-9]{1,7}$ ]] || die "FILL_CUT_IN must be a whole number of prompt tokens up to 9999999 (0: no cut-ins)"
+  FILL_CUT_IN=$((10#$FILL_CUT_IN)) FILL_SLICE_MS=$((10#$FILL_SLICE_MS))
+  [ "$FILL_CUT_IN" = 0 ] || [ "$FILL_SLICE_MS" != 0 ] || die "FILL_CUT_IN needs FILL_SLICE_MS above 0: a request cuts in between a prompt's slices"
   # the switch acts only on drafted TP2 shared rounds that can hold that many streams; elsewhere it is off
   if [ "$DRAFTS" != 1 ] || [ "$WORLD" != 2 ] || [ "$DRAFT_BYPASS_AT" -gt "$STREAMS" ]; then DRAFT_BYPASS_AT=0; fi
   for v in REPLAY_FLOOR HC_SIDE ENGRAM_AIO SEED_RANDOM L2_PREFETCH LOOP_GUARD; do case ${!v} in 0|1) ;; *) die "$v must be 0 or 1, not ${!v}";; esac; done
@@ -200,6 +204,7 @@ serve_env() {
   [ -n "${FROZEN_TIMING:-}" ] && [ "$RANK" = 0 ] && SERVE_ENV+=(TF_LANES_FROZEN_TIMING="$FROZEN_TIMING")
   [ "$RANK" = 0 ] && SERVE_ENV+=(TF_DS_DRAFT_BYPASS_AT="$DRAFT_BYPASS_AT")
   [ "$RANK" = 0 ] && SERVE_ENV+=(TF_FILL_SLICE_MS="$FILL_SLICE_MS")
+  [ "$RANK" = 0 ] && [ "$FILL_CUT_IN" != 0 ] && SERVE_ENV+=(TF_FILL_CUT_IN="$FILL_CUT_IN")
   [ -n "${TRACE_ROUNDS:-}" ] && [ "$RANK" = 0 ] && SERVE_ENV+=(TF_DS_TRACE_ROUNDS="$TRACE_ROUNDS")
   [ -n "${GRAPHS_EAGER:-}" ] && SERVE_ENV+=(TF_DS_GRAPHS_EAGER="$GRAPHS_EAGER")
   # the prefetch's forked stream overlaps the graph's main branch only with HIP's segment scheduling (a debug variable)
