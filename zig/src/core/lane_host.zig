@@ -225,6 +225,30 @@ pub const LaneHost = struct {
         return e.at;
     }
 
+    /// The family's tower gate (Info.tower_slice_ns; 0: free), held only while a stream decodes (never idle, held).
+    fn gate(h: *const LaneHost) ?lanes.stream.Encode {
+        if (h.info_.tower_slice_ns == 0) return null;
+        const v = h.info_.vision orelse return null;
+        return v.encode;
+    }
+
+    fn holdTower(h: *LaneHost) void {
+        const x = h.gate() orelse return;
+        if (x.hold) |f| f(x.ctx);
+    }
+
+    /// After a round's deliveries: a slice of the tower while streams still decode, else it runs free.
+    fn sliceTower(h: *LaneHost) void {
+        const x = h.gate() orelse return;
+        if (h.core.activeCount() == 0) return h.releaseTower();
+        if (x.slice) |f| f(x.ctx, h.info_.tower_slice_ns);
+    }
+
+    fn releaseTower(h: *LaneHost) void {
+        const x = h.gate() orelse return;
+        if (x.release) |f| f(x.ctx);
+    }
+
     /// The family's off-thread tower for a request with images; null: its prompt pass runs any tower itself.
     fn encoder(h: *const LaneHost, r: *const Request) ?lanes.stream.Encode {
         if (r.images.len == 0) return null;
@@ -490,6 +514,7 @@ pub const LaneHost = struct {
         if (!done) {
             if (cut) return h.drop(job, "a cut-in's prompt pass paused");
             h.filling = job;
+            if (h.encoder(r)) |x| x.forget(x.ctx, r.images); // its first slice took the rows (FILL_IMAGES)
             return false;
         }
         return h.entered(job, !cut); // in at its first call: no round ran during it
@@ -684,16 +709,18 @@ pub const LaneHost = struct {
 
     fn run(h: *LaneHost) void {
         while (true) {
+            if (h.core.activeCount() == 0) h.releaseTower(); // before admission and any idle wait (after failAll too)
             h.takeCancels();
             if (h.filling == null) {
                 while (h.admitOne()) {}
             } else h.cutIn(); // one a pause: the paused pass reads its next slice after this round
             h.noteLive();
+            if (h.core.activeCount() == 0) h.releaseTower(); // cancels may have ended the last stream: idle free
             h.lock();
             if (h.closing) {
                 const left = h.queued.items.len + h.admitted.items.len;
                 h.unlock();
-                if (left == 0) return;
+                if (left == 0) return h.releaseTower();
                 h.closeAll();
                 continue;
             }
@@ -705,6 +732,7 @@ pub const LaneHost = struct {
             }
             h.unlock();
             if (h.core.activeCount() > 0) {
+                h.holdTower();
                 h.core.step() catch |e| {
                     h.failAll(@errorName(e));
                     continue;
@@ -718,6 +746,7 @@ pub const LaneHost = struct {
                         h.unlock();
                     } else i += 1;
                 }
+                h.sliceTower();
             }
             if (h.filling) |job| h.fillMore(job); // a round, then the paused pass's next slice
         }
@@ -866,4 +895,5 @@ test {
     _ = @import("lane_host_end_test.zig");
     _ = @import("lane_host_cut_test.zig");
     _ = @import("lane_host_hint_test.zig");
+    _ = @import("lane_host_gate_test.zig");
 }
