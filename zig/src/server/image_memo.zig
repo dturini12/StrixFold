@@ -7,6 +7,29 @@ pub const Digest = [32]u8;
 /// One remembered preparation.
 pub const Entry = struct { tokens: u32, pixels: u64, digest: Digest };
 
+/// One request's lookups, for its log line: pictures = hits + misses; `entries` = the memo's count after the request.
+pub const Tally = struct {
+    hits: u32 = 0,
+    misses: u32 = 0,
+    entries: usize = 0,
+
+    pub fn pictures(t: Tally) u32 {
+        return t.hits + t.misses;
+    }
+
+    /// The request's line, with `args`.
+    pub const line = "image memo: pictures={d} hits={d} misses={d} entries={d}";
+
+    pub fn args(t: Tally) struct { u32, u32, u32, usize } {
+        return .{ t.pictures(), t.hits, t.misses, t.entries };
+    }
+
+    /// The request's one line (info level).
+    pub fn log(t: Tally) void {
+        std.log.info(line, t.args());
+    }
+};
+
 /// Only good preparations are remembered; at `cap` entries it is cleared whole before the next new one (one log line).
 pub const Memo = struct {
     gpa: std.mem.Allocator,
@@ -86,4 +109,11 @@ test "a memo of 0 pictures remembers nothing" {
     defer m.deinit();
     m.put(io, Memo.key("a"), .{ .tokens = 1, .pixels = 1, .digest = Memo.key("p") });
     try std.testing.expectEqual(@as(usize, 0), m.count(io));
+}
+
+test "a request's tally reads as its log line" {
+    const t: Tally = .{ .hits = 1, .misses = 2, .entries = 5 };
+    const text = try std.fmt.allocPrint(std.testing.allocator, Tally.line, t.args());
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("image memo: pictures=3 hits=1 misses=2 entries=5", text);
 }
