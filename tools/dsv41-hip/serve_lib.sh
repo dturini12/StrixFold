@@ -225,6 +225,7 @@ serve_env() {
   [ "$RANK" = 0 ] && [ "$IMAGE_ROWS_BUDGET_MIB" != 0 ] && SERVE_ENV+=(TF_DS_IMAGE_ROWS_BUDGET_MIB="$IMAGE_ROWS_BUDGET_MIB")
   [ "$RANK" = 0 ] && [ "$TOWER_SLICE_MS" != 0 ] && SERVE_ENV+=(TF_DS_TOWER_SLICE_MS="$TOWER_SLICE_MS")
   [ -n "${TRACE_ROUNDS:-}" ] && [ "$RANK" = 0 ] && SERVE_ENV+=(TF_DS_TRACE_ROUNDS="$TRACE_ROUNDS")
+  [ -n "${ROUND_LOGITS_SHA:-}" ] && [ "$RANK" = 0 ] && SERVE_ENV+=(TF_DS_ROUND_LOGITS_SHA="$ROUND_LOGITS_SHA")
   [ -n "${GRAPHS_EAGER:-}" ] && SERVE_ENV+=(TF_DS_GRAPHS_EAGER="$GRAPHS_EAGER")
   # the prefetch's forked stream overlaps the graph's main branch only with HIP's segment scheduling (a debug variable)
   [ "$L2_PREFETCH" = 1 ] && SERVE_ENV+=(DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING=1)
