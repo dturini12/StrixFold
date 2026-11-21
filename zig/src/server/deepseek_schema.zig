@@ -4,9 +4,7 @@ const json = @import("json.zig");
 const Allocator = std.mem.Allocator;
 const Value = json.Value;
 
-/// ``schema_for_prompt``: what ``## Response Format`` shows for a ``response_format``, or null (text, absent or not
-/// a shape that names a schema). json_object shows ``{"type": "object"}``; json_schema its schema (a JSON string of one
-/// parsed).
+/// ``schema_for_prompt``: json_object as ``{"type": "object"}``, json_schema as its (parsed) schema, else null.
 pub fn schemaFor(a: Allocator, rf: Value) Allocator.Error!?Value {
     if (rf != .object) return null;
     const kind = rf.get("type") orelse return null;

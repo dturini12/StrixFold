@@ -48,8 +48,7 @@ pub const Config = struct {
     keep_warm_s: i64 = 900,
     /// TENSORFOLD_SSE_KEEPALIVE (s): a stream silent this long (a long prefill) sends an SSE comment; 0: never.
     sse_keepalive_ms: u32 = 0,
-    /// TF_DSV41_SCHEMA_PROMPT=1: a DeepSeek-V4.1 request's response_format schema goes into its prompt as the encoder's
-    /// ``## Response Format`` block (the chat template's ``response_format``); off (the default): the prompt as without it.
+    /// TF_DSV41_SCHEMA_PROMPT=1: a request's schema in its prompt as ``## Response Format``; off: the prompt as before.
     dsv41_schema_prompt: bool = false,
     dashboard: bool = false,
     /// Sampling when a request names none (generation_config.json and the serve flags), or null for greedy.

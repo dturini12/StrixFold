@@ -430,8 +430,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     gpu_test.dependOn(&b.addInstallArtifact(coll_check, .{ .dest_dir = .{ .override = install_test } }).step);
 }
 
-/// `dsv41_assets` for the server's unit tests: the deployed DeepSeek-V4.1 chat template (tools/dsv41-hip/assets) as
-/// `chat_template`, so a test renders the very file the deploy pins.
+/// `dsv41_assets`: tools/dsv41-hip/assets' chat template (the file deploys pin) as `chat_template`, for server tests.
 pub fn assetsModule(b: *std.Build) *std.Build.Module {
     const files = b.addWriteFiles();
     _ = files.addCopyFile(b.path("tools/dsv41-hip/assets/chat_template.jinja"), "chat_template.jinja");
