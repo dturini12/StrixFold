@@ -64,3 +64,21 @@ slices its prompt is read whole and it starts answering, then the long read goes
 the long read never stops, and it needs a free stream slot and room in the pool like any request. The others wait for
 the short prompt's read on top of the slice, so keep the size small. With it set, a long prompt is read in slices even
 when nothing else is answering, so that a request can cut in. It is off by default and needs `FILL_SLICE_MS` above 0.
+
+## Pictures
+
+Five settings for requests with images, all off by default; each leaves the output unchanged.
+
+- `FILL_IMAGES=1` reads a prompt with pictures in `FILL_SLICE_MS` slices like a text prompt, so the chats that are
+  answering keep getting rounds while it is read, and a short request (`FILL_CUT_IN`) may cut in on it. Off, such a
+  prompt is read whole and the others wait for it. It needs `FILL_SLICE_MS` above 0.
+- `TOWER_SLICE_MS=200` lets the vision tower run only between the answering chats' rounds, about that long each
+  time, instead of beside them: a round then waits for at most one tower block, not a whole picture (3-4 s). A
+  picture takes a little longer to encode while others answer; with nothing answering the tower runs free.
+- `IMAGE_ROWS_CACHE_MIB=64` keeps the tower's output for recent pictures in rank 0's RAM (about 10.5 MiB a
+  full-size picture), so a turn that repeats a picture does not run the tower for it again.
+- `IMAGE_ROWS_BUDGET_MIB=1280` bounds the tower output that rank 0's encoder holds for requests: an encode that would
+  pass it waits, holding no memory, until earlier requests' rows are freed (one request alone, or one a prompt pass
+  waits for, always runs). It bounds host memory when several screenshot-heavy requests arrive at once.
+- `IMAGE_MEMO=65536` makes the server remember each picture's preparation by its bytes, and prepare a picture's
+  payload only when the tower encodes it, which saves time and host memory on long screenshot histories.

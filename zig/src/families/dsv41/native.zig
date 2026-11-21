@@ -224,6 +224,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []
     // sf-disk: this rank's tier, reconciled with rank 1's before the server takes a request (off: nothing changes)
     try st.lanes.attachDisk();
     if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
+    // TF_DS_FILL_IMAGES=1 (rank 0): prompt passes with images read in slices like text ones (empty, 0: whole)
+    st.lanes.fill_images = try fillImagesOf(getenv("TF_DS_FILL_IMAGES"));
     // structured output: each token's bytes, for the draws that keep a reply inside its grammar (rank 0 draws)
     st.vocab = lanes.grammar.vocab.load(gpa, io, dir) catch |e| blk: {
         std.log.warn("structured output off: {s}/tokenizer.json is not a byte-level BPE vocabulary this engine reads ({s})", .{ dir, @errorName(e) });
@@ -246,6 +248,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []
     if (gpu.features.vision and gpu.backend == .hip) if (st.vision) |v| {
         const enc = try gpa.create(encoder_mod.Encoder);
         enc.* = .init(gpa, io, v.encoderTower(), st.m.image_rows);
+        enc.options = .{
+            .rows_cache_bytes = mibBytes(getenv("TF_DS_IMAGE_ROWS_CACHE_MIB")) catch return error.BadImageRowsCache,
+            .rows_budget_bytes = mibBytes(getenv("TF_DS_IMAGE_ROWS_BUDGET_MIB")) catch return error.BadImageRowsBudget,
+        };
         enc.start() catch |err| {
             gpa.destroy(enc);
             return err;
@@ -263,6 +269,32 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []
     const L = lanes_mod.Lanes;
     const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .resumes = L.snapResumesFn, .live = L.snapLiveFn, .tail = @intCast(st.m.cfg.window) };
     return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .cache_images = true, .vision = hook, .structures = st.vocab != null, .context_window = lanes_mod.usableContext(st.m.context_cap, st.m.eng.round_rows) };
+}
+
+/// TF_DS_FILL_IMAGES: unset, empty or "0" off, "1" on.
+fn fillImagesOf(v: ?[]const u8) error{BadFillImages}!bool {
+    const t = v orelse return false;
+    if (t.len == 0 or std.mem.eql(u8, t, "0")) return false;
+    if (std.mem.eql(u8, t, "1")) return true;
+    return error.BadFillImages;
+}
+
+/// A MiB setting in bytes (TF_DS_IMAGE_ROWS_CACHE_MIB, TF_DS_IMAGE_ROWS_BUDGET_MIB; unset, empty or 0: 0, off).
+fn mibBytes(v: ?[]const u8) error{BadMib}!usize {
+    const t = v orelse return 0;
+    if (t.len == 0) return 0;
+    const mib = std.fmt.parseInt(usize, t, 10) catch return error.BadMib;
+    return std.math.mul(usize, mib, 1 << 20) catch error.BadMib;
+}
+
+test "TF_DS_FILL_IMAGES and the image rows MiB settings: unset, empty and 0 are off" {
+    for ([_]?[]const u8{ null, "", "0" }) |v| try std.testing.expect(!try fillImagesOf(v));
+    try std.testing.expect(try fillImagesOf("1"));
+    for ([_][]const u8{ "2", "on", " 1", "01" }) |v| try std.testing.expectError(error.BadFillImages, fillImagesOf(v));
+    for ([_]?[]const u8{ null, "", "0" }) |v| try std.testing.expectEqual(@as(usize, 0), try mibBytes(v));
+    try std.testing.expectEqual(@as(usize, 64 << 20), try mibBytes("64"));
+    try std.testing.expectEqual(@as(usize, 1280 << 20), try mibBytes("1280"));
+    for ([_][]const u8{ "-1", "x", "1e3", "99999999999999999999" }) |v| try std.testing.expectError(error.BadMib, mibBytes(v));
 }
 
 fn stopEncoder(gpa: std.mem.Allocator, enc: *encoder_mod.Encoder) void {
@@ -293,6 +325,9 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.NoKit => "set TF_DS_KIT to the kernel kit (cubins/, the RoPE tables, engram.json)",
         error.NoFreeSlot => "this engine serves TF_DS_STREAMS streams at once (default 4): --parallel at most that",
         error.BadRoundRows => "TF_DS_ROUND_ROWS: a round's rows at most, 16 .. 48",
+        error.BadFillImages => "TF_DS_FILL_IMAGES: 0 (prompt passes with images read whole) or 1 (in slices, as TF_FILL_SLICE_MS)",
+        error.BadImageRowsCache => "TF_DS_IMAGE_ROWS_CACHE_MIB: the encoded pictures' rows kept on rank 0, in MiB (empty or 0: none)",
+        error.BadImageRowsBudget => "TF_DS_IMAGE_ROWS_BUDGET_MIB: the rows rank 0's encoder jobs may hold together, in MiB (empty or 0: no budget)",
         error.BadRoundMs => "TF_DS_ROUND_MS: a round's cost in ms by its rows from 1, comma separated, each finite and above 0 (at most 48)",
         error.BadDraftMs => "TF_DS_DRAFT_MS: a drafter pass's cost in ms, finite and not negative",
         error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 16",

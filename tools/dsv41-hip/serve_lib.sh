@@ -79,6 +79,16 @@ serve_load() {
   [[ $FILL_CUT_IN =~ ^[0-9]{1,7}$ ]] || die "FILL_CUT_IN must be a whole number of prompt tokens up to 9999999 (0: no cut-ins)"
   FILL_CUT_IN=$((10#$FILL_CUT_IN)) FILL_SLICE_MS=$((10#$FILL_SLICE_MS))
   [ "$FILL_CUT_IN" = 0 ] || [ "$FILL_SLICE_MS" != 0 ] || die "FILL_CUT_IN needs FILL_SLICE_MS above 0: a request cuts in between a prompt's slices"
+  # the image keys (rank 0; unset, empty or 0: off, the engine and server as before; none enters the plan text)
+  IMAGE_ROWS_CACHE_MIB=${IMAGE_ROWS_CACHE_MIB:-0} IMAGE_MEMO=${IMAGE_MEMO:-0} FILL_IMAGES=${FILL_IMAGES:-0} TOWER_SLICE_MS=${TOWER_SLICE_MS:-0}
+  IMAGE_ROWS_BUDGET_MIB=${IMAGE_ROWS_BUDGET_MIB:-0}
+  [[ $IMAGE_ROWS_CACHE_MIB =~ ^[0-9]{1,6}$ ]] || die "IMAGE_ROWS_CACHE_MIB must be a whole number of MiB up to 999999 (empty or 0: no rows cache), not $IMAGE_ROWS_CACHE_MIB"
+  [[ $IMAGE_ROWS_BUDGET_MIB =~ ^[0-9]{1,6}$ ]] || die "IMAGE_ROWS_BUDGET_MIB must be a whole number of MiB up to 999999 (empty or 0: no budget), not $IMAGE_ROWS_BUDGET_MIB"
+  [[ $IMAGE_MEMO =~ ^[0-9]{1,7}$ ]] || die "IMAGE_MEMO must be a whole number of pictures up to 9999999 (empty or 0: no memo), not $IMAGE_MEMO"
+  [[ $TOWER_SLICE_MS =~ ^[0-9]{1,6}$ ]] || die "TOWER_SLICE_MS must be a whole number of ms up to 999999 (empty or 0: the tower runs free), not $TOWER_SLICE_MS"
+  case $FILL_IMAGES in 0|1) ;; *) die "FILL_IMAGES must be 0 or 1 (empty: 0), not $FILL_IMAGES";; esac
+  IMAGE_ROWS_CACHE_MIB=$((10#$IMAGE_ROWS_CACHE_MIB)) IMAGE_ROWS_BUDGET_MIB=$((10#$IMAGE_ROWS_BUDGET_MIB)) IMAGE_MEMO=$((10#$IMAGE_MEMO)) TOWER_SLICE_MS=$((10#$TOWER_SLICE_MS))
+  [ "$FILL_IMAGES" = 0 ] || [ "$FILL_SLICE_MS" != 0 ] || die "FILL_IMAGES=1 needs FILL_SLICE_MS above 0: an image prompt reads in those slices"
   # the switch acts only on drafted TP2 shared rounds that can hold that many streams; elsewhere it is off
   if [ "$DRAFTS" != 1 ] || [ "$WORLD" != 2 ] || [ "$DRAFT_BYPASS_AT" -gt "$STREAMS" ]; then DRAFT_BYPASS_AT=0; fi
   for v in REPLAY_FLOOR HC_SIDE HC_INLINE ENGRAM_AIO SEED_RANDOM L2_PREFETCH LOOP_GUARD SCHEMA_PROMPT; do case ${!v} in 0|1) ;; *) die "$v must be 0 or 1, not ${!v}";; esac; done
@@ -211,6 +221,11 @@ serve_env() {
   [ "$RANK" = 0 ] && SERVE_ENV+=(TF_DS_DRAFT_BYPASS_AT="$DRAFT_BYPASS_AT")
   [ "$RANK" = 0 ] && SERVE_ENV+=(TF_FILL_SLICE_MS="$FILL_SLICE_MS")
   [ "$RANK" = 0 ] && [ "$FILL_CUT_IN" != 0 ] && SERVE_ENV+=(TF_FILL_CUT_IN="$FILL_CUT_IN")
+  # the image keys, rank 0 only and only when on (rank 1's behaviour does not depend on them; --vision-image-memo: serve_cmd)
+  [ "$RANK" = 0 ] && [ "$FILL_IMAGES" != 0 ] && SERVE_ENV+=(TF_DS_FILL_IMAGES="$FILL_IMAGES")
+  [ "$RANK" = 0 ] && [ "$IMAGE_ROWS_CACHE_MIB" != 0 ] && SERVE_ENV+=(TF_DS_IMAGE_ROWS_CACHE_MIB="$IMAGE_ROWS_CACHE_MIB")
+  [ "$RANK" = 0 ] && [ "$IMAGE_ROWS_BUDGET_MIB" != 0 ] && SERVE_ENV+=(TF_DS_IMAGE_ROWS_BUDGET_MIB="$IMAGE_ROWS_BUDGET_MIB")
+  [ "$RANK" = 0 ] && [ "$TOWER_SLICE_MS" != 0 ] && SERVE_ENV+=(TF_DS_TOWER_SLICE_MS="$TOWER_SLICE_MS")
   [ -n "${TRACE_ROUNDS:-}" ] && [ "$RANK" = 0 ] && SERVE_ENV+=(TF_DS_TRACE_ROUNDS="$TRACE_ROUNDS")
   [ -n "${ROUND_LOGITS_SHA:-}" ] && [ "$RANK" = 0 ] && SERVE_ENV+=(TF_DS_ROUND_LOGITS_SHA="$ROUND_LOGITS_SHA")
   [ -n "${GRAPHS_EAGER:-}" ] && SERVE_ENV+=(TF_DS_GRAPHS_EAGER="$GRAPHS_EAGER")
@@ -287,6 +302,8 @@ serve_cmd() {
     [ "$DRAFTS" = 1 ] || SERVE_CMD+=(--no-drafts)
     # (empty: the flag is left out, the server's default)
     [ -z "$MAX_IMAGES" ] || SERVE_CMD+=(--vision-max-images "$MAX_IMAGES")
+    # (0: the flag is left out, the argv of a build without it)
+    [ "$IMAGE_MEMO" = 0 ] || SERVE_CMD+=(--vision-image-memo "$IMAGE_MEMO")
   else
     serve_lanes_cmd
     [ -n "${LOGITS_SHA:-}" ] && SERVE_CMD+=(--logits-sha "$LOGITS_SHA")

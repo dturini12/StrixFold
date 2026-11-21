@@ -28,11 +28,18 @@ const Job = struct {
     wake: Wake,
 };
 
+/// Settings the engine reads at start (native.zig); the defaults are the encoder without them.
+pub const Options = struct {
+    rows_cache_bytes: usize = 0, // TF_DS_IMAGE_ROWS_CACHE_MIB: encoded rows kept by picture digest (0: none)
+    rows_budget_bytes: usize = 0, // TF_DS_IMAGE_ROWS_BUDGET_MIB: rows the jobs hold together, allocation to free (0: none)
+};
+
 pub const Encoder = struct {
     gpa: Allocator,
     io: std.Io,
     tower: Tower,
     cap: usize, // a request's image rows at most (Model.image_rows): more fail at once, nothing encoded
+    options: Options = .{},
     mutex: std.Io.Mutex = .init,
     cond: std.Io.Condition = .init,
     done: std.Io.Condition = .init, // a job finished (a prompt pass waits in take)
