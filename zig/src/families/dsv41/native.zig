@@ -174,6 +174,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const gpu.Context, dir: []
     if (getenv("TF_DS_LOGITS_SHA")) |v| lanes_mod.logits_sha = !std.mem.eql(u8, v, "0");
     // each verify window's position, ids and drawn tokens on stderr (rank 0; comparing two runs' schedules)
     if (getenv("TF_DS_TRACE_ROUNDS")) |v| lanes_mod.trace_rounds = std.fmt.parseInt(u8, v, 10) catch return error.BadSetting;
+    // each verify window's rows' full-logits sha256 on stderr (rank 0; decode identity of two runs; not in the plan)
+    if (getenv("TF_DS_ROUND_LOGITS_SHA")) |v| lanes_mod.round_sha = !std.mem.eql(u8, v, "0");
     // the scheduler's cost profile, measured on this backend (the model keeps its own copy)
     const round_costs = if (getenv("TF_DS_ROUND_MS")) |v| lanes_mod.parseMs(gpa, v) catch return error.BadRoundMs else null;
     defer if (round_costs) |v| gpa.free(v);

@@ -84,6 +84,35 @@ test "the usable context is the largest request whose extent fits the pool" {
 /// (the round's logits fetched to the host: a diagnostic, slower).
 pub var trace_rounds: u8 = 0;
 
+/// TF_DS_ROUND_LOGITS_SHA (rank 0): a line a verify window, each row's sha256 of its full fp32 logits (roundShaLine).
+pub var round_sha = false;
+
+/// The logits a verify round holds on the host for the trace and the digests: none, a greedy round's, the sampled ones.
+const Traced = enum { none, fetch, sampled };
+
+/// A round's Traced: with neither trace_rounds >= 2 nor round_sha nothing beyond what the draws read (as before).
+fn tracedSource(greedy: bool) Traced {
+    if (trace_rounds < 2 and !round_sha) return .none;
+    return if (greedy) .fetch else .sampled;
+}
+
+/// The longest round_sha line: its keys, then one quoted 64-hex digest a row of a window.
+const round_sha_line_max = 160 + window_rows * 68;
+
+/// round_sha's line for the window of rows row0 .. row0 + n of a round's logits (V fp32 a row), without a newline.
+fn roundShaLine(buf: []u8, seq: u64, nround: u64, at: u64, traced: []const f32, row0: usize, n: usize, V: usize) ![]u8 {
+    const rows = traced[row0 * V ..][0 .. n * V];
+    var w: std.Io.Writer = .fixed(buf);
+    try w.print("{{\"round_logits\": {d}, \"round\": {d}, \"at\": {d}, \"rows\": {d}, \"sha256\": [", .{ seq, nround, at, n });
+    for (0..n) |r| {
+        var dg: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(rows[r * V ..][0..V]), &dg, .{});
+        try w.print("{s}\"{s}\"", .{ if (r == 0) "" else ", ", &std.fmt.bytesToHex(dg, .lower) });
+    }
+    try w.writeAll("]}");
+    return w.buffered();
+}
+
 /// A row's two best tokens and their logits (the first wins ties, as the device argmax).
 fn topTwo(row: []const f32) [2]struct { u32, f32 } {
     var best: [2]struct { u32, f32 } = .{ .{ 0, -std.math.inf(f32) }, .{ 0, -std.math.inf(f32) } };
@@ -350,6 +379,75 @@ test "topTwo: the two largest logits, in order" {
     try std.testing.expectEqual([2]u32{ 1, 2 }, ids(topTwo(&.{ 1.0, 4.0, 2.0 })));
 }
 
+test "round_sha off: no logits beyond the draws' (greedy rounds download none); on: a greedy round's, or the sampled" {
+    defer {
+        trace_rounds = 0;
+        round_sha = false;
+    }
+    for ([_]u8{ 0, 1 }) |tr| {
+        trace_rounds = tr;
+        round_sha = false;
+        try std.testing.expectEqual(Traced.none, tracedSource(true));
+        try std.testing.expectEqual(Traced.none, tracedSource(false));
+        round_sha = true;
+        try std.testing.expectEqual(Traced.fetch, tracedSource(true));
+        try std.testing.expectEqual(Traced.sampled, tracedSource(false));
+    }
+    // TRACE_ROUNDS=2 as before, with the digests or without
+    trace_rounds = 2;
+    for ([_]bool{ false, true }) |on| {
+        round_sha = on;
+        try std.testing.expectEqual(Traced.fetch, tracedSource(true));
+        try std.testing.expectEqual(Traced.sampled, tracedSource(false));
+    }
+}
+
+test "round_sha's line: its keys, then one digest a window row, each the sha256 of the row's fp32 bytes" {
+    const a = std.testing.allocator;
+    const V = 129280; // the served vocabulary: a row is 517,120 bytes
+    // a round of two windows, as verify holds them: rows 0-1 (a greedy window's download) and 2-7 (a sampled window)
+    const traced = try a.alloc(f32, 8 * V);
+    defer a.free(traced);
+    var rng = std.Random.DefaultPrng.init(41);
+    for (traced) |*x| x.* = rng.random().floatNorm(f32) * 8;
+    traced[3 * V + 5] = -0.0; // row 3 differs from row 4 only by the sign of a zero: the digests tell them apart
+    @memcpy(traced[4 * V ..][0..V], traced[3 * V ..][0..V]);
+    traced[4 * V + 5] = 0.0;
+    const Line = struct { round_logits: u64, round: u64, at: u64, rows: usize, sha256: []const []const u8 };
+    const cases = [_]struct { seq: u64, round: u64, at: u64, row0: usize, n: usize }{
+        .{ .seq = 0, .round = 0, .at = 27001, .row0 = 0, .n = 2 },
+        .{ .seq = 3, .round = 17, .at = 312455, .row0 = 2, .n = window_rows },
+    };
+    for (cases) |c| {
+        var buf: [round_sha_line_max]u8 = undefined;
+        const line = try roundShaLine(&buf, c.seq, c.round, c.at, traced, c.row0, c.n, V);
+        try std.testing.expect(std.mem.startsWith(u8, line, "{\"round_logits\": "));
+        try std.testing.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
+        const p = try std.json.parseFromSlice(Line, a, line, .{});
+        defer p.deinit();
+        try std.testing.expectEqual(c.seq, p.value.round_logits);
+        try std.testing.expectEqual(c.round, p.value.round);
+        try std.testing.expectEqual(c.at, p.value.at);
+        try std.testing.expectEqual(c.n, p.value.rows);
+        try std.testing.expectEqual(c.n, p.value.sha256.len);
+        for (p.value.sha256, 0..) |hex, r| {
+            var dg: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(traced[(c.row0 + r) * V ..][0..V]), &dg, .{});
+            try std.testing.expectEqualStrings(&std.fmt.bytesToHex(dg, .lower), hex);
+        }
+        if (c.row0 == 2) try std.testing.expect(!std.mem.eql(u8, p.value.sha256[1], p.value.sha256[2])); // -0 vs +0
+    }
+    // the exact form cmp_rounds.py reads, on a tiny round (V 2: two rows of [1.0, -2.5])
+    const tiny = [_]f32{ 1.0, -2.5, 1.0, -2.5 };
+    var dg: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(tiny[0..2]), &dg, .{});
+    const hex = std.fmt.bytesToHex(dg, .lower);
+    var want: [256]u8 = undefined;
+    const expect = try std.fmt.bufPrint(&want, "{{\"round_logits\": 2, \"round\": 5, \"at\": 100, \"rows\": 2, \"sha256\": [\"{s}\", \"{s}\"]}}", .{ &hex, &hex });
+    var buf: [round_sha_line_max]u8 = undefined;
+    try std.testing.expectEqualStrings(expect, try roundShaLine(&buf, 2, 5, 100, &tiny, 0, 2, 2));
+}
+
 /// `draw` among the tokens the stream's grammar allows here (a free draw where it constrains nothing): greedy takes
 /// the best allowed token, sampling the served sampler over the best top_k allowed ones.
 pub fn drawAllowed(c: *grammar.Constraint, row: []const f32, position: u64, s: ?lanes.Sampling) !u32 {
@@ -410,6 +508,8 @@ const Lane = struct {
     grammar_rows: u64 = 0, // rows drawn under it, and the host time those draws took (ns)
     grammar_ns: u64 = 0,
     tel: Telemetry = .{},
+    seq: u64 = 0, // round_sha's key: the request's number (Lanes.next_seq when its prompt logits were read)
+    round: u64 = 0, // and its verify windows so far
 };
 
 /// A request's rounds as the reply's telemetry (engine_api Stats.telemetry_json, the reply's speculative.proposer):
@@ -566,6 +666,7 @@ pub const Lanes = struct {
     next: u64 = 0,
     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, least recently used first (made, or last resumed)
     next_snap: u64 = 1,
+    next_seq: u64 = 0, // the requests whose prompt logits were read (round_sha's keys)
     /// The tokenizer's bytes for structured output (native.zig loads it); null: requests with a structure refused.
     vocab: ?*const grammar.Vocab = null,
     /// sf-disk's tier on this rank (attachDisk; null: off).
@@ -937,6 +1038,9 @@ pub const Lanes = struct {
             if (logits_dump) |dir| try dumpLogits(m.io, dir, s.id, len, m.cfg.vocab, logits, &hex);
         }
         const l = self.streams.getPtr(s).?;
+        l.seq = self.next_seq;
+        self.next_seq += 1;
+        l.round = 0;
         const token = if (l.grammar) |c| blk: {
             const g0 = m.now();
             defer {
@@ -1039,7 +1143,11 @@ pub const Lanes = struct {
         }
         const tokens: []const u32 = if (greedy) try m.roundArgmax(rows.ids.len) else &.{};
         const logits: []const f32 = if (greedy) &.{} else try m.roundLogits(rows.ids.len);
-        const traced: []const f32 = if (trace_rounds >= 2) (if (greedy) try m.roundLogits(rows.ids.len) else logits) else &.{};
+        const traced: []const f32 = switch (tracedSource(greedy)) {
+            .none => &.{},
+            .fetch => try m.roundLogits(rows.ids.len),
+            .sampled => logits,
+        };
         const t3 = m.now();
         defer if (self.prof) |*p| {
             p.send += t1 - t0;
@@ -1073,6 +1181,11 @@ pub const Lanes = struct {
                 }
                 std.debug.print("]}}\n", .{});
             } else if (trace_rounds == 1) std.debug.print("{{\"verify\": {d}, \"rows\": {d}, \"ids\": {any}, \"drawn\": {any}}}\n", .{ w.stream.cache_len, w.rows(), ids[k][0..w.rows()], o.sampled[0..w.rows()] });
+            if (round_sha) {
+                var lb: [round_sha_line_max]u8 = undefined;
+                std.debug.print("{s}\n", .{try roundShaLine(&lb, l.seq, l.round, w.stream.cache_len, traced, row0, w.rows(), V)});
+            }
+            l.round += 1;
         }
     }
 
