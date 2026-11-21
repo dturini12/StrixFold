@@ -699,7 +699,7 @@ pub const Model = struct {
         strict: bool,
         disk: bool, // sf-disk: " disk=1" at the end, only when on (the text is the stock one when off)
         edit: []const u8 = "", // TF_DS_EDIT's file by its hash: " edit=<16 hex>" at the end, only when set
-        image_rows: usize = image_rows_default, // " image_tokens=N" last, only when not the default
+        image_rows: usize = image_rows_default, // " image_tokens=N" after edit=, only when not the default
         hc_inline: bool = false, // TF_DS_HC_INLINE (tri_hc.inline_mix): " hc_inline=1" last, only when on
     };
 
@@ -709,12 +709,13 @@ pub const Model = struct {
         const ctx = if (p.context != 0 and p.context != p.pool) try std.fmt.bufPrint(&cb, " context={d}", .{p.context}) else "";
         var ib: [32]u8 = undefined;
         const img = if (p.image_rows != image_rows_default) try std.fmt.bufPrint(&ib, " image_tokens={d}", .{p.image_rows}) else "";
+        var tb: [64]u8 = undefined;
+        const tail = try std.fmt.bufPrint(&tb, "{s}{s}", .{ img, if (p.hc_inline) " hc_inline=1" else "" });
         return std.fmt.bufPrint(buf, "drafts={} engram={} graphs={} pool={d}{s} streams={d} round_rows={d} chunk_rows={d} replay_floor={} aux={s} {s} engram_rows={} deploy={s} bundle={s} conf={s} kv={s} strict={}{s}{s}{s}{s}", .{
             p.drafts,       p.engram, p.graphs,  p.pool,  ctx, p.streams,  p.round_rows, chunk_rows,
             p.replay_floor, p.aux,    p.gather,  p.engram_rows, p.deploy, p.bundle, p.conf,
             kv_format,      p.strict, if (p.disk) " disk=1" else "", if (p.edit.len > 0) " edit=" else "", p.edit,
-            img,
-            if (p.hc_inline) " hc_inline=1" else "",
+            tail,
         });
     }
 
