@@ -216,3 +216,34 @@ test "memo on: a full memo is cleared before the next new picture, and what it h
     try std.testing.expectEqual(@as(usize, 4), fake.prepares);
     try std.testing.expectEqualStrings("one", got.images[0].source);
 }
+
+fn expectTally(got: prompt.Rendered, hits: u32, misses: u32, entries: usize) !void {
+    const t = got.memo.?;
+    try std.testing.expectEqual(hits, t.hits);
+    try std.testing.expectEqual(misses, t.misses);
+    try std.testing.expectEqual(entries, t.entries);
+    try std.testing.expectEqual(@as(u32, @intCast(got.images.len)), t.pictures());
+}
+
+test "memo on: each request's log line counts its pictures as hits and misses, and the entries after it; memo off: no tally" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cx: errors.Cx = .{ .a = a };
+    var plain: Fake = .{};
+    var off = try Rigged.start(a, &plain, 0);
+    defer off.stop();
+    try std.testing.expect((try ask(&off, a, &cx, &.{ "one", "one" })).memo == null);
+
+    var fake: Fake = .{};
+    var r = try Rigged.start(a, &fake, 3);
+    defer r.stop();
+    // "one" twice in one request: the second is a hit
+    try expectTally(try ask(&r, a, &cx, &.{ "one", "two", "one" }), 1, 2, 2);
+    try expectTally(try ask(&r, a, &cx, &.{ "one", "two", "one" }), 3, 0, 2);
+    try expectTally(try ask(&r, a, &cx, &.{ "three", "one" }), 1, 1, 3);
+    // full: "four" clears the memo, then "one" is new again
+    try expectTally(try ask(&r, a, &cx, &.{ "four", "one", "two" }), 0, 3, 3);
+    try std.testing.expectEqual(@as(u64, 1), r.srv.memo.?.clears);
+    try std.testing.expectEqual(@as(usize, 2 + 1 + 3), fake.prepares);
+}

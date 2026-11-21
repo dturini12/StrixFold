@@ -11,7 +11,7 @@ const image_memo = @import("image_memo.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 
-pub const Rendered = struct { ids: []const u32, history_len: usize = 0, images: []const api.Image = &.{} };
+pub const Rendered = struct { ids: []const u32, history_len: usize = 0, images: []const api.Image = &.{}, memo: ?image_memo.Tally = null };
 
 pub const isTitle = messages_mod.isTitleRequest;
 
@@ -146,8 +146,22 @@ fn imageIdentities(cx: *Cx, messages: Value, placeholder: []const u8, count: usi
 }
 
 /// Each image placeholder of the rendered prompt as its image's span (the vision family's prepare: the span's length and
-/// the payload the engine reads), the images in prompt order.
+/// the payload the engine reads), the images in prompt order. Memo on: one log line of its lookups, refused or not.
 fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8) errors.Refused!Rendered {
+    var tally: image_memo.Tally = .{};
+    const memo = srv.memo orelse return placeSpans(srv, cx, ids, images, &tally); // memo off: the tally is never read
+    const placed = placeSpans(srv, cx, ids, images, &tally);
+    if (images.len > 0) {
+        tally.entries = memo.count(srv.io);
+        tally.log();
+    }
+    var r = try placed;
+    r.memo = tally;
+    return r;
+}
+
+/// `spans` without the log line; each memo lookup counted in `tally`.
+fn placeSpans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8, tally: *image_memo.Tally) errors.Refused!Rendered {
     const vision = srv.info.vision orelse return cx.refuse("this server accepts text only; image, audio and video inputs are unsupported");
     var out: std.ArrayList(u32) = .empty;
     var placed: std.ArrayList(api.Image) = .empty;
@@ -171,7 +185,7 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8) er
         if (k >= images.len or used[k]) return cx.refuse("image input: unknown or repeated image identity");
         used[k] = true;
         cursor = end + 1;
-        const pic = if (srv.memo) |memo| try memoized(srv.io, srv.gpa, memo, vision, cx, images[k]) else try prepared(vision, cx, images[k]);
+        const pic = if (srv.memo) |memo| try memoized(srv.io, srv.gpa, memo, vision, cx, images[k], tally) else try prepared(vision, cx, images[k]);
         try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = pic.tokens, .bytes = pic.bytes, .source = pic.source, .digest = pic.digest });
         try out.appendNTimes(cx.a, vision.token, pic.tokens);
         // the limits refuse at the picture that crosses them, before any later one is decoded
@@ -200,9 +214,11 @@ fn prepared(vision: api.Vision, cx: *Cx, source: []const u8) errors.Refused!Pict
 }
 
 /// By the memo: a new picture is prepared into a scratch freed here, a known one not at all; the span holds the source.
-fn memoized(io: std.Io, gpa: std.mem.Allocator, memo: *image_memo.Memo, vision: api.Vision, cx: *Cx, source: []const u8) errors.Refused!Picture {
+fn memoized(io: std.Io, gpa: std.mem.Allocator, memo: *image_memo.Memo, vision: api.Vision, cx: *Cx, source: []const u8, tally: *image_memo.Tally) errors.Refused!Picture {
     const k = image_memo.Memo.key(source);
-    const e = memo.get(io, k) orelse fresh: {
+    const known = memo.get(io, k);
+    if (known != null) tally.hits += 1 else tally.misses += 1; // a refused picture is a miss
+    const e = known orelse fresh: {
         var scratch: std.heap.ArenaAllocator = .init(gpa);
         defer scratch.deinit();
         var problem: []const u8 = "";
