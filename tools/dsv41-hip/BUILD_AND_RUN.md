@@ -54,7 +54,7 @@ tools/dsv41-hip/verify_inputs.sh  ~/models/tf-port/inputs-tp2-c178a012 1 ~/model
 ```
 `prepare_inputs.sh` authenticates every checkpoint and Engram file against the pinned Hugging Face metadata, writes the
 token map, the Engram constants (`kit/engram.json`), the RoPE tables (`kit/rope-*.f32`, 65,536 rows by default: they set
-the longest context the engine can serve), both rank caches and the chat template (c282975e), byte-checks each cache in
+the longest context the engine can serve), both rank caches and the chat template (865cb39b), byte-checks each cache in
 full (`tf-dsv41-check --bytes 1`) and hashes everything into `inputs_manifest.json`. The manifest records local paths
 and the Python version, so its SHA-256 differs from one setup to another: ours is the 243b984d... that the shipped
 `serve.conf` pins, and yours goes into your configuration's `BUNDLE_SHA256` (see
