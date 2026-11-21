@@ -12,6 +12,9 @@ pub const RenderOptions = struct {
     reasoning_effort: ?[]const u8 = null,
     /// The family's number for that effort (Info.efforts): the template hears the number instead of the name.
     reasoning_effort_value: ?i64 = null,
+    /// A JSON schema the template shows as the reply's format (DeepSeek-V4.1's ``## Response Format``), or null: the
+    /// template hears no ``response_format`` at all.
+    response_format: ?json.Value = null,
 };
 
 pub const Error = error{ Template, OutOfMemory };
