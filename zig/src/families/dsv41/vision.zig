@@ -103,17 +103,30 @@ pub const Vision = struct {
                 const x: *Vision = @ptrCast(@alignCast(ctx));
                 try x.m.ctx.makeCurrent();
             }
-            fn rows(ctx: *anyopaque, payload: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) anyerror!usize {
+            fn rows(ctx: *anyopaque, payload: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(u8), pace: encoder.Pace) anyerror!usize {
                 const x: *Vision = @ptrCast(@alignCast(ctx));
-                return x.rows(payload, gpa, out);
+                return x.rowsPaced(payload, gpa, out, pace);
+            }
+            fn prepare(ctx: *anyopaque, gpa: std.mem.Allocator, source: []const u8) anyerror![]align(16) u8 {
+                const x: *Vision = @ptrCast(@alignCast(ctx));
+                return x.payloadOf(gpa, source);
             }
         };
-        return .{ .ctx = v, .bind = T.bind, .rows = T.rows, .row_bytes = v.m.cfg.hidden * 2 };
+        return .{ .ctx = v, .bind = T.bind, .rows = T.rows, .row_bytes = v.m.cfg.hidden * 2, .prepare = T.prepare };
+    }
+
+    /// A picture's payload from its source on the encoder thread, by the server's function, in `gpa` (refusal: error).
+    pub fn payloadOf(v: *Vision, gpa: std.mem.Allocator, source: []const u8) ![]align(16) u8 {
+        var words = std.heap.ArenaAllocator.init(gpa);
+        defer words.deinit();
+        var problem: []const u8 = "";
+        const prep = try preparedIn(v.pil, v.cfg, gpa, words.allocator(), source, &problem);
+        return @alignCast(@constCast(prep.payload));
     }
 
     /// The server's view: the placeholder the template renders for each image and the picture it prepares.
     pub fn hook(v: *Vision) lanes.stream.Vision {
-        return .{ .ctx = v, .placeholder = placeholder, .token = v.m.cfg.image_token.?, .prepare = prepareFn, .max_pixels = picture.max_pixels };
+        return .{ .ctx = v, .placeholder = placeholder, .token = v.m.cfg.image_token.?, .prepare = prepareFn, .max_pixels = picture.max_pixels, .source_prepare = hip };
     }
 
     pub const placeholder = "<\u{ff5c}deepseek_image\u{ff5c}>";
@@ -126,6 +139,11 @@ pub const Vision = struct {
     /// A prepared picture's span rows bf16 [tokens, 5120] appended to `out` (the tower on its stream, then the rows to
     /// the host); its span's tokens.
     pub fn rows(v: *Vision, payload: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !usize {
+        return v.rowsPaced(payload, gpa, out, null);
+    }
+
+    /// `rows` on the encoder thread: after each block, while the gate pauses, stream synchronized and gate asked.
+    pub fn rowsPaced(v: *Vision, payload: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(u8), pace: ?encoder.Pace) !usize {
         if (payload.len < header_bytes) return error.BadImagePayload;
         var x: [6]usize = undefined;
         for (&x, 0..) |*f, i| f.* = std.mem.readInt(u32, payload[i * 4 ..][0..4], .little);
@@ -134,7 +152,19 @@ pub const Vision = struct {
         if (payload.len != header_bytes + n * vit.patch_in * 2 or g.spanTokens() > (if (hip) v.cfg.max_tokens else max_span)) return error.BadImagePayload;
         const body: []align(2) const u8 = @alignCast(payload[header_bytes..]);
         const patches = std.mem.bytesAsSlice(u16, body);
-        const at = try v.tower.encode(g, patches, null);
+        const Paced = struct {
+            v: *Vision,
+            pace: encoder.Pace,
+            fn after(ctx: *anyopaque, what: []const u8, _: usize, _: u64, _: usize) anyerror!void {
+                const pc: *@This() = @ptrCast(@alignCast(ctx));
+                if (!std.mem.eql(u8, what, "block") or !pc.pace.pausing()) return;
+                try pc.v.tower.stream.synchronize();
+                pc.pace.yield();
+            }
+        };
+        var paced: Paced = if (pace) |p| .{ .v = v, .pace = p } else undefined;
+        const probe: ?vit.Probe = if (hip and pace != null) .{ .ctx = &paced, .f = Paced.after } else null;
+        const at = try v.tower.encode(g, patches, probe);
         try v.tower.spanRows(g, at, v.span.ptr, v.scratch.ptr);
         const t = g.spanTokens();
         const bytes = t * vit.model_dim * 2;
@@ -149,11 +179,16 @@ pub const Vision = struct {
 
 /// An image's payload, or on BadImage its refusal, in `a`; its decode, plan and patches in a scratch arena freed here.
 fn prepared(p: ?*pil.Pil, cfg: picture.Config, a: std.mem.Allocator, bytes: []const u8, problem: *[]const u8) lanes.stream.Vision.PrepareError!lanes.stream.Vision.Prepared {
+    return preparedIn(p, cfg, a, a, bytes, problem);
+}
+
+/// `prepared` with the payload in `a` and a refusal's words in `wa`.
+fn preparedIn(p: ?*pil.Pil, cfg: picture.Config, a: std.mem.Allocator, wa: std.mem.Allocator, bytes: []const u8, problem: *[]const u8) lanes.stream.Vision.PrepareError!lanes.stream.Vision.Prepared {
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
     const s = scratch.allocator();
     const rgb = decode(p, s, bytes, problem) catch |err| {
-        if (err == error.BadImage) problem.* = try a.dupe(u8, problem.*);
+        if (err == error.BadImage) problem.* = try wa.dupe(u8, problem.*);
         return err;
     };
     const pic = picture.fromRgb(s, rgb, cfg) catch |err| switch (err) {

@@ -1840,7 +1840,7 @@ fn followView(m: *Model, seqs: *const [max_streams]std.ArrayList(i32), slot: usi
 const AsideSpans = struct {
     spans: std.ArrayList(Span) = .empty,
 
-    /// After followEnd: the fill_begin that sets a paused pass aside keeps its spans; a pass that ended drops them.
+    /// After followPassEnd: the fill_begin that sets a paused pass aside keeps its spans; a pass that ended drops them.
     fn keep(a: *AsideSpans, gpa: std.mem.Allocator, m: *const Model, kind: Kind, was_aside: bool, passes: *const Passes) !void {
         if (!passes.aside) return a.spans.clearRetainingCapacity();
         if (kind != .fill_begin or was_aside) return;
