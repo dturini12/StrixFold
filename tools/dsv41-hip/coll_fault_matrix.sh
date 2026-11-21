@@ -14,6 +14,7 @@ cd "${COLL_DIR:-$(dirname "$0")}"
 BIN=${COLL_CHECK:-./tf-dsv41-coll-check}
 PORT=29800
 export TF_COLL_PROGRESS_MS=2000
+export TF_COLL_GPU_WAIT_S=2  # a peer's arrival limit is this + the progress deadline: 4 s, under the 5 s stall and stop
 pass=0; fail=0
 run_case() {  # name, expect0, expect1, args0, args1, [external action]
   local name=$1 e0=$2 e1=$3 a0=$4 a1=$5 act=${6:-}

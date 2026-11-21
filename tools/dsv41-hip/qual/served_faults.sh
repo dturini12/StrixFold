@@ -3,7 +3,7 @@
 # M3.fault-matrix, M3.handshake, M3.stale-cache-refusal). Each case is its own run under both GPU locks (node0's first,
 # released after the case): both ranks from CONF ('$HOME/...', the same file on both boxes), a fault, and the verdict.
 #   kill_r1_decode / kill_r0_decode     SIGKILL a rank while a streamed reply decodes
-#   stop_r1_decode / stop_r0_decode     SIGSTOP a rank for STOP_S (10 s, past the 2 s progress deadline), then SIGCONT
+#   stop_r1_decode / stop_r0_decode     SIGSTOP a rank for STOP_S (20 s, past the 12 s arrival limit), then SIGCONT
 #   kill_r1_prefill / stop_r1_prefill   the same inside a long prompt's prefill (--long 1: prompts over 128 rows)
 #   kill_r1_load                        SIGKILL rank 1 while both ranks load: rank 0 must give up, not wait forever
 #   mm_round_rows / mm_aux / mm_streams / mm_context / mm_pool / mm_kit / mm_strict / mm_conf (any other conf byte: U46)
@@ -24,8 +24,8 @@ while [ $# -gt 0 ]; do
   case $1 in --cases) CASES=$2; shift 2;; --long) LONG=$2; shift 2;; *) echo "unknown $1" >&2; exit 2;; esac
 done
 export QLOCK_MAX_S=${QLOCK_MAX_S:-900}   # one case: a load, a fault and the teardown
-DEADLINE_S=${DEADLINE_S:-15}   # the progress deadline is 2 s (COLL_PROGRESS_MS); 15 s bounds detection plus teardown
-STOP_S=${STOP_S:-10}
+DEADLINE_S=${DEADLINE_S:-15}   # from the kill or the SIGCONT: 15 s bounds detection plus teardown
+STOP_S=${STOP_S:-20}           # past COLL_GPU_WAIT_S + COLL_PROGRESS_MS (12 s), when a stopped peer is given up
 QDIR=$(cd "$(dirname "$0")" && pwd)
 QOUT_ROOT=$HOME/tfp/qual/out/$BASE
 mkdir -p "$QOUT_ROOT"

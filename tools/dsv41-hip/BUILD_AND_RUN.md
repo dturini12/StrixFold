@@ -152,7 +152,7 @@ That evidence lives on the boxes it was measured on, so on yours the suites abov
 |---|---|
 | `collectives handshake refused: <field>=a vs b` | the two ranks run different settings, kits or plans: one configuration file, one deployment |
 | `no Triton variant of _X in the kit for this launch` (HTTP 500 `MissingTritonVariant`) | the kit lacks that specialization; `GPU_STRICT=0` only helps where a less specialized variant exists |
-| a request ends without a finish reason, rank logs show `PeerLost` / `Timeout` | the other rank died, stalled or lost its link (2 s progress deadline, `COLL_PROGRESS_MS`); restart both ranks |
+| a request ends without a finish reason, rank logs show `PeerLost` / `Timeout` | the other rank died, stalled or lost its link (`COLL_PROGRESS_MS`, 2 s, once its bytes flow; a peer that does not enter a call: `COLL_GPU_WAIT_S` + `COLL_PROGRESS_MS`, 12 s); restart both ranks |
 | `inputs_manifest.json is X, the config pins Y` | the bundle is not the one the configuration names |
 | slow decode | other CPU load on either box (the TP service thread and USB4 interrupts share cores 0-7/16-23); measure inside quiet windows |
 
