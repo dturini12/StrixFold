@@ -341,6 +341,33 @@ test "an image request whose schema holds the image marker as text: the marker s
     try std.testing.expectEqualSlices(u32, s.capture.prompt, try tokenized(&s, a, body));
 }
 
+test "shared_messages: the client's cut carries the system message's block and ends at the next user turn, on and off" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try Case.load(a);
+    try std.testing.expect(c.system.len > 512);
+    for ([_]bool{ true, false }) |on| {
+        var s: Served = undefined;
+        try s.start(a, on, false);
+        defer s.stop();
+        const messages = try arr(a, &.{
+            try obj(a, .{ .{ "role", str("system") }, .{ "content", str(c.system) } }),
+            try obj(a, .{ .{ "role", str("user") }, .{ "content", str(c.user) } }),
+            try obj(a, .{ .{ "role", str("assistant") }, .{ "content", str("{\"ok\": true}") } }),
+            try obj(a, .{ .{ "role", str("user") }, .{ "content", str("And again, please.") } }),
+        });
+        const body = try obj(a, .{ .{ "model", str("m") }, .{ "max_tokens", Value{ .int = "2" } }, .{ "messages", messages }, .{ "response_format", try chatFormat(a, c, false) }, .{ "shared_messages", Value{ .int = "3" } } });
+        _ = try s.post(a, "/v1/chat/completions", body);
+        const text = try s.decoded(a);
+        // byte ids: the first three messages' prefix runs to the last user turn's tag, where the probe turn differs
+        const cut = std.mem.lastIndexOf(u8, text, user_tag).? + user_tag.len;
+        try std.testing.expect(s.capture.shared.len > 0);
+        try std.testing.expectEqual(@as(u32, @intCast(cut)), s.capture.shared[s.capture.shared.len - 1]);
+        try std.testing.expectEqual(on, std.mem.indexOf(u8, text[0..cut], c.block) != null);
+    }
+}
+
 /// `off` with the case's block where its first user turn starts: the end of the first system message.
 fn withBlock(a: std.mem.Allocator, c: Case, off: []const u8) ![]u8 {
     const at = std.mem.indexOf(u8, off, user_tag).?;
