@@ -202,14 +202,15 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         if (input.max_tokens != null and limit > room) return cx.fail(.context_length, "{s} {d} tokens, but the rendered prompt has {d} tokens and requests {d} reply tokens, which exceeds the context window. Reduce the prompt to at most {d} prompt tokens or request at most {d} reply tokens, including chat template and thinking tokens.", .{ errors.context_limit, window, n, limit, @max(0, window - limit), room });
         limit = @min(limit, room);
     }
-    const system_len: usize = if (input.prompt != null) 0 else prompt_mod.systemPrefixLen(srv, &scx, input.messages, input.tools, rendered.ids, thinking, effort);
+    const schema = prompt_mod.schemaOf(srv, scx.a, input.fields.get("response_format")) catch null;
+    const system_len: usize = if (input.prompt != null) 0 else prompt_mod.systemPrefixLen(srv, &scx, input.messages, input.tools, rendered.ids, thinking, effort, schema);
     var shared: std.ArrayList(u32) = .empty;
     if (system_len > 0) for ([_]i64{ @as(i64, @intCast(system_len)) - 2048, @as(i64, @intCast(system_len)) - 512, @intCast(system_len) }) |cut| {
         if (cut >= 512) try shared.append(a, @intCast(cut));
     };
     // the client's own shared prefix (`shared_messages`: k): the end of its first k messages, kept as a shared cut
     if (f.get("shared_messages")) |v| if (v.int64()) |k| if (k > 0 and input.prompt == null) {
-        const cut = prompt_mod.messagesPrefixLen(srv, &scx, input.messages, @intCast(k), input.tools, rendered.ids, thinking, effort);
+        const cut = prompt_mod.messagesPrefixLen(srv, &scx, input.messages, @intCast(k), input.tools, rendered.ids, thinking, effort, schema);
         if (cut > 0) try shared.append(a, @intCast(cut));
     };
     const sampling = try srv.resolveSampling(cx, f, input.temperature, rendered.ids);

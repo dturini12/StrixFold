@@ -38,9 +38,10 @@ fn tokenize(srv: *Server, cx: *Cx, body: Value) errors.Refused!Value {
         };
         const thinking = try fields.thinkingFields(cx, body, srv.effort_levels);
         const on = thinking.enable orelse srv.config.enable_thinking;
+        const schema = try prompt.schemaOf(srv, cx.a, body.get("response_format"));
         ids = (if (images.list.items.len > 0)
-            (try prompt.renderImages(srv, cx, msgs, tools, on, srv.effortFor(thinking.effort), generation, images.list.items)).ids
-        else prompt.renderIds(srv, cx, msgs, tools, on, srv.effortFor(thinking.effort), generation)) catch |e| switch (e) {
+            (try prompt.renderImages(srv, cx, msgs, tools, on, srv.effortFor(thinking.effort), generation, images.list.items, schema)).ids
+        else prompt.renderIds(srv, cx, msgs, tools, on, srv.effortFor(thinking.effort), generation, schema)) catch |e| switch (e) {
             error.Refused => return cx.other(cx.message),
             else => |x| return x,
         };

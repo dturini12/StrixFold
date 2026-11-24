@@ -105,6 +105,13 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         std.debug.print("tensorfold: TENSORFOLD_SSE_KEEPALIVE={s}: whole seconds (0: off)\n", .{t});
         return 1;
     } else 0;
+    const schema_prompt = if (env(s, "TF_DSV41_SCHEMA_PROMPT")) |t| blk: {
+        const v = std.mem.trim(u8, t, " ");
+        if (v.len == 0 or std.mem.eql(u8, v, "0")) break :blk false;
+        if (std.mem.eql(u8, v, "1")) break :blk true;
+        std.debug.print("tensorfold: TF_DSV41_SCHEMA_PROMPT={s}: 0 or 1\n", .{t});
+        return 1;
+    } else false;
     const config: server_mod.Config = .{
         .served_name = s.served,
         .model_ids = ids.items,
@@ -117,6 +124,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .loop_guard = args.loop_guard,
         .keep_warm_s = args.keep_warm,
         .sse_keepalive_ms = std.math.mul(u32, keepalive_s, 1000) catch std.math.maxInt(u32),
+        .dsv41_schema_prompt = schema_prompt,
         .default_sampling = s.sampling,
         .use_drafts = !args.no_drafts,
         .seed_salt = salt,

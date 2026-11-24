@@ -49,6 +49,8 @@ pub const Config = struct {
     keep_warm_s: i64 = 900,
     /// TENSORFOLD_SSE_KEEPALIVE (s): a stream silent this long (a long prefill) sends an SSE comment; 0: never.
     sse_keepalive_ms: u32 = 0,
+    /// TF_DSV41_SCHEMA_PROMPT=1: a request's schema in its prompt as ``## Response Format``; off: the prompt as before.
+    dsv41_schema_prompt: bool = false,
     dashboard: bool = false,
     /// Sampling when a request names none (generation_config.json and the serve flags), or null for greedy.
     default_sampling: ?Value = null,
@@ -283,7 +285,7 @@ pub const Server = struct {
     fn callForm(srv: *Server, cx: *Cx) errors.Refused!?Form {
         const probe = (try json.parse(cx.a, "[{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_0\", \"type\": \"function\", \"function\": {\"name\": \"tfprobe_fn\", \"arguments\": {}}}]}]")).ok;
         var scratch: Cx = .{ .a = cx.a };
-        const text = if (prompt.renderIds(srv, &scratch, probe, &.{}, false, null, false)) |ids| try srv.text.decode(cx.a, ids) else |_| "";
+        const text = if (prompt.renderIds(srv, &scratch, probe, &.{}, false, null, false, null)) |ids| try srv.text.decode(cx.a, ids) else |_| "";
         if (std.mem.lastIndexOf(u8, text, "tfprobe_fn")) |at| {
             var best: ?usize = null;
             var opener: []const u8 = "";

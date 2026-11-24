@@ -169,7 +169,7 @@ fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
         .target = target,
         .optimize = .Debug, // the server's unit tests run with safety checks, as zig_test.sh builds them
         .link_libc = true,
-        .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template } },
+        .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template }, .{ .name = "dsv41_assets", .module = hip_dsv41_build.assetsModule(b) } },
     });
     test_step.?.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests })).step);
     // the parse half's tests, as their own test binary (zig/src/server/tool_parse_test.zig)
