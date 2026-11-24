@@ -56,9 +56,10 @@ fn countTokens(srv: *Server, cx: *Cx, chat: Value) errors.Refused!usize {
     var images: messages_mod.Images = .{ .placeholder = if (srv.info.vision) |v| v.placeholder else "", .max = srv.config.max_images };
     const take: ?*messages_mod.Images = if (srv.info.vision != null) &images else null;
     const msgs = try messages_mod.normalizeImages(cx, chat.get("messages"), "system", srv.needs_user_after_tool, srv.dialect, take);
+    const schema = try prompt.schemaOf(srv, cx.a, chat.get("response_format"));
     const ids_ = (if (images.list.items.len > 0)
-        (try prompt.renderImages(srv, cx, msgs, tools, on, srv.effortFor(thinking.effort), true, images.list.items)).ids
-    else prompt.renderIds(srv, cx, msgs, tools, on, srv.effortFor(thinking.effort), true)) catch |e| switch (e) {
+        (try prompt.renderImages(srv, cx, msgs, tools, on, srv.effortFor(thinking.effort), true, images.list.items, schema)).ids
+    else prompt.renderIds(srv, cx, msgs, tools, on, srv.effortFor(thinking.effort), true, schema)) catch |e| switch (e) {
         error.Refused => return cx.other(cx.message),
         else => |x| return x,
     };
