@@ -56,4 +56,5 @@ test {
     _ = @import("queue_cap.zig");
     _ = @import("queue_cap_test.zig");
     _ = @import("dsv41_schema_prompt_test.zig");
+    _ = @import("dsv41_schema_routes_test.zig");
 }
