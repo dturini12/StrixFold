@@ -69,8 +69,9 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
     if (input.images.len > 0) {
         const vision = srv.info.vision orelse return cx.refuse("image input: this engine has no vision hook");
         const tagged = try imageIdentities(cx, input.messages, vision.placeholder, input.images.len);
-        const raw = try renderNormalizedIds(srv, cx, tagged, input.tools, thinking, effort, true, schema);
-        const raw_history = try renderNormalizedIds(srv, cx, tagged, input.tools, thinking, effort, false, schema);
+        const plain = if (schema) |v| try escapedSchema(cx, v, vision.placeholder) else null;
+        const raw = try renderNormalizedIds(srv, cx, tagged, input.tools, thinking, effort, true, plain);
+        const raw_history = try renderNormalizedIds(srv, cx, tagged, input.tools, thinking, effort, false, plain);
         var r = try spans(srv, cx, raw, input.images);
         r.history_len = expandedAt(raw, historyLen(raw, raw_history), vision.token, r.images);
         return r;
@@ -123,8 +124,27 @@ test "an image prompt's history length moves past the spans before it" {
 pub fn renderImages(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool, images: []const []const u8, schema: ?Value) errors.Refused!Rendered {
     const vision = srv.info.vision orelse return cx.refuse("image input: this engine has no vision hook");
     const tagged = try imageIdentities(cx, messages, vision.placeholder, images.len);
-    const ids = try renderNormalizedIds(srv, cx, tagged, tools, thinking, effort, generation, schema);
+    const plain = if (schema) |v| try escapedSchema(cx, v, vision.placeholder) else null;
+    const ids = try renderNormalizedIds(srv, cx, tagged, tools, thinking, effort, generation, plain);
     return spans(srv, cx, ids, images);
+}
+
+/// `v` with the image placeholder in every string and key as plain text (messages.escape), as a message's own text.
+fn escapedSchema(cx: *Cx, v: Value, ph: []const u8) error{OutOfMemory}!Value {
+    switch (v) {
+        .string => |s| return .{ .string = try messages_mod.escape(cx, s, ph) },
+        .array => |items| {
+            const out = try cx.a.alloc(Value, items.len);
+            for (items, out) |x, *o| o.* = try escapedSchema(cx, x, ph);
+            return .{ .array = out };
+        },
+        .object => |o| {
+            const out = try json.newObject(cx.a);
+            for (o.keys(), o.values()) |k, x| try out.put(cx.a, try messages_mod.escape(cx, k, ph), try escapedSchema(cx, x, ph));
+            return .{ .object = out };
+        },
+        else => return v,
+    }
 }
 
 /// Identity travels inside paired image delimiters until rendering has established the final order.

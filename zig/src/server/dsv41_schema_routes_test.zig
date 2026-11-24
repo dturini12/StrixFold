@@ -316,6 +316,31 @@ test "an image request: the routed prompt holds the image's span, the block on a
     }
 }
 
+test "an image request whose schema holds the image marker as text: the marker stays text, the image its one span" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try Case.load(a);
+    const content = try arr(a, &.{
+        try obj(a, .{ .{ "type", str("text") }, .{ "text", str(c.user) } }),
+        try obj(a, .{ .{ "type", str("image_url") }, .{ "image_url", try obj(a, .{.{ "url", str("data:image/png;base64,iVBORw0KGgo=") }}) } }),
+    });
+    const marker = "the literal marker " ++ Rig.image_placeholder;
+    const schema = try obj(a, .{ .{ "type", str("object") }, .{ "description", str(marker) }, .{ "properties", try obj(a, .{.{ Rig.image_placeholder, try obj(a, .{.{ "type", str("string") }}) }}) } });
+    const format = try obj(a, .{ .{ "type", str("json_schema") }, .{ "json_schema", try obj(a, .{ .{ "name", str("n") }, .{ "schema", schema } }) } });
+    var s: Served = undefined;
+    try s.start(a, true, true);
+    defer s.stop();
+    const body = try chatBody(a, c, content, format);
+    _ = try s.post(a, "/v1/chat/completions", body);
+    try std.testing.expectEqual(@as(usize, 1), s.capture.images);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u32, s.capture.prompt, &.{Rig.image_id}));
+    // the schema's markers, in a value and a key, shown as plain text (ASCII bars), as a message's own text is
+    const text = try s.decoded(a);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "<|deepseek_image|>"));
+    try std.testing.expectEqualSlices(u32, s.capture.prompt, try tokenized(&s, a, body));
+}
+
 /// `off` with the case's block where its first user turn starts: the end of the first system message.
 fn withBlock(a: std.mem.Allocator, c: Case, off: []const u8) ![]u8 {
     const at = std.mem.indexOf(u8, off, user_tag).?;

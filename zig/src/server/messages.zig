@@ -147,7 +147,7 @@ fn isImagePart(part: Value) bool {
 
 /// `s` with every `ph` as plain text: the placeholder's fullwidth bars to ASCII `|`, so the text no longer
 /// matches the tokenizer's special (whose id would otherwise add image tokens the prompt's span count misses).
-fn escape(cx: *Cx, s: []const u8, ph: []const u8) ![]const u8 {
+pub fn escape(cx: *Cx, s: []const u8, ph: []const u8) ![]const u8 {
     if (ph.len == 0 or std.mem.indexOf(u8, s, ph) == null) return s;
     var plain: std.ArrayList(u8) = .empty;
     var i: usize = 0;
