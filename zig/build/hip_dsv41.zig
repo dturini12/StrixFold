@@ -443,3 +443,10 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     }) });
     gpu_test.dependOn(&b.addInstallArtifact(coll_check, .{ .dest_dir = .{ .override = install_test } }).step);
 }
+
+/// `dsv41_assets`: tools/dsv41-hip/assets' chat template (the file deploys pin) as `chat_template`, for server tests.
+pub fn assetsModule(b: *std.Build) *std.Build.Module {
+    const files = b.addWriteFiles();
+    _ = files.addCopyFile(b.path("tools/dsv41-hip/assets/chat_template.jinja"), "chat_template.jinja");
+    return b.createModule(.{ .root_source_file = files.add("dsv41_assets.zig", "pub const chat_template = @embedFile(\"chat_template.jinja\");\n") });
+}

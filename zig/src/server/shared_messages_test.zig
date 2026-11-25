@@ -172,8 +172,8 @@ fn prefixLen(srv: *server.Server, conversation: []const u8, k: usize, with_tools
     var cx: errors.Cx = .{ .a = arena.allocator() };
     const messages = try parsed(cx.a, conversation);
     const tools: []const json.Value = if (with_tools) (try parsed(cx.a, tools_json)).array else &.{};
-    const ids = try prompt.renderIds(srv, &cx, messages, tools, false, null, true);
-    return prompt.messagesPrefixLen(srv, &cx, messages, k, tools, ids, false, null);
+    const ids = try prompt.renderIds(srv, &cx, messages, tools, false, null, true, null);
+    return prompt.messagesPrefixLen(srv, &cx, messages, k, tools, ids, false, null, null);
 }
 
 test "messagesPrefixLen: k = 0, k at or past the end and a cut under 512 add nothing" {

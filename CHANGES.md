@@ -67,6 +67,7 @@ names the source commit and its author in the message. Thanks to everyone below.
 | bertholomus cf6aae2b8 | evilpsycho42 | A prompt ending within the window past a kept state resumes an earlier one and keeps it |
 | bertholomus a6fed17ee | bertholomus | A kept state the lanes would refuse is passed over for an earlier one; each refusal says why |
 | bertholomus 33b521d7d | bertholomus | A follower whose GPU failed for good stops at once, so rank 0 stops too (rewritten for HIP) |
+| ashhart 4ded1802d (part) | Jay Leaton | `SCHEMA_PROMPT`: a request's `response_format` schema shown in its prompt as DeepSeek's encoder writes it, "## Response Format" (off by default) |
 
 Our own changes made while porting: each half of a split prompt chunk passes its own positions to the replay cut
 (needed once the cut uploads positions); and tests for the memo's exactness on DeepSeek-shaped tokenizers.
