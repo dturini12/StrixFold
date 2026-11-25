@@ -16,10 +16,13 @@ pub const Rendered = struct { ids: []const u32, history_len: usize = 0, images: 
 
 pub const isTitle = messages_mod.isTitleRequest;
 
-/// A ``response_format``'s schema for a V4.1 prompt; null unless Config.dsv41_schema_prompt and the V4.1 dialect.
+/// A ``response_format``'s schema for a V4.1 prompt; null unless Config.dsv41_schema_prompt and the V4.1 dialect. The
+/// image placeholder in its strings and keys is plain text (escapedSchema) on every path, with or without images.
 pub fn schemaOf(srv: *const Server, a: std.mem.Allocator, response_format: ?Value) std.mem.Allocator.Error!?Value {
     if (!srv.config.dsv41_schema_prompt or srv.dialect != .deepseek_v41) return null;
-    return deepseek_schema.schemaFor(a, response_format orelse return null);
+    const schema = try deepseek_schema.schemaFor(a, response_format orelse return null) orelse return null;
+    var cx: Cx = .{ .a = a };
+    return try escapedSchema(&cx, schema, if (srv.info.vision) |v| v.placeholder else messages_mod.deepseek_image);
 }
 
 /// ``render_prompt_ids``: messages normalized, rendered (with schemaOf's `schema`), a dangling ``<think>`` closed.
@@ -69,9 +72,8 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
     if (input.images.len > 0) {
         const vision = srv.info.vision orelse return cx.refuse("image input: this engine has no vision hook");
         const tagged = try imageIdentities(cx, input.messages, vision.placeholder, input.images.len);
-        const plain = if (schema) |v| try escapedSchema(cx, v, vision.placeholder) else null;
-        const raw = try renderNormalizedIds(srv, cx, tagged, input.tools, thinking, effort, true, plain);
-        const raw_history = try renderNormalizedIds(srv, cx, tagged, input.tools, thinking, effort, false, plain);
+        const raw = try renderNormalizedIds(srv, cx, tagged, input.tools, thinking, effort, true, schema);
+        const raw_history = try renderNormalizedIds(srv, cx, tagged, input.tools, thinking, effort, false, schema);
         var r = try spans(srv, cx, raw, input.images);
         r.history_len = expandedAt(raw, historyLen(raw, raw_history), vision.token, r.images);
         return r;
@@ -124,12 +126,12 @@ test "an image prompt's history length moves past the spans before it" {
 pub fn renderImages(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool, images: []const []const u8, schema: ?Value) errors.Refused!Rendered {
     const vision = srv.info.vision orelse return cx.refuse("image input: this engine has no vision hook");
     const tagged = try imageIdentities(cx, messages, vision.placeholder, images.len);
-    const plain = if (schema) |v| try escapedSchema(cx, v, vision.placeholder) else null;
-    const ids = try renderNormalizedIds(srv, cx, tagged, tools, thinking, effort, generation, plain);
+    const ids = try renderNormalizedIds(srv, cx, tagged, tools, thinking, effort, generation, schema);
     return spans(srv, cx, ids, images);
 }
 
-/// `v` with the image placeholder in every string and key as plain text (messages.escape), as a message's own text.
+/// `v` with the image placeholder in every string and key as plain text (messages.escape), as a message's own text
+/// on an image request: its special token would put an image token in the prompt.
 fn escapedSchema(cx: *Cx, v: Value, ph: []const u8) error{OutOfMemory}!Value {
     switch (v) {
         .string => |s| return .{ .string = try messages_mod.escape(cx, s, ph) },
