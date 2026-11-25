@@ -1,0 +1,35 @@
+{
+ "generator": "encoding.py (git blob 3c7c357dc9ae3ed37adacb8572a2e9498b7d1bcb) encode_messages(thinking_mode='chat'); on: the schema on an empty system message put first, as upstream TensorFold's native encoder places it",
+ "schema": {
+  "type": "object",
+  "properties": {
+   "answer": {
+    "type": "integer",
+    "description": "the count"
+   }
+  },
+  "required": [
+   "answer"
+  ]
+ },
+ "messages": [
+  {
+   "role": "user",
+   "content": "How many legs does a spider have?"
+  },
+  {
+   "role": "assistant",
+   "content": "Eight."
+  },
+  {
+   "role": "system",
+   "content": "From now on reply in JSON."
+  },
+  {
+   "role": "user",
+   "content": "And an ant?"
+  }
+ ],
+ "prompt_on": "<｜begin▁of▁sentence｜><｜System｜>\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{\"type\": \"object\", \"properties\": {\"answer\": {\"type\": \"integer\", \"description\": \"the count\"}}, \"required\": [\"answer\"]}<｜User｜>How many legs does a spider have?<｜Assistant｜></think>Eight.<｜end▁of▁sentence｜><｜System｜>From now on reply in JSON.<｜User｜>And an ant?<｜Assistant｜></think>",
+ "prompt_off": "<｜begin▁of▁sentence｜><｜User｜>How many legs does a spider have?<｜Assistant｜></think>Eight.<｜end▁of▁sentence｜><｜System｜>From now on reply in JSON.<｜User｜>And an ant?<｜Assistant｜></think>"
+}

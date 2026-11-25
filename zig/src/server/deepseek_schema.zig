@@ -57,7 +57,8 @@ pub fn renderIds(text: model_text.Text, a: Allocator, messages: Value, options: 
     return text.encode(a, try render(text, a, messages, options, schema, problem), false);
 }
 
-/// `messages` led by a system message: an empty one first unless the first is a system or developer message.
+/// `messages` led by a system message: an empty one first unless the first is a system or developer message. A later
+/// system message stays where normalize left it, a mid-conversation one without the block, as upstream's encoder does.
 fn withSystem(a: Allocator, messages: Value) Allocator.Error!Value {
     const list: []const Value = if (messages == .array) messages.array else &.{};
     if (list.len > 0) if (list[0].strField("role")) |role| {

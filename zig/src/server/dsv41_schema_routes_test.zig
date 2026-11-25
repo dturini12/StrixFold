@@ -448,3 +448,20 @@ test "a text-only request whose schema holds the image marker as text: the marke
         try std.testing.expectEqual(@as(u32, @intCast(user_at)), s.capture.shared[s.capture.shared.len - 1]);
     }
 }
+
+test "a system message later in the conversation stays in place: the block goes on an empty system message first" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = (try json.parse(a, @embedFile("fixtures/dsv41_response_format/encoder_late_system.json"))).ok;
+    const format = try obj(a, .{ .{ "type", str("json_schema") }, .{ "json_schema", try obj(a, .{ .{ "name", str("n") }, .{ "schema", v.get("schema").? } }) } });
+    for ([_]bool{ true, false }) |on| {
+        var s: Served = undefined;
+        try s.start(a, on, false);
+        defer s.stop();
+        const body = try obj(a, .{ .{ "model", str("m") }, .{ "max_tokens", Value{ .int = "2" } }, .{ "messages", v.get("messages").? }, .{ "response_format", format } });
+        _ = try s.post(a, "/v1/chat/completions", body);
+        try expectPrompt(&s, a, v.get(if (on) "prompt_on" else "prompt_off").?.string);
+        try std.testing.expectEqualSlices(u32, s.capture.prompt, try tokenized(&s, a, body));
+    }
+}
