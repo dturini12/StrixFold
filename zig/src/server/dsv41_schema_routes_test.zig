@@ -422,3 +422,29 @@ test "Chat with thinking on: the block follows the effort prompt and the system 
     try std.testing.expect(std.mem.indexOf(u8, prompts[1], "Reasoning Effort: ") != null);
     try std.testing.expectEqualStrings(try withBlock(a, c, prompts[1]), prompts[0]);
 }
+
+test "a text-only request whose schema holds the image marker as text: the marker stays text, with or without vision" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try Case.load(a);
+    const marker = "the literal marker " ++ Rig.image_placeholder;
+    const schema = try obj(a, .{ .{ "type", str("object") }, .{ "description", str(marker) }, .{ "properties", try obj(a, .{.{ Rig.image_placeholder, try obj(a, .{.{ "type", str("string") }}) }}) } });
+    const format = try obj(a, .{ .{ "type", str("json_schema") }, .{ "json_schema", try obj(a, .{ .{ "name", str("n") }, .{ "schema", schema } }) } });
+    for ([_]bool{ true, false }) |vision| {
+        var s: Served = undefined;
+        try s.start(a, true, vision);
+        defer s.stop();
+        const body = try chatBody(a, c, str(c.user), format);
+        _ = try s.post(a, "/v1/chat/completions", body);
+        try std.testing.expectEqual(@as(usize, 0), s.capture.images);
+        // no image token: the schema's markers, in a value and a key, shown as plain text (ASCII bars)
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u32, s.capture.prompt, &.{Rig.image_id}));
+        const text = try s.decoded(a);
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "<|deepseek_image|>"));
+        try std.testing.expectEqualSlices(u32, s.capture.prompt, try tokenized(&s, a, body));
+        // the system-prefix probe renders the same escaped block: the reusable prefix still ends at the user turn
+        const user_at = std.mem.indexOf(u8, text, user_tag).? + user_tag.len;
+        try std.testing.expectEqual(@as(u32, @intCast(user_at)), s.capture.shared[s.capture.shared.len - 1]);
+    }
+}
