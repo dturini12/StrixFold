@@ -326,7 +326,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{ .{ .name = "gpu", .module = hip_gpu }, .{ .name = "dsv41", .module = familyModule(b, target, optimize, o, hip_gpu, hip_lanes, "zig/src/families/dsv41/dsv41.zig") }, .{ .name = "lanes", .module = hip_lanes } },
+        .imports = &.{ .{ .name = "gpu", .module = hip_gpu }, .{ .name = "dsv41", .module = familyModule(b, target, optimize, o, hip_gpu, hip_lanes, "zig/src/families/dsv41/dsv41.zig") }, .{ .name = "lanes", .module = hip_lanes }, .{ .name = "log_time", .module = b.createModule(.{ .root_source_file = b.path("zig/src/server/log_time.zig"), .target = target, .optimize = optimize, .link_libc = true }) } },
     }) });
     host_test.dependOn(&rank1.step);
     host_test.dependOn(noNvidia(b, rank1));

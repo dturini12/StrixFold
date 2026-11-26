@@ -68,7 +68,7 @@ serve_load() {
   case $SPAWN_UNIT in 0|1) ;; *) die "SPAWN_UNIT must be 0 or 1, not $SPAWN_UNIT";; esac
   REPLAY_FLOOR=${REPLAY_FLOOR:-0} HC_SIDE=${HC_SIDE:-0} HC_INLINE=${HC_INLINE:-0} ENGRAM_AIO=${ENGRAM_AIO:-0} TOP_K_MAX=${TOP_K_MAX:-0} SEED_RANDOM=${SEED_RANDOM:-0}
   SCHEMA_PROMPT=${SCHEMA_PROMPT:-0}
-  L2_PREFETCH=${L2_PREFETCH:-0} LOOP_GUARD=${LOOP_GUARD:-1} DRAFT_TEMPERATURE=${DRAFT_TEMPERATURE:-0}
+  L2_PREFETCH=${L2_PREFETCH:-0} LOOP_GUARD=${LOOP_GUARD:-1} DRAFT_TEMPERATURE=${DRAFT_TEMPERATURE:-0} LOG_TIME=${LOG_TIME:-0}
   [[ $DRAFT_TEMPERATURE =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v t="$DRAFT_TEMPERATURE" 'BEGIN { exit !(t <= 100) }' \
     || die "DRAFT_TEMPERATURE must be a number from 0 (off) to 100, not $DRAFT_TEMPERATURE"
   DRAFT_BYPASS_AT=${DRAFT_BYPASS_AT:-0}
@@ -94,7 +94,7 @@ serve_load() {
   [ "$FILL_IMAGES" = 0 ] || [ "$FILL_SLICE_MS" != 0 ] || die "FILL_IMAGES=1 needs FILL_SLICE_MS above 0: an image prompt reads in those slices"
   # the switch acts only on drafted TP2 shared rounds that can hold that many streams; elsewhere it is off
   if [ "$DRAFTS" != 1 ] || [ "$WORLD" != 2 ] || [ "$DRAFT_BYPASS_AT" -gt "$STREAMS" ]; then DRAFT_BYPASS_AT=0; fi
-  for v in REPLAY_FLOOR HC_SIDE HC_INLINE ENGRAM_AIO SEED_RANDOM L2_PREFETCH LOOP_GUARD SCHEMA_PROMPT; do case ${!v} in 0|1) ;; *) die "$v must be 0 or 1, not ${!v}";; esac; done
+  for v in REPLAY_FLOOR HC_SIDE HC_INLINE ENGRAM_AIO SEED_RANDOM L2_PREFETCH LOOP_GUARD SCHEMA_PROMPT LOG_TIME; do case ${!v} in 0|1) ;; *) die "$v must be 0 or 1, not ${!v}";; esac; done
   # the inline mixes leave no side work for HC_SIDE's stream (the engine refuses the pair too: Round.useSide)
   [ "$HC_INLINE" = 0 ] || [ "$HC_SIDE" = 0 ] || die "HC_INLINE=1 leaves the mixes no side work: HC_SIDE must be 0"
   [[ $TOP_K_MAX =~ ^[0-9]+$ ]] || die "TOP_K_MAX must be a whole number (0: off), not $TOP_K_MAX"
@@ -254,6 +254,8 @@ serve_env() {
   [ -n "${WINDOW_LOGITS:-}" ] && SERVE_ENV+=(TF_DS_WINDOW_LOGITS="$WINDOW_LOGITS")
   # the inline mixes, both ranks alike (the handshake's plan says hc_inline=1); nothing at all when off
   if [ "$HC_INLINE" = 1 ]; then SERVE_ENV+=(TF_DS_HC_INLINE=1); fi
+  # each rank log line starts with its UTC time, both ranks alike; nothing at all when off
+  if [ "$LOG_TIME" = 1 ]; then SERVE_ENV+=(TF_LOG_TIME=1); fi
   # sf-disk, both ranks alike (the handshake compares " disk=1"); nothing at all when off
   if serve_disk_on; then
     mkdir -p "${PROMPT_DISK_DIR:-$HOME/strixfold-cache/prefix}" && chmod 700 "${PROMPT_DISK_DIR:-$HOME/strixfold-cache/prefix}" ||

@@ -22,6 +22,7 @@ unchanged; NOTICE gains one section at its end.
 | `tools/dsv41-zig/inputs/`, `tools/dsv41-zig/kit/` | Token map and per-node input preparation, and kit packing |
 | `docs/RESULTS.md`, `docs/TUNING.md`, `docs/img/` | Measured results with charts, and the two-box tuning notes |
 | `tools/dsv41-hip/ctx_sweep.py` | Writing speed against context length, drafts on and off (RESULTS, Speed at long context) |
+| `zig/src/server/log_time.zig` | `TF_LOG_TIME=1` (serve.conf `LOG_TIME=1`): each rank log line starts with its RFC 3339 UTC time |
 | `docs/COMMUNITY-RESULTS.md`, `.github/ISSUE_TEMPLATE/` | Results from other people's hardware, and the issue form that collects them |
 | `tools/m5-usb4/` | The Bosgame M5's optional USB4 host-to-host setting: a kernel module (GPL-2.0, its text in `COPYING`), a script and a service |
 | `README.md`, `CHANGES.md` | This fork's README and this file. Upstream's README moved to `docs/UPSTREAM-README.md`. |

@@ -48,6 +48,11 @@ fn stagger(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     return b.createModule(.{ .root_source_file = b.path("zig/src/core/stagger.zig"), .target = target, .optimize = optimize });
 }
 
+/// server/log_time.zig, the rank logs' line stamps, for tf-dsv41-lanes (the server imports the file itself).
+fn logTime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.createModule(.{ .root_source_file = b.path("zig/src/server/log_time.zig"), .target = target, .optimize = optimize, .link_libc = true });
+}
+
 /// The runtime module for `target`; `with_kernels` false builds it host-only (empty images).
 fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, images: []const ?std.Build.LazyPath) *std.Build.Module {
     const options = b.addOptions();
@@ -157,6 +162,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     ds_lanes.addImport("cuda", cuda);
     ds_lanes.addImport("gpu", ds_check.import_table.get("dsv41").?.import_table.get("gpu").?);
     ds_lanes.addImport("lanes", mods.lanes);
+    ds_lanes.addImport("log_time", logTime(b, target, optimize));
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-lanes", .root_module = ds_lanes }));
     _ = nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.core, mods.tokenizer, build_options, true);
 }
@@ -233,7 +239,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     const cuda = runtime(b, host, .debug, &.{});
     const mods = family(b, host, .debug, cuda, draft_ids);
     const eng = engines(b, host, .debug, cuda, mods.lanes, mods.nemotron, mods.core);
-    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, eng.api, eng.engines, eng.dsv41, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, eng.api, eng.engines, eng.dsv41, stagger(b, host, .debug), logTime(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     // every dsv41 tool compiled (not run) against the kernel-less runtime, so a family change that breaks a CUDA-only
     // tool fails here too (the AMD hosts have no nvcc to build them for real)
     for ([_][]const u8{ "check_main", "rank_cache_main", "load_main", "comm_main", "layer_main", "rdma_bench_main", "engram_check_main", "picture_main", "vit_main", "ring2d_check_main", "lanes_main" }) |name| {
@@ -242,6 +248,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
         m.addImport("cuda", cuda);
         m.addImport("lanes", mods.lanes);
         m.addImport("gpu", eng.dsv41.import_table.get("gpu").?);
+        m.addImport("log_time", logTime(b, host, .debug));
         step.dependOn(&b.addExecutable(.{ .name = name, .root_module = m }).step);
     }
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });

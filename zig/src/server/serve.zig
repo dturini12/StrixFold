@@ -5,6 +5,7 @@ const json = @import("json.zig");
 const auth = @import("auth.zig");
 const cli = @import("cli.zig");
 const log = @import("log.zig");
+const log_time = @import("log_time.zig");
 const live = @import("live.zig");
 const listener_mod = @import("listener.zig");
 const model_text = @import("model_text.zig");
@@ -85,7 +86,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
     const a = arena.allocator();
     var problem: []const u8 = "";
     var store = auth.Store.init(gpa, args.api_key, env(s, "TENSORFOLD_API_KEY") orelse "", args.api_key_file, args.metrics_open, &problem) catch {
-        std.debug.print("tensorfold: {s}\n", .{if (problem.len > 0) problem else "API key file cannot be opened safely"});
+        log_time.print("tensorfold: {s}\n", .{if (problem.len > 0) problem else "API key file cannot be opened safely"});
         return 1;
     };
     if (!store.enabled() and !auth.loopback(args.host)) log.line("warning: non-loopback server has no API key; requests are open", .{});
@@ -98,11 +99,11 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         } else ids.append(a, id) catch return 1;
     };
     const salt = if (env(s, "TENSORFOLD_SEED_SALT")) |t| std.fmt.parseInt(i64, std.mem.trim(u8, t, " "), 10) catch {
-        std.debug.print("tensorfold: TENSORFOLD_SEED_SALT={s}: an integer\n", .{t});
+        log_time.print("tensorfold: TENSORFOLD_SEED_SALT={s}: an integer\n", .{t});
         return 1;
     } else 0;
     const keepalive_s: u32 = if (env(s, "TENSORFOLD_SSE_KEEPALIVE")) |t| std.fmt.parseInt(u32, std.mem.trim(u8, t, " "), 10) catch {
-        std.debug.print("tensorfold: TENSORFOLD_SSE_KEEPALIVE={s}: whole seconds (0: off)\n", .{t});
+        log_time.print("tensorfold: TENSORFOLD_SSE_KEEPALIVE={s}: whole seconds (0: off)\n", .{t});
         return 1;
     } else 0;
     const schema_prompt = if (env(s, "TF_DSV41_SCHEMA_PROMPT")) |t| blk: {
@@ -135,21 +136,21 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .compact_memory = args.compact_memory,
     };
     const srv = server_mod.Server.init(gpa, io, s.engine, s.text, config, if (store.enabled()) &store else null) catch {
-        std.debug.print("tensorfold: the server could not start\n", .{});
+        log_time.print("tensorfold: the server could not start\n", .{});
         return 1;
     };
     defer srv.deinit();
     if (args.loop_guard and !srv.info.loop_guard) {
-        std.debug.print("tensorfold: --loop-guard is not supported by this native engine\n", .{});
+        log_time.print("tensorfold: --loop-guard is not supported by this native engine\n", .{});
         return 2;
     }
     if (raiseOpenFileLimit()) |r| log.line("open-file limit raised: soft {d} -> {d}", .{ r[0], r[1] });
     const address = resolve(io, args.host, args.port) orelse {
-        std.debug.print("tensorfold: cannot resolve --host {s}\n", .{args.host});
+        log_time.print("tensorfold: cannot resolve --host {s}\n", .{args.host});
         return 1;
     };
     const lis = listener_mod.Listener.open(address) catch |e| {
-        std.debug.print("tensorfold: cannot listen on {s}:{d} ({s})\n", .{ args.host, args.port, @errorName(e) });
+        log_time.print("tensorfold: cannot listen on {s}:{d} ({s})\n", .{ args.host, args.port, @errorName(e) });
         return 1;
     };
     installSignals(store.enabled());

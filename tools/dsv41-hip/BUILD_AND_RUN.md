@@ -107,7 +107,12 @@ ssh node0 'curl -s http://127.0.0.1:18080/v1/chat/completions -H "Content-Type: 
 ```
 `/health`, `/v1/models`, `/v1/tokenize` and `/metrics` answer as well. Logs and identities of a run are in
 `RUN_ROOT/RUN_ID/` on each box (`rank0.log`, `rank1.log`, `resolved-rank*.json` with the argv, the whole environment
-and every hash, `probe.json`).
+and every hash, `probe.json`). With `LOG_TIME=1` in the configuration (`TF_LOG_TIME=1` on both ranks) each line a rank
+writes starts with its UTC time and a space, `2026-11-26T14:03:12.123456Z ` (RFC 3339, microseconds, the wall clock
+when the line is written), and the live status line is not drawn. Some lines stay unstamped: ROCm, HIP and hipBLAS
+messages, the Pillow child's, panic traces, and the DeepSeek-V4.1 family's diagnostics printed past the log (the vision
+startup line, `follow_refused`, `prompt_logits`, `TRACE_ROUNDS`, `ROUND_LOGITS_SHA`). They are separate events, and
+their time is only known to lie between the stamped lines around them.
 
 ### Settings that matter
 
@@ -122,6 +127,8 @@ and every hash, `probe.json`).
   [GETTING-STARTED.md, Longer context](../../docs/GETTING-STARTED.md#longer-context).
 - **Drafts:** `DRAFTS=1` (the default) turns on DSpark drafting, which the published speeds need: on our pair the
   `bench` code prompt writes 74.5 tok/s with it and about 33 without. It gives exactly the same text as `DRAFTS=0`.
+- **Times in the logs:** `LOG_TIME=1` starts each line of `rank0.log` and `rank1.log` with its UTC time (off by
+  default; the configuration is in the handshake, so both boxes switch together).
 
 ## 6. Check and measure
 
