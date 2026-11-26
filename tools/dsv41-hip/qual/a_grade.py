@@ -42,6 +42,7 @@ import statistics
 import sys
 
 FALLBACK = re.compile(r"assumes less|Triton variant of|MissingTritonVariant")
+STAMP = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z ")  # TF_LOG_TIME's line stamp
 P_B = (2050, 2062, 2064, 4100)
 
 
@@ -50,7 +51,7 @@ def jl(path):
     if not os.path.exists(path):
         return out
     for line in open(path, errors="replace"):
-        line = line.strip()
+        line = STAMP.sub("", line.strip(), count=1)
         if line.startswith("{"):
             try:
                 out.append(json.loads(line))

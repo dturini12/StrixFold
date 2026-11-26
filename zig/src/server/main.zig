@@ -9,6 +9,9 @@ const serve = @import("serve.zig");
 const leave = @import("leave.zig");
 const hf_text = @import("hf_text.zig");
 const checkpoint_cli = @import("checkpoint_cli");
+const log_time = @import("log_time.zig");
+
+pub const std_options: std.Options = .{ .logFn = log_time.logFn };
 
 const usage_line = "usage: tensorfold serve [-h] [--host HOST] [--port PORT] [--name NAME] [--alias ALIAS] [--api-key API_KEY] [--api-key-file API_KEY_FILE] [--metrics-open] [--dashboard] [--vision-max-images VISION_MAX_IMAGES] [--context CONTEXT] [--speed-up SETTINGS] [--prompt-cache-gib PROMPT_CACHE_GIB] [--prompt-cache-over-cap] [--learn] [--learn-dir LEARN_DIR] [--learn-gib LEARN_GIB] [--max-tokens MAX_TOKENS] [--temperature TEMPERATURE] [--top-p TOP_P] [--top-k TOP_K] [--min-p MIN_P] [--draft-temperature DRAFT_TEMPERATURE] [--thinking | --no-thinking] [--reasoning-effort {low,medium,high,xhigh}] [--thinking-budget THINKING_BUDGET] [--loop-guard] [--no-drafts] [--compact-at COMPACT_AT] [--compact-keep COMPACT_KEEP] [--compact-memory COMPACT_MEMORY] [--parallel PARALLEL] [--no-update-check] [--backend {auto,mlx,cuda}] [--device DEVICE] [--segments SEGMENTS] model\n";
 
@@ -42,14 +45,14 @@ pub fn main(init: std.process.Init) !u8 {
         return 0;
     }
     if (argv.len < 2 or !std.mem.eql(u8, argv[1], "serve")) {
-        std.debug.print("usage: tensorfold-native capabilities --json | models | info MODEL | pull REPO[@REVISION] | serve MODEL [flags]\n", .{});
+        log_time.print("usage: tensorfold-native capabilities --json | models | info MODEL | pull REPO[@REVISION] | serve MODEL [flags]\n", .{});
         return 2;
     }
     const started = std.Io.Clock.awake.now(io).toNanoseconds();
     var u: cli.Usage = .{};
     const args = cli.parse(a, argv[2..], &u) catch |e| switch (e) {
         error.Usage => {
-            std.debug.print("{s}tensorfold serve: error: {s}\n", .{ usage_line, u.message });
+            log_time.print("{s}tensorfold serve: error: {s}\n", .{ usage_line, u.message });
             return 2;
         },
         else => |x| return x,
@@ -78,7 +81,7 @@ pub fn main(init: std.process.Init) !u8 {
 }
 
 fn fail(message: []const u8) u8 {
-    std.debug.print("tensorfold: {s}\n", .{message});
+    log_time.print("tensorfold: {s}\n", .{message});
     return 1;
 }
 

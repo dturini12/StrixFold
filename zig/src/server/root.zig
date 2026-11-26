@@ -36,6 +36,7 @@ test {
     _ = @import("prompt.zig");
     _ = @import("status_routes.zig");
     _ = @import("log.zig");
+    _ = @import("log_time.zig");
     _ = @import("messages.zig");
     _ = @import("stream_preflight_test.zig");
     _ = @import("structure_test.zig");

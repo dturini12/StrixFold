@@ -2,6 +2,7 @@
 const std = @import("std");
 const Conn = @import("http_conn.zig").Conn;
 const afterChars = @import("reply_text.zig").afterChars;
+const log_time = @import("log_time.zig");
 
 var global_io: ?std.Io = null;
 var mutex: std.Io.Mutex = .init;
@@ -38,11 +39,15 @@ pub fn line(comptime fmt: []const u8, args: anytype) void {
         buf[buf.len - 1] = '\n';
         w.end = buf.len;
     };
-    raw(w.buffered());
+    emit(w.buffered(), log_time.enabled());
 }
 
 /// Text as given, the live line cleared first.
 pub fn raw(text: []const u8) void {
+    emit(text, false);
+}
+
+fn emit(text: []const u8, stamped: bool) void {
     const m = io();
     mutex.lockUncancelable(m);
     defer mutex.unlock(m);
@@ -50,8 +55,26 @@ pub fn raw(text: []const u8) void {
         writeOut(clear);
         shown = false;
     }
-    writeOut(text);
+    var at: [log_time.stamp_len]u8 = undefined;
+    var buf: [log_time.stamp_len + 8192]u8 = undefined;
+    var rest = text;
+    while (rest.len > 0) writeOut(nextPiece(&buf, &rest, if (stamped) log_time.stamp(&at, log_time.nowNs()) else null));
     if (text.len > 0) line_start = text[text.len - 1] == '\n';
+}
+
+/// Without a prefix ``rest`` whole, else its next line after the prefix (in ``buf``); ``rest`` keeps what follows.
+fn nextPiece(buf: []u8, rest: *[]const u8, prefix: ?[]const u8) []const u8 {
+    const p = prefix orelse {
+        const all = rest.*;
+        rest.* = all[all.len..];
+        return all;
+    };
+    const nl = if (std.mem.indexOfScalar(u8, rest.*, '\n')) |i| i + 1 else rest.*.len;
+    const n = @min(nl, buf.len - p.len);
+    @memcpy(buf[0..p.len], p);
+    @memcpy(buf[p.len..][0..n], rest.*[0..n]);
+    rest.* = rest.*[n..];
+    return buf[0 .. p.len + n];
 }
 
 /// Redraws the status line unless a log line is half written.
@@ -103,6 +126,19 @@ pub fn ended(buf: []u8, id: []const u8, why: ?[]const u8, prompt: usize, tokens:
     if (why) |e| w.print("error ({s})", .{e}) catch {} else w.writeAll("client-left") catch {};
     w.print(" prompt={d} tokens={d} after={d:.2}s", .{ prompt, tokens, after }) catch {};
     return w.buffered();
+}
+
+test "a line's pieces, stamped and not" {
+    var buf: [64]u8 = undefined;
+    var at: [log_time.stamp_len]u8 = undefined;
+    const p = log_time.stamp(&at, 1_795_701_792_123_456_789);
+    var rest: []const u8 = "[tensorfold] a\nb\n";
+    try std.testing.expectEqualStrings("2026-11-26T14:03:12.123456Z [tensorfold] a\n", nextPiece(&buf, &rest, p));
+    try std.testing.expectEqualStrings("2026-11-26T14:03:12.123456Z b\n", nextPiece(&buf, &rest, p));
+    try std.testing.expectEqual(0, rest.len);
+    rest = "[tensorfold] a\nb\n";
+    try std.testing.expectEqualStrings("[tensorfold] a\nb\n", nextPiece(&buf, &rest, null));
+    try std.testing.expectEqual(0, rest.len);
 }
 
 test "a request's refused and ended lines" {

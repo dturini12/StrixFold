@@ -12,6 +12,9 @@ const std = @import("std");
 const gpu = @import("gpu");
 const dsv41 = @import("dsv41");
 const lanes = @import("lanes");
+const log_time = @import("log_time");
+
+pub const std_options: std.Options = .{ .logFn = log_time.logFn };
 
 const usage = "usage: tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P] [--context C] [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE] [--rdma DEVICES --rdma-kernels FATBIN] [--fix-k K] [--round-rows R] [--round-ms MS,...] [--draft-ms MS] [--streams S] [--modalities text|text_image] [--image-tokens N] [--hip-kit DIR] [--aio 0|1] [--side 0|1] [--logits-sha 0|1] [--logits-dump DIR]\n";
 
@@ -56,7 +59,7 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const args = try init.minimal.args.toSlice(a);
     if (args.len < 8) {
-        std.debug.print("{s}", .{usage});
+        log_time.print("{s}", .{usage});
         return 2;
     }
     var o: dsv41.model.Options = .{
@@ -148,7 +151,8 @@ pub fn main(init: std.process.Init) !u8 {
 
     var out_buf: [1 << 14]u8 = undefined;
     var out = std.Io.File.stdout().writer(io, &out_buf);
-    const w = &out.interface;
+    var stamped: log_time.Stamper = .init(&out.interface, &.{});
+    const w = if (log_time.enabled()) &stamped.interface else &out.interface;
 
     // rank 1 leaves through rank1Exit after its teardown (this defer runs last): a stop is 0, a lost peer 1
     var rank1_code: u8 = 1;
@@ -197,7 +201,7 @@ pub fn main(init: std.process.Init) !u8 {
             try w.flush();
             // a faulted device frees nothing in order (teardown can wait on the peer): exit now, so rank 0 stops too
             if (err == error.GpuContextFailed or err == error.DeviceFault or m.contextFailed()) {
-                std.debug.print("dsv41: rank {d} stops: its device failed ({s})\n", .{ o.rank, @errorName(err) });
+                log_time.print("dsv41: rank {d} stops: its device failed ({s})\n", .{ o.rank, @errorName(err) });
                 rank1Exit(1);
             }
             rank1_code = if (stoppedHere(io)) 0 else 1; // a PeerDown with the marker is the stop it asked for

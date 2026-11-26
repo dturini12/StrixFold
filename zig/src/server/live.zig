@@ -3,6 +3,7 @@ const std = @import("std");
 const api = @import("engine_api");
 const json = @import("json.zig");
 const log = @import("log.zig");
+const log_time = @import("log_time.zig");
 const Allocator = std.mem.Allocator;
 
 /// Python's ``round(x, 1)``.
@@ -94,9 +95,9 @@ fn columns() usize {
     return 100;
 }
 
-/// Whether to draw: stdout is a terminal and TENSORFOLD_NO_LIVE is not 1.
+/// Whether to draw: stdout is a terminal, TENSORFOLD_NO_LIVE is not 1 and TF_LOG_TIME is off.
 pub fn wanted(io: std.Io, no_live: bool) bool {
-    if (no_live) return false;
+    if (no_live or log_time.enabled()) return false;
     return std.Io.File.stdout().isTty(io) catch false;
 }
 
