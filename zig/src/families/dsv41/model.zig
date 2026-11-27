@@ -516,7 +516,8 @@ pub const Model = struct {
         const caps = chunkCaps(m.split_min); // (the handshake's chunk_caps)
         // a chunk's compressed keys are its stream's (to the context); the caches hold every stream's extent (the pool)
         m.ch = try prompt.Chunk.init(&m.eng, &m.arena, caps[0], m.context_cap);
-        if (caps[1] > 0) m.ch2 = try prompt.Chunk.init(&m.eng, &m.arena, caps[1], m.context_cap);
+        // the second half borrows the first's indexer scratch: the halves' steps run on one stream, A's then B's
+        if (caps[1] > 0) m.ch2 = try prompt.Chunk.initSharing(&m.eng, &m.arena, caps[1], m.context_cap, &m.ch);
         m.caches = try prompt.Caches.init(&m.eng, &m.arena, o.pool, m.streams);
         m.blas = try blas.Blas.open(m.stream, m.ch.blas_ws);
         errdefer m.blas.close();
