@@ -175,14 +175,19 @@ pub const Rule = struct {
         return true;
     }
 
-    /// Python `_head_depth`: the next round's head drafts for a stream (0 when forced, 1 with a copy ahead).
+    /// Python `_head_depth`: the next round's head drafts for a stream (0 when forced or with a copy ahead).
+    /// A copied continuation takes the next window and drops the head's drafts (windows.plan), so none are drafted:
+    /// a depth-0 request still hands the backend the kept rows (a plain round's request), and no later pass reads a
+    /// skipped one's output (dsv41: the drafter rings take every verified row in the verify; a pass stores nothing).
+    /// (Python returned 1, "in case it is gone": the plan proposes again from the same context, so it is there; a
+    /// shared round that trims it to nothing verifies a plain row, which the held draft could not have joined either.)
     pub fn headDepth(r: *Rule, who: *const Who, budget: ?i64, probe: Probe) !i64 {
         const d: i64 = if (who.finished) 0 else if (budget) |b| b else if (r.node_probabilities)
             @min(@as(i64, r.most_drafts), @max(1, who.draft_room - 1))
         else
             try r.depth(who.*);
         if (who.forced) return 0;
-        if (d != 0 and probe.copy(probe.ptr, who)) return 1;
+        if (d != 0 and probe.copy(probe.ptr, who)) return 0;
         return d;
     }
 
@@ -268,4 +273,81 @@ test "depth picks the most tokens a ms and probes deeper" {
     defer if (st) |*s| s.deinit(gpa);
     const who: Who = .{ .state = &st, .draft_room = 100, .finished = false, .forced = false };
     try std.testing.expectEqual(@as(i64, 3), try rule.depth(who));
+}
+
+/// A stream as the copy probe sees it: whether a copy is ahead, and how often it was asked (each ask is a `propose`).
+const ProbeStub = struct {
+    copy: bool = false,
+    asked: u32 = 0,
+
+    fn ahead(_: *anyopaque, w: *const Who) bool {
+        const s: *ProbeStub = @ptrCast(@alignCast(w.stream.?));
+        s.asked += 1;
+        return s.copy;
+    }
+};
+
+test "a copy ahead drafts nothing; the proposer is asked as before" {
+    const gpa = std.testing.allocator;
+    var fc: Table = .{};
+    defer fc.deinit(gpa);
+    for (1..7) |w| try fc.put(gpa, @intCast(w), 30.0 + 6.0 * @as(f64, @floatFromInt(w)));
+    const shared: Table = .{};
+    for ([_]bool{ true, false }) |node| {
+        var rule: Rule = .{ .gpa = gpa, .prior = &.{ 0.9, 0.85, 0.8, 0.75, 0.7 }, .most_drafts = 5, .family_costs = &fc, .shared_costs = &shared, .mtp_step_ms = 0.5, .plain_guard = false, .node_probabilities = node, .batch_rows = 16 };
+        defer rule.deinit();
+        var st: ?State = null;
+        defer if (st) |*s| s.deinit(gpa);
+        var stub: ProbeStub = .{};
+        const probe: Probe = .{ .ptr = undefined, .copy = ProbeStub.ahead };
+        var who: Who = .{ .state = &st, .draft_room = 100, .finished = false, .forced = false, .stream = &stub };
+        const full = try rule.headDepth(&who, null, probe);
+        try std.testing.expect(full > 0);
+        try std.testing.expectEqual(@as(u32, 1), stub.asked);
+        const rounds = if (st) |s| s.rounds else 0;
+        stub.copy = true;
+        try std.testing.expectEqual(@as(i64, 0), try rule.headDepth(&who, null, probe));
+        try std.testing.expectEqual(@as(u32, 2), stub.asked);
+        // the depth rule ran before the probe, as without a copy: its state moves the same
+        if (!node) try std.testing.expectEqual(rounds + 1, st.?.rounds);
+        try std.testing.expectEqual(@as(i64, 0), try rule.headDepth(&who, 3, probe));
+        try std.testing.expectEqual(@as(u32, 3), stub.asked);
+        // no probe where nothing would be drafted anyway: a zero budget, a forced token, a finished stream
+        try std.testing.expectEqual(@as(i64, 0), try rule.headDepth(&who, 0, probe));
+        who.forced = true;
+        try std.testing.expectEqual(@as(i64, 0), try rule.headDepth(&who, null, probe));
+        who.forced = false;
+        who.finished = true;
+        try std.testing.expectEqual(@as(i64, 0), try rule.headDepth(&who, null, probe));
+        try std.testing.expectEqual(@as(u32, 3), stub.asked);
+        who.finished = false;
+        stub.copy = false;
+        try std.testing.expectEqual(@as(i64, 3), try rule.headDepth(&who, 3, probe));
+    }
+}
+
+test "a shared round's budgets: a stream with a copy ahead drafts nothing, the others keep theirs" {
+    const gpa = std.testing.allocator;
+    const fc: Table = .{};
+    var shared: Table = .{};
+    defer shared.deinit(gpa);
+    for (1..17) |w| try shared.put(gpa, @intCast(w), 30.0 + 5.0 * @as(f64, @floatFromInt(w)));
+    for ([_]bool{ true, false }) |node| {
+        var rule: Rule = .{ .gpa = gpa, .prior = &.{ 0.9, 0.85, 0.8, 0.75, 0.7 }, .most_drafts = 5, .family_costs = &fc, .shared_costs = &shared, .mtp_step_ms = 0.0, .plain_guard = false, .node_probabilities = node, .batch_rows = 16 };
+        defer rule.deinit();
+        var states: [3]?State = .{ null, null, null };
+        defer for (&states) |*s| if (s.*) |*x| x.deinit(gpa);
+        var stubs: [3]ProbeStub = .{ .{}, .{ .copy = true }, .{} };
+        var whos: [3]Who = undefined;
+        for (&whos, &states, &stubs) |*w, *s, *p| w.* = .{ .state = s, .draft_room = 100, .finished = false, .forced = false, .granted = 5, .stream = p };
+        const probe: Probe = .{ .ptr = undefined, .copy = ProbeStub.ahead };
+        var out: [3]i64 = undefined;
+        try rule.budgets(&whos, probe, &out);
+        try std.testing.expect(out[0] > 0 and out[2] > 0);
+        try std.testing.expectEqual(@as(i64, 0), out[1]);
+        try std.testing.expectEqual(out[0], out[2]);
+        // node probabilities ask twice (the inner depth, then the granted one), unless the first already gave 0
+        try std.testing.expectEqual(@as(u32, if (node) 2 else 1), stubs[0].asked);
+        try std.testing.expectEqual(@as(u32, 1), stubs[1].asked);
+    }
 }
