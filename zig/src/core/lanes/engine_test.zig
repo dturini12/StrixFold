@@ -5,7 +5,9 @@ const Engine = @import("engine.zig").Engine;
 const sm = @import("stream.zig");
 const fake = @import("fake.zig");
 const SuffixLookup = @import("proposer.zig").SuffixLookup;
+const Proposer = @import("proposer.zig").Proposer;
 const Sampling = @import("sampling.zig").Sampling;
+const ev = @import("events.zig");
 
 const gpa = std.testing.allocator;
 
@@ -387,4 +389,143 @@ fn overheadsAfter(frozen: bool) !usize {
 test "frozen timing: the round loop learns no overhead from the clock" {
     try std.testing.expect(try overheadsAfter(false) > 0);
     try std.testing.expectEqual(@as(usize, 0), try overheadsAfter(true));
+}
+
+/// The suffix proposer with some copies made to miss and some withheld, chosen by the context's length so the depth
+/// probe and the plan see the same proposal (the test checks the proposer never fell silent).
+const Missing = struct {
+    inner: SuffixLookup,
+    buf: [64]u32 = undefined,
+
+    fn proposer(m: *Missing) Proposer {
+        return .{ .ptr = m, .vtable = &vtable };
+    }
+
+    const vtable: Proposer.VTable = .{ .propose = propose, .last_match = lastMatch, .observe = observe };
+
+    fn of(ptr: *anyopaque) *Missing {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn propose(ptr: *anyopaque, context: []const u32, max_draft: i64) anyerror![]const u32 {
+        const m = of(ptr);
+        const got = try m.inner.propose(context, max_draft);
+        const pick = ((context.len *% 2654435761) >> 7) % 8;
+        if (pick == 2) return got[0..0]; // no copy ahead: the head drafts
+        const n = @min(got.len, m.buf.len);
+        @memcpy(m.buf[0..n], got[0..n]);
+        if (n > 0) switch (pick) {
+            0 => m.buf[0] = (m.buf[0] + 1) % fake.vocab, // the window keeps nothing
+            1, 3 => m.buf[n / 2] = (m.buf[n / 2] + 1) % fake.vocab, // it keeps a part
+            else => {},
+        };
+        return m.buf[0..n];
+    }
+
+    fn lastMatch(ptr: *anyopaque) i64 {
+        return of(ptr).inner.last_match;
+    }
+
+    fn observe(ptr: *anyopaque, proposed: i64, accepted: i64) void {
+        of(ptr).inner.observe(proposed, accepted) catch {};
+    }
+};
+
+const CopyRun = struct {
+    emitted: [2][]const u32 = .{ &.{}, &.{} },
+    copies: usize = 0, // copy windows planned
+    missed: usize = 0, // copy windows that kept fewer rows than they verified
+    resumed: usize = 0, // head windows right after a missed copy window
+    head_rounds: usize = 0,
+
+    fn deinit(r: CopyRun) void {
+        for (r.emitted) |e| gpa.free(e);
+    }
+};
+
+fn field(e: []const ev.Field, k: []const u8) ?ev.Value {
+    for (e) |x| if (std.mem.eql(u8, x.k, k)) return x.v;
+    return null;
+}
+
+const p3 = [_]u32{ 2, 7, 1, 8, 2, 8, 1, 8, 2, 8, 4 }; // p1's length: the fake's cycle starts as far into both replies
+
+/// One or two streams on the fake target, which repeats a pattern 20 tokens into a reply so copies fire, with the
+/// decision log read back: after a round, the head is asked for no drafts exactly when the next window is a copy.
+fn runCopies(prompts: []const []const u32, drafts: bool, served: bool, sampling: ?Sampling) !CopyRun {
+    var cfg = if (served) try servedModel() else try model();
+    defer cfg.deinit(gpa);
+    var target: fake.Fake = .{ .gpa = gpa, .cycle_after = 20, .probe_prompt = p1.len };
+    defer target.deinit();
+    var clock: fake.FixedClock = .{};
+    var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer engine.deinit();
+    var log = ev.Log.init(gpa);
+    defer log.deinit();
+    engine.log = &log;
+    const ids = [_][]const u8{ "a", "b" };
+    var missing: [2]Missing = undefined;
+    var streams: [2]sm.Stream = undefined;
+    for (prompts, 0..) |p, i| {
+        missing[i] = .{ .inner = try SuffixLookup.init(gpa, .{ .min_match = 4 }) };
+        streams[i] = try sm.Stream.init(gpa, .{ .id = ids[i], .prompt = p, .max_new = @intCast(120 + 37 * i), .sampling = sampling, .drafts = drafts, .proposer = missing[i].proposer() });
+    }
+    defer for (streams[0..prompts.len], missing[0..prompts.len]) |*s, *m| {
+        s.deinit(gpa);
+        m.inner.deinit();
+    };
+    for (streams[0..prompts.len]) |*s| try engine.addStream(s);
+    while (engine.activeCount() > 0) try engine.step();
+    var out: CopyRun = .{};
+    errdefer out.deinit();
+    for (streams[0..prompts.len], 0..) |*s, i| {
+        out.emitted[i] = try gpa.dupe(u32, s.emitted());
+        try std.testing.expectEqual(@as(i64, 0), missing[i].inner.silenced_rounds);
+    }
+    // per stream: the depth of the head request after its last round (null: none yet), and that round's outcome
+    var depth: [2]?i64 = .{ null, null };
+    var last_copy_missed: [2]bool = .{ false, false };
+    for (log.events.items) |e| {
+        const kind = field(e, "ev").?.str;
+        const stream = field(e, "stream") orelse continue;
+        const i: usize = if (std.mem.eql(u8, stream.str, "a")) 0 else 1;
+        if (std.mem.eql(u8, kind, "draft")) {
+            if (field(e, "rows").? != .null) depth[i] = field(e, "depth").?.int; // (the first request has no rows)
+        } else if (std.mem.eql(u8, kind, "plan")) {
+            const plan = field(e, "kind").?.str;
+            const copy = std.mem.eql(u8, plan, "copy");
+            out.copies += @intFromBool(copy);
+            if (std.mem.eql(u8, plan, "head")) {
+                out.head_rounds += 1;
+                out.resumed += @intFromBool(last_copy_missed[i]);
+            }
+            if (depth[i]) |d| try std.testing.expectEqual(copy, d == 0);
+        } else if (std.mem.eql(u8, kind, "round")) {
+            const copy = std.mem.eql(u8, field(e, "kind").?.str, "copy");
+            const missed = field(e, "path").?.u32s.len < field(e, "window").?.u32s.len;
+            out.missed += @intFromBool(copy and missed);
+            last_copy_missed[i] = copy and missed;
+        }
+    }
+    return out;
+}
+
+test "no head pass before a copy window: replies stay the plain decode's, alone and shared, after hits and misses" {
+    for ([_]?Sampling{ null, .{ .seed = 3, .temperature = 0.8, .top_k = 0, .top_p = 0.95 } }) |sampling| {
+        for ([_]bool{ false, true }) |served| {
+            const plain = try runCopies(&.{ &p1, &p3 }, false, served, sampling);
+            defer plain.deinit();
+            const alone = try runCopies(&.{&p1}, true, served, sampling);
+            defer alone.deinit();
+            const shared = try runCopies(&.{ &p1, &p3 }, true, served, sampling);
+            defer shared.deinit();
+            try std.testing.expectEqualSlices(u32, plain.emitted[0], alone.emitted[0]);
+            try std.testing.expectEqualSlices(u32, plain.emitted[0], shared.emitted[0]);
+            try std.testing.expectEqualSlices(u32, plain.emitted[1], shared.emitted[1]);
+            try std.testing.expectEqual(@as(usize, 0), plain.copies);
+            for ([_]CopyRun{ alone, shared }) |r| {
+                try std.testing.expect(r.copies > 0 and r.missed > 0 and r.resumed > 0 and r.head_rounds > r.resumed);
+            }
+        }
+    }
 }
