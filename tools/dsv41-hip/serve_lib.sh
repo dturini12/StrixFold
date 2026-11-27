@@ -98,6 +98,9 @@ serve_load() {
   # the inline mixes leave no side work for HC_SIDE's stream (the engine refuses the pair too: Round.useSide)
   [ "$HC_INLINE" = 0 ] || [ "$HC_SIDE" = 0 ] || die "HC_INLINE=1 leaves the mixes no side work: HC_SIDE must be 0"
   [[ $TOP_K_MAX =~ ^[0-9]+$ ]] || die "TOP_K_MAX must be a whole number (0: off), not $TOP_K_MAX"
+  ENGRAM_ROW_CACHE_MIB=${ENGRAM_ROW_CACHE_MIB:-0}
+  [[ $ENGRAM_ROW_CACHE_MIB =~ ^[0-9]+$ ]] && [ "$ENGRAM_ROW_CACHE_MIB" -le 65536 ] ||
+    die "ENGRAM_ROW_CACHE_MIB must be a whole number of MiB up to 65536 (empty or 0: none), not $ENGRAM_ROW_CACHE_MIB"
   # the SSE keepalive (rank 0; unset, empty or 0: off, the server as before)
   [ -z "${SSE_KEEPALIVE:-}" ] || [[ $SSE_KEEPALIVE =~ ^[0-9]+$ ]] ||
     die "SSE_KEEPALIVE must be a whole number of seconds (0 or empty: off), not $SSE_KEEPALIVE"
@@ -256,6 +259,8 @@ serve_env() {
   if [ "$HC_INLINE" = 1 ]; then SERVE_ENV+=(TF_DS_HC_INLINE=1); fi
   # each rank log line starts with its UTC time, both ranks alike; nothing at all when off
   if [ "$LOG_TIME" = 1 ]; then SERVE_ENV+=(TF_LOG_TIME=1); fi
+  # the Engram row cache, each rank its own (not in the handshake: the rows are the tables' bytes); nothing when off
+  if [ "${ENGRAM_ROW_CACHE_MIB:-0}" -gt 0 ]; then SERVE_ENV+=(TF_DS_ENGRAM_ROW_CACHE_MIB="$ENGRAM_ROW_CACHE_MIB"); fi
   # sf-disk, both ranks alike (the handshake compares " disk=1"); nothing at all when off
   if serve_disk_on; then
     mkdir -p "${PROMPT_DISK_DIR:-$HOME/strixfold-cache/prefix}" && chmod 700 "${PROMPT_DISK_DIR:-$HOME/strixfold-cache/prefix}" ||

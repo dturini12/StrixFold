@@ -15,6 +15,7 @@ pub const pil = @import("pil.zig");
 pub const checkpoint = @import("checkpoint.zig");
 pub const weights = @import("weights.zig");
 pub const engram_io = @import("engram_io.zig");
+pub const engram_cache = @import("engram_cache.zig");
 pub const engram_aio = @import("engram_aio.zig");
 pub const link = @import("link.zig");
 pub const disk = @import("disk.zig");

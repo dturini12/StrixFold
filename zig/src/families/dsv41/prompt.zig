@@ -29,6 +29,7 @@ const coll = @import("coll.zig");
 const engram = @import("engram.zig");
 const engram_io = @import("engram_io.zig");
 const engram_aio = @import("engram_aio.zig");
+const engram_cache = @import("engram_cache.zig");
 const exact = @import("exact.zig");
 const tri_index = @import("tri_index.zig");
 const exl3_linear = @import("exl3_linear.zig");
@@ -1276,6 +1277,7 @@ pub const EngramHost = struct {
     rows: []u16, // bf16 [cap, (hi - lo) * head_dim]
     aio: ?*engram_aio.Aio = null, // a round's reads by Linux AIO on the tables' O_DIRECT descriptors (else the pool)
     paio: ?*engram_aio.Aio = null, // a prompt chunk's reads the same way, on a ring of its own (else the pool)
+    rcache: ?*engram_cache.RowCache = null, // a prompt chunk's rows kept dense (else every read goes to the tables)
     // the rounds' Engram host time (ns, summed; a profile reads it): hashing, the table reads, the decode, the upload
     io: ?std.Io = null,
     t_hash: u64 = 0,
@@ -1368,7 +1370,7 @@ fn engramAhead1(eh: *EngramHost, c: *const Config, seq: []const i32, start: usiz
     }
     const m = n * k;
     // by AIO on the prompt's ring when it is open (the main thread reads by it only after joining this one)
-    if (eh.paio) |aio| try aioGather(aio, t, eh.ahead_flat[j][0..m], eh.ahead_w[j][0 .. m * t.row_w], eh.ahead_s[j][0 .. m * t.row_s]) else try eh.pool.gather(t, eh.ahead_flat[j][0..m], eh.ahead_w[j][0 .. m * t.row_w], eh.ahead_s[j][0 .. m * t.row_s]);
+    if (eh.paio) |aio| try aioGather(aio, t, eh.ahead_flat[j][0..m], eh.ahead_w[j][0 .. m * t.row_w], eh.ahead_s[j][0 .. m * t.row_s]) else if (eh.rcache) |rc| try rc.gather(eh.pool, j, t, eh.ahead_flat[j][0..m], eh.ahead_w[j][0 .. m * t.row_w], eh.ahead_s[j][0 .. m * t.row_s]) else try eh.pool.gather(t, eh.ahead_flat[j][0..m], eh.ahead_w[j][0 .. m * t.row_w], eh.ahead_s[j][0 .. m * t.row_s]);
     engram.decodeRows(eh.ahead_w[j][0 .. m * t.row_w], eh.ahead_s[j][0 .. m * t.row_s], eh.ahead_rows[j][0 .. m * t.row_w], m, t.row_w, t.row_s, 8);
     eh.ahead_ready[j] = true;
 }
@@ -1422,7 +1424,7 @@ pub fn engramRows(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq:
         for (0..n) |r| {
             for (0..k) |j| eh.flat[r * k + j] = eh.hashes[(r * eh.hasher.layers + l) * cols + eh.lo + j];
         }
-        if (eh.paio) |aio| try aioGather(aio, t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]) else try eh.pool.gather(t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]);
+        if (eh.paio) |aio| try aioGather(aio, t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]) else if (eh.rcache) |rc| try rc.gather(eh.pool, l, t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]) else try eh.pool.gather(t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]);
         engram.decodeRows(eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s], eh.rows[0 .. m * t.row_w], m, t.row_w, t.row_s, 8); // the rows on 8 threads
     }
     if (m * t.row_w != n * ew.k) return error.EngramShape;

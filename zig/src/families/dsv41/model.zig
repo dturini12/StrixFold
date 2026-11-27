@@ -16,6 +16,7 @@ const round = @import("round.zig");
 const draft = @import("draft.zig");
 const engram = @import("engram.zig");
 const engram_io = @import("engram_io.zig");
+const engram_cache = @import("engram_cache.zig");
 const engram_aio = @import("engram_aio.zig");
 const exl3_prefill = @import("exl3_prefill.zig");
 const exl3_linear = @import("exl3_linear.zig");
@@ -209,6 +210,7 @@ pub const Model = struct {
     dr: ?draft.Drafter = null,
     tables: ?engram_io.Tables = null,
     epool: ?*engram_io.Pool = null,
+    ecache: ?*engram_cache.RowCache = null, // TF_DS_ENGRAM_ROW_CACHE_MIB: the prompt chunks' Engram rows kept dense
     aio: ?*engram_aio.Aio = null,
     paio: ?*engram_aio.Aio = null, // the prompt chunks' Engram reads, on a ring of their own
     eh: ?prompt.EngramHost = null,
@@ -558,6 +560,11 @@ pub const Model = struct {
             m.tables = try engram_io.Tables.open(gpa, io, edir);
             m.epool = try engram_io.Pool.init(gpa, io, 64);
             m.eh = try prompt.EngramHost.init(a, c, engram.Hasher.init(c.*, map, mult), &m.tables.?, m.epool.?, sp.rank, sp.world, chunk_rows);
+            if (try rowCacheMib()) |mib| {
+                m.ecache = try engramCache(gpa, io, &m.tables.?, c, mib, chunk_rows * (m.eh.?.hi - m.eh.?.lo));
+                std.log.info("engram row cache: {d} MiB, {d} rows of {d} bytes", .{ mib, m.ecache.?.sets * 8, m.ecache.?.slot });
+            }
+            m.eh.?.rcache = m.ecache;
             if (o.engram_aio) {
                 // a round's reads, 2 x 12 x its rows at most: 1,024 slots for each 16 rows of the round-row setting
                 m.aio = try engram_aio.Aio.init(gpa, io, 1024 * ((o.round_rows + 15) / 16));
@@ -607,6 +614,7 @@ pub const Model = struct {
         m.rd.dropPrefetch();
         if (m.aio) |x| x.deinit();
         if (m.paio) |x| x.deinit();
+        if (m.ecache) |x| x.deinit();
         if (m.epool) |p| p.deinit(m.gpa);
         if (m.tables) |*t| t.close();
         if (gpu.features.world4 and gpu.features.verbs_rdma) if (m.rdma_rings) |*r| r.close(m.gpa);
@@ -1561,4 +1569,25 @@ test "TF_DS_HC_INLINE is resolved before any Round: off keeps the stock plan and
     // the namespace's directory name (pd.namespaceOf) differs too
     const pd = @import("core").prompt_disk;
     try std.testing.expect(!std.mem.eql(u8, &pd.namespaceOf(id_off), &pd.namespaceOf(id_on)));
+}
+
+/// TF_DS_ENGRAM_ROW_CACHE_MIB: the dense Engram row cache's MiB on this rank; unset, empty or 0: none.
+fn rowCacheMib() !?usize {
+    const v = std.mem.span(std.c.getenv("TF_DS_ENGRAM_ROW_CACHE_MIB") orelse return null);
+    if (v.len == 0) return null;
+    const mib = std.fmt.parseInt(usize, v, 10) catch return error.BadSetting;
+    if (mib > 1 << 16) return error.BadSetting;
+    return if (mib == 0) null else mib;
+}
+
+/// The row cache for the prompt Engram layers' tables (the widest rows), gathers of up to `cap` rows.
+fn engramCache(gpa: std.mem.Allocator, io: std.Io, tables: *const engram_io.Tables, c: *const Config, mib: usize, cap: usize) !*engram_cache.RowCache {
+    var rw: usize = 0;
+    var rs: usize = 0;
+    for (c.engram_layers.slice()[0..@min(2, c.engram_layers.slice().len)]) |li| {
+        const t = tables.layers.get(li) orelse return error.MissingEngramTable;
+        rw = @max(rw, t.row_w);
+        rs = @max(rs, t.row_s);
+    }
+    return engram_cache.RowCache.init(gpa, io, mib << 20, rw, rs, cap);
 }

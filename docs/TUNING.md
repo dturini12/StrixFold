@@ -68,6 +68,15 @@ request. The others wait for the short prompt's read on top of the slice, so kee
 prompt is read in slices even when nothing else is answering, so that a request can cut in. It is off by default and
 needs `FILL_SLICE_MS` above 0.
 
+## Prompt reading and the drive
+
+Prompt reading also reads each token's Engram rows from the tables on the drive, two 4 KiB page reads a row unless the
+page cache has them, so a drive whose random reads slow down, or a box with little page cache left, makes it swing.
+`ENGRAM_ROW_CACHE_MIB=512` keeps rows in memory dense (264 bytes a row against a page), so a text read again (a second
+question on a long document, a turn whose kept state went) skips the drive: on a pair with DRAM-less drives a 25K
+re-read took 14.0 s with it against 23.6 s without, the same logits either way. It costs that much host memory on each
+rank and does little for a text read for the first time. Empty or 0: off.
+
 ## Pictures
 
 Five settings for requests with images, all off by default; each leaves the output unchanged.
